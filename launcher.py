@@ -125,11 +125,27 @@ def _terminate_process(process: subprocess.Popen | None) -> None:
 
 
 class BitSeekWinLauncher:
+    COLORS = {
+        "background": "#111114",
+        "sidebar": "#19191e",
+        "surface": "#202026",
+        "surface_alt": "#28282f",
+        "surface_hover": "#33333c",
+        "text": "#f5f4f6",
+        "muted": "#aaa8b1",
+        "subtle": "#77757f",
+        "accent": "#fa315c",
+        "accent_dark": "#d91f49",
+        "green": "#54d68b",
+        "border": "#34343c",
+    }
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title(f"BitSeekWin Launcher v{__version__}")
-        self.root.geometry("760x690")
-        self.root.minsize(680, 620)
+        self.root.title(f"BitSeekWin v{__version__}")
+        self.root.geometry("1100x850")
+        self.root.minsize(920, 740)
+        self.root.configure(bg=self.COLORS["background"])
         self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
         self.slskd_process: subprocess.Popen | None = None
         self.server_process: subprocess.Popen | None = None
@@ -143,90 +159,485 @@ class BitSeekWinLauncher:
         self.public_url = tk.StringVar(value=detect_tailscale_url(self.tailscale) or "http://127.0.0.1:8080")
         self.start_funnel = tk.BooleanVar(value=self.public_url.get().endswith(".ts.net"))
         self.status = tk.StringVar(value="Enter your slskd location and Soulseek login to get started.")
+        self.status_detail = tk.StringVar(value="Ready")
+        self.source_url = tk.StringVar(value="")
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(150, self._drain_messages)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=16)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(1, weight=1)
+        colors = self.COLORS
+        shell = tk.Frame(self.root, bg=colors["background"])
+        shell.pack(fill="both", expand=True)
+        shell.grid_columnconfigure(1, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
 
-        ttk.Label(outer, text=f"BitSeekWin v{__version__}", font=("Segoe UI", 20, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w"
+        sidebar = tk.Frame(shell, bg=colors["sidebar"], width=205)
+        sidebar.grid(row=0, column=0, sticky="ns")
+        sidebar.grid_propagate(False)
+        self._build_sidebar(sidebar)
+
+        main = tk.Frame(shell, bg=colors["background"], padx=28, pady=22)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(5, weight=1)
+
+        header = tk.Frame(main, bg=colors["background"])
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 17))
+        tk.Label(
+            header,
+            text="YOUR PERSONAL MUSIC BRIDGE",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["muted"],
+            bg=colors["background"],
+        ).pack(side="left")
+        self.version_badge = tk.Label(
+            header,
+            text="VERY EARLY PRE-ALPHA",
+            font=("Segoe UI", 8, "bold"),
+            fg="#ff9aae",
+            bg="#39202a",
+            padx=10,
+            pady=5,
         )
-        ttk.Label(
-            outer,
-            text="Start slskd and the BitChord add-on from one window.",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 14))
+        self.version_badge.pack(side="right")
 
-        self._path_row(outer, 2, "slskd.exe", self.slskd_path, self._browse_slskd)
-        self._entry_row(outer, 3, "Soulseek username", self.username)
-        self._entry_row(outer, 4, "Soulseek password", self.password, show="*")
-        self._path_row(outer, 5, "Downloads folder", self.downloads_dir, self._browse_downloads)
-        self._entry_row(outer, 6, "Public URL", self.public_url)
-
-        self.funnel_check = ttk.Checkbutton(
-            outer,
-            text="Start Tailscale Funnel on port 8080 (only if you use a .ts.net URL)",
-            variable=self.start_funnel,
+        self.hero = tk.Canvas(
+            main,
+            height=158,
+            bg=colors["accent_dark"],
+            highlightthickness=0,
+            bd=0,
         )
-        self.funnel_check.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        self.hero.grid(row=1, column=0, sticky="ew", pady=(0, 21))
+        self.hero.bind("<Configure>", self._draw_hero)
+        self.hero.bind("<Button-1>", lambda _event: None)
 
-        ttk.Label(
-            outer,
+        section_header = tk.Frame(main, bg=colors["background"])
+        section_header.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        tk.Label(
+            section_header,
+            text="CONNECT YOUR SOURCES",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["muted"],
+            bg=colors["background"],
+        ).pack(side="left")
+        tk.Label(
+            section_header,
+            text="Your login stays on this device",
+            font=("Segoe UI", 9),
+            fg=colors["subtle"],
+            bg=colors["background"],
+        ).pack(side="right")
+
+        cards = tk.Frame(main, bg=colors["background"])
+        cards.grid(row=3, column=0, sticky="ew")
+        cards.grid_columnconfigure(0, weight=1, uniform="cards")
+        cards.grid_columnconfigure(1, weight=1, uniform="cards")
+        service_card = self._card(cards)
+        service_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+        storage_card = self._card(cards)
+        storage_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+        self._build_service_card(service_card)
+        self._build_storage_card(storage_card)
+
+        security_note = tk.Label(
+            main,
             text=(
-                "Credentials are used only for this launch and are not saved by BitSeekWin. "
-                "They remain in process memory while running. slskd's existing YAML values can "
-                "override environment settings; this launcher uses a separate BitSeekWin slskd data folder."
+                "Credentials are used for this session only. BitSeekWin does not save them. "
+                "slskd data uses a separate app folder; its API listens on this PC only."
             ),
-            wraplength=700,
+            font=("Segoe UI", 8),
+            fg=colors["subtle"],
+            bg=colors["background"],
+            anchor="w",
             justify="left",
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(2, 10))
+            wraplength=760,
+        )
+        security_note.grid(row=4, column=0, sticky="ew", pady=(10, 13))
 
-        buttons = ttk.Frame(outer)
-        buttons.grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 10))
-        self.start_button = ttk.Button(buttons, text="Start", command=self.start)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop, state="disabled")
+        status_panel = self._card(main, padding=13)
+        status_panel.grid(row=5, column=0, sticky="nsew")
+        status_panel.grid_columnconfigure(0, weight=1)
+        status_top = tk.Frame(status_panel, bg=colors["surface"])
+        status_top.grid(row=0, column=0, sticky="ew")
+        status_top.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            status_top,
+            text="ACTIVITY",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["muted"],
+            bg=colors["surface"],
+        ).grid(row=0, column=0, sticky="w")
+        self.status_dot = tk.Label(
+            status_top,
+            text="●",
+            font=("Segoe UI", 10),
+            fg=colors["subtle"],
+            bg=colors["surface"],
+        )
+        self.status_dot.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        self.status_label = tk.Label(
+            status_top,
+            textvariable=self.status_detail,
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["muted"],
+            bg=colors["surface"],
+        )
+        self.status_label.grid(row=0, column=2, sticky="e")
+        self.copy_url_button = self._action_button(
+            status_top,
+            "Copy source URL",
+            self._copy_source_url,
+        )
+        self.copy_url_button.configure(state="disabled")
+        self.copy_url_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
+
+        output_frame = tk.Frame(status_panel, bg=colors["surface"])
+        output_frame.grid(row=1, column=0, sticky="nsew", pady=(9, 0))
+        status_panel.grid_rowconfigure(1, weight=1)
+        output_frame.grid_columnconfigure(0, weight=1)
+        output_frame.grid_rowconfigure(0, weight=1)
+        self.output = tk.Text(
+            output_frame,
+            height=5,
+            wrap="word",
+            state="disabled",
+            bg="#19191e",
+            fg="#d2d0d7",
+            insertbackground=colors["text"],
+            selectbackground=colors["accent_dark"],
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=8,
+            font=("Consolas", 9),
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["border"],
+        )
+        self.output.grid(row=0, column=0, sticky="nsew")
+        self.output.tag_configure("url", foreground="#ff7791", underline=True)
+        self.output.bind("<Button-1>", self._copy_clicked_url)
+
+    def _build_sidebar(self, sidebar: tk.Frame) -> None:
+        colors = self.COLORS
+        brand = tk.Frame(sidebar, bg=colors["sidebar"], padx=19, pady=22)
+        brand.pack(fill="x")
+        mark = tk.Canvas(brand, width=39, height=39, bg=colors["sidebar"], highlightthickness=0)
+        mark.pack(side="left")
+        mark.create_oval(2, 2, 37, 37, fill=colors["accent"], outline="")
+        mark.create_text(20, 19, text="♪", fill="white", font=("Segoe UI", 20, "bold"))
+        brand_name = tk.Frame(brand, bg=colors["sidebar"])
+        brand_name.pack(side="left", padx=(9, 0))
+        tk.Label(
+            brand_name,
+            text="BitSeek",
+            font=("Segoe UI", 15, "bold"),
+            fg=colors["text"],
+            bg=colors["sidebar"],
+        ).pack(anchor="w")
+        tk.Label(
+            brand_name,
+            text="FOR BITCHORD",
+            font=("Segoe UI", 7, "bold"),
+            fg=colors["muted"],
+            bg=colors["sidebar"],
+        ).pack(anchor="w")
+
+        tk.Label(
+            sidebar,
+            text="WORKSPACE",
+            font=("Segoe UI", 8, "bold"),
+            fg=colors["subtle"],
+            bg=colors["sidebar"],
+            padx=20,
+        ).pack(anchor="w", pady=(26, 9))
+        self.nav_button = tk.Button(
+            sidebar,
+            text="  ♫    Player setup",
+            anchor="w",
+            command=lambda: None,
+            bg="#35202a",
+            fg="#ff6d89",
+            activebackground="#35202a",
+            activeforeground="#ff6d89",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=11,
+            font=("Segoe UI", 10, "bold"),
+            cursor="arrow",
+        )
+        self.nav_button.pack(fill="x", padx=12)
+
+        spacer = tk.Frame(sidebar, bg=colors["sidebar"])
+        spacer.pack(fill="both", expand=True)
+        tk.Frame(sidebar, bg=colors["border"], height=1).pack(fill="x", padx=17, pady=(0, 15))
+        tk.Label(
+            sidebar,
+            text="SOULSEEK  •  BITCHORD",
+            font=("Segoe UI", 8, "bold"),
+            fg=colors["muted"],
+            bg=colors["sidebar"],
+            padx=20,
+        ).pack(anchor="w")
+        tk.Label(
+            sidebar,
+            text=f"Build {__version__}",
+            font=("Segoe UI", 8),
+            fg=colors["subtle"],
+            bg=colors["sidebar"],
+            padx=20,
+        ).pack(anchor="w", pady=(5, 20))
+
+    def _card(self, parent: tk.Widget, padding: int = 16) -> tk.Frame:
+        card = tk.Frame(parent, bg=self.COLORS["surface"], padx=padding, pady=padding)
+        card.configure(highlightthickness=1, highlightbackground=self.COLORS["border"])
+        return card
+
+    def _field_label(self, parent: tk.Widget, text: str) -> None:
+        tk.Label(
+            parent,
+            text=text.upper(),
+            font=("Segoe UI", 8, "bold"),
+            fg=self.COLORS["muted"],
+            bg=self.COLORS["surface"],
+        ).pack(anchor="w", pady=(9, 5))
+
+    def _entry(self, parent: tk.Widget, variable: tk.StringVar, show: str | None = None) -> tk.Entry:
+        entry = tk.Entry(
+            parent,
+            textvariable=variable,
+            show=show or "",
+            bg=self.COLORS["surface_alt"],
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            selectbackground=self.COLORS["accent_dark"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=self.COLORS["border"],
+            highlightcolor=self.COLORS["accent"],
+            font=("Segoe UI", 9),
+        )
+        entry.pack(fill="x", ipady=8)
+        return entry
+
+    def _action_button(
+        self,
+        parent: tk.Widget,
+        text: str,
+        command,
+        *,
+        primary: bool = False,
+        width: int | None = None,
+    ) -> tk.Button:
+        background = self.COLORS["accent"] if primary else self.COLORS["surface_alt"]
+        active = self.COLORS["accent_dark"] if primary else self.COLORS["surface_hover"]
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=background,
+            fg="white" if primary else self.COLORS["text"],
+            activebackground=active,
+            activeforeground="white",
+            disabledforeground=self.COLORS["subtle"],
+            relief="flat",
+            bd=0,
+            padx=13,
+            pady=7,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            width=width,
+        )
+        return button
+
+    def _build_service_card(self, card: tk.Frame) -> None:
+        colors = self.COLORS
+        header = tk.Frame(card, bg=colors["surface"])
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="01",
+            font=("Segoe UI", 10, "bold"),
+            fg=colors["accent"],
+            bg=colors["surface"],
+        ).pack(side="left")
+        tk.Label(
+            header,
+            text="  SOULSEEK CONNECTION",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["text"],
+            bg=colors["surface"],
+        ).pack(side="left")
+
+        self._field_label(card, "slskd application")
+        path_row = tk.Frame(card, bg=colors["surface"])
+        path_row.pack(fill="x")
+        path_entry = tk.Entry(
+            path_row,
+            textvariable=self.slskd_path,
+            bg=colors["surface_alt"],
+            fg=colors["text"],
+            insertbackground=colors["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["accent"],
+            font=("Segoe UI", 9),
+        )
+        path_entry.pack(side="left", fill="x", expand=True, ipady=8)
+        self._action_button(path_row, "Browse", self._browse_slskd).pack(side="left", padx=(7, 0))
+
+        self._field_label(card, "Soulseek username")
+        self._entry(card, self.username)
+        self._field_label(card, "Soulseek password")
+        self._entry(card, self.password, show="*")
+        tk.Label(
+            card,
+            text="Private to this session · never saved",
+            font=("Segoe UI", 8),
+            fg=colors["subtle"],
+            bg=colors["surface"],
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _build_storage_card(self, card: tk.Frame) -> None:
+        colors = self.COLORS
+        header = tk.Frame(card, bg=colors["surface"])
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="02",
+            font=("Segoe UI", 10, "bold"),
+            fg=colors["accent"],
+            bg=colors["surface"],
+        ).pack(side="left")
+        tk.Label(
+            header,
+            text="  LIBRARY & STREAM",
+            font=("Segoe UI", 9, "bold"),
+            fg=colors["text"],
+            bg=colors["surface"],
+        ).pack(side="left")
+
+        self._field_label(card, "download destination")
+        path_row = tk.Frame(card, bg=colors["surface"])
+        path_row.pack(fill="x")
+        path_entry = tk.Entry(
+            path_row,
+            textvariable=self.downloads_dir,
+            bg=colors["surface_alt"],
+            fg=colors["text"],
+            insertbackground=colors["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["accent"],
+            font=("Segoe UI", 9),
+        )
+        path_entry.pack(side="left", fill="x", expand=True, ipady=8)
+        self._action_button(path_row, "Choose", self._browse_downloads).pack(side="left", padx=(7, 0))
+
+        self._field_label(card, "public address")
+        self._entry(card, self.public_url)
+        self.funnel_check = tk.Checkbutton(
+            card,
+            text="Start Tailscale Funnel",
+            variable=self.start_funnel,
+            bg=colors["surface"],
+            fg=colors["text"],
+            activebackground=colors["surface"],
+            activeforeground=colors["text"],
+            selectcolor=colors["surface_alt"],
+            font=("Segoe UI", 9),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.funnel_check.pack(anchor="w", pady=(9, 0))
+        tk.Label(
+            card,
+            text="Use Funnel for a public HTTPS .ts.net address.",
+            font=("Segoe UI", 8),
+            fg=colors["subtle"],
+            bg=colors["surface"],
+        ).pack(anchor="w", padx=(22, 0), pady=(2, 0))
+
+        actions = tk.Frame(card, bg=colors["surface"])
+        actions.pack(fill="x", pady=(16, 0))
+        self.start_button = self._action_button(actions, "▶   Start listening", self.start, primary=True)
+        self.start_button.pack(side="left", fill="x", expand=True)
+        self.stop_button = self._action_button(actions, "Stop", self.stop)
+        self.stop_button.configure(state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Label(buttons, textvariable=self.status).pack(side="left", padx=(14, 0))
 
-        ttk.Label(outer, text="Status and add-on URL").grid(
-            row=10, column=0, columnspan=3, sticky="w"
-        )
-        self.output = tk.Text(outer, height=12, wrap="word", state="disabled")
-        self.output.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
-        outer.rowconfigure(11, weight=1)
+    def _draw_hero(self, _event=None) -> None:
+        canvas = self.hero
+        width = max(canvas.winfo_width(), 2)
+        height = max(canvas.winfo_height(), 2)
+        canvas.delete("all")
+        left = (250, 49, 92)
+        right = (114, 35, 101)
+        for x in range(width):
+            ratio = x / max(width - 1, 1)
+            shade = tuple(int(a + (b - a) * ratio) for a, b in zip(left, right))
+            color = "#%02x%02x%02x" % shade
+            canvas.create_line(x, 0, x, height, fill=color)
 
-    @staticmethod
-    def _entry_row(
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.StringVar,
-        show: str | None = None,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        entry = ttk.Entry(parent, textvariable=variable, show=show)
-        entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=4)
+        canvas.create_oval(width - 226, -95, width - 18, 113, fill="#a83768", outline="")
+        canvas.create_oval(width - 198, -67, width - 46, 85, outline="#e787a3", width=2)
+        canvas.create_oval(width - 166, -35, width - 78, 53, outline="#f2a4b9", width=1)
+        canvas.create_oval(width - 137, -6, width - 107, 24, fill="#ffb5c3", outline="")
+        canvas.create_text(
+            26,
+            30,
+            text="BITSEEKWIN  /  BITCHORD",
+            anchor="w",
+            fill="#ffe5eb",
+            font=("Segoe UI", 8, "bold"),
+        )
+        canvas.create_text(
+            25,
+            67,
+            text="Your music,",
+            anchor="w",
+            fill="white",
+            font=("Segoe UI", 23, "bold"),
+        )
+        canvas.create_text(
+            25,
+            99,
+            text="connected.",
+            anchor="w",
+            fill="white",
+            font=("Segoe UI", 23, "bold"),
+        )
+        canvas.create_text(
+            27,
+            133,
+            text="Search Soulseek  ·  Queue a FLAC  ·  Listen in BitChord",
+            anchor="w",
+            fill="#ffe5eb",
+            font=("Segoe UI", 9),
+        )
 
-    @staticmethod
-    def _path_row(
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.StringVar,
-        browse,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(parent, textvariable=variable).grid(
-            row=row, column=1, sticky="ew", padx=(10, 6), pady=4
-        )
-        ttk.Button(parent, text="Browse…", command=browse).grid(
-            row=row, column=2, sticky="ew", pady=4
-        )
+    def _copy_clicked_url(self, event) -> None:
+        index = self.output.index(f"@{event.x},{event.y}")
+        if "url" in self.output.tag_names(index) and self.source_url.get():
+            self._copy_source_url()
+
+    def _copy_source_url(self) -> None:
+        if not self.source_url.get():
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.source_url.get())
+        self.status_detail.set("Source URL copied")
+        self.status_label.configure(fg=self.COLORS["green"])
 
     def _browse_slskd(self) -> None:
         selected = filedialog.askopenfilename(
@@ -242,8 +653,22 @@ class BitSeekWinLauncher:
             self.downloads_dir.set(selected)
 
     def _append(self, text: str) -> None:
+        marker = "Add this source in BitChord: "
+        source_url = text.split(marker, 1)[1].strip() if marker in text else ""
+        if source_url:
+            self.source_url.set(source_url)
+            self.copy_url_button.configure(state="normal")
         self.output.configure(state="normal")
-        self.output.insert("end", text.rstrip() + "\n")
+        if source_url:
+            before, after = text.split(source_url, 1)
+            self.output.insert("end", before)
+            start = self.output.index("end-1c")
+            self.output.insert("end", source_url)
+            end = self.output.index("end-1c")
+            self.output.tag_add("url", start, end)
+            self.output.insert("end", after.rstrip() + "\n")
+        else:
+            self.output.insert("end", text.rstrip() + "\n")
         self.output.see("end")
         self.output.configure(state="disabled")
 
@@ -372,9 +797,13 @@ class BitSeekWinLauncher:
             messagebox.showerror("Invalid downloads folder", "Choose an absolute folder path.")
             return
         self.starting = True
+        self.password.set("")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="disabled")
-        self.status.set("Starting…")
+        self.status.set("Starting slskd and BitSeekWin…")
+        self.status_detail.set("Connecting")
+        self.status_label.configure(fg=self.COLORS["accent"])
+        self.status_dot.configure(fg=self.COLORS["accent"])
         self._append("Starting services. Secrets are not written to a settings file.")
         threading.Thread(
             target=self._start_worker,
@@ -390,6 +819,9 @@ class BitSeekWinLauncher:
 
     def stop(self) -> None:
         self.status.set("Stopping…")
+        self.status_detail.set("Stopping")
+        self.status_label.configure(fg=self.COLORS["accent"])
+        self.status_dot.configure(fg=self.COLORS["accent"])
         _terminate_process(self.server_process)
         _terminate_process(self.slskd_process)
         self.server_process = None
@@ -398,6 +830,9 @@ class BitSeekWinLauncher:
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.status.set("Stopped. Tailscale Funnel, if enabled, remains configured.")
+        self.status_detail.set("Stopped")
+        self.status_label.configure(fg=self.COLORS["muted"])
+        self.status_dot.configure(fg=self.COLORS["subtle"])
         self._append("Stopped BitSeekWin and slskd. Tailscale Funnel remains configured in Tailscale.")
 
     def _drain_messages(self) -> None:
@@ -410,10 +845,16 @@ class BitSeekWinLauncher:
             if kind == "started":
                 self.starting = False
                 self.status.set(text)
+                self.status_detail.set("Listening")
+                self.status_label.configure(fg=self.COLORS["green"])
+                self.status_dot.configure(fg=self.COLORS["green"])
                 self.stop_button.configure(state="normal")
             elif kind == "error":
                 self.starting = False
                 self.status.set("Startup failed.")
+                self.status_detail.set("Needs attention")
+                self.status_label.configure(fg=self.COLORS["accent"])
+                self.status_dot.configure(fg=self.COLORS["accent"])
                 self.start_button.configure(state="normal")
                 messagebox.showerror("BitSeekWin could not start", text)
                 self.stop_button.configure(state="disabled")
