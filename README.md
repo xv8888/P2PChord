@@ -16,18 +16,18 @@ Please read the [public-domain and authorized-use notice](#public-domain-and-aut
 
 ## Quick start (Windows)
 
-The desktop launcher is the easiest way to start slskd and BitSeekWin together. It asks for your Soulseek login in a masked password field and does not save credentials.
+The desktop launcher opens a polished local dashboard in your default web browser—no Tkinter or additional GUI package is used. It starts slskd and BitSeekWin together and asks for your Soulseek login in a masked password field without saving credentials.
 
 ### Before you start
 
 - A Soulseek account (username and password).
-- Python 3.10 or newer with Tcl/Tk (included with the standard Windows installer).
+- Python 3.10 or newer and a modern web browser.
 - BitSeekWin downloaded and extracted.
 - The Windows `slskd.exe` application downloaded from [slskd Releases](https://github.com/slskd/slskd/releases).
 
 ### 1. Open the launcher
 
-Double-click `ez-start.bat` in the project folder. If Windows cannot find Python, open PowerShell in that folder and run:
+Double-click `ez-start.bat` in the project folder. The dashboard opens in your browser and listens only on this computer using a temporary session URL. If Windows cannot find Python, open PowerShell in that folder and run:
 
 ```powershell
 python .\launcher.py
@@ -35,14 +35,14 @@ python .\launcher.py
 
 ### 2. Enter settings and start
 
-1. Browse to the `slskd.exe` you downloaded.
+1. Enter the full path to the `slskd.exe` you downloaded. In File Explorer, use **Shift + right-click → Copy as path**.
 2. Enter your Soulseek username and password. The password field is masked.
-3. Choose a downloads folder. BitSeekWin creates it if needed.
+3. Enter a downloads folder path. BitSeekWin creates it if needed. The default is under your Music folder, outside the project.
 4. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`.
 5. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
-6. Click **Start**. Keep the launcher open while using BitChord.
+6. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
-The launcher starts slskd and BitSeekWin, generates a temporary API key, and displays the BitChord source URL in its status box. Add that URL in BitChord under **Sources → Add addon**. The API key and login fields are passed to the child processes through their startup environment; the launcher does not write credentials to a settings file. Stop both services with **Stop**.
+The launcher starts slskd and BitSeekWin, generates a temporary API key, and displays the BitChord source URL in its status panel. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. The API key and login fields are sent only to the local launcher and child-process environments; credentials are not written to a settings file. Stop the services with **Stop**, or use **Exit launcher** to stop them and close the dashboard server.
 
 slskd runs with a separate data/configuration directory at `%LOCALAPPDATA%\BitSeekWin\slskd`; your existing slskd configuration is left untouched. BitSeekWin secrets are not persisted, but they exist in process memory while the services are running. The slskd API is bound to this computer only. The source URL contains a temporary bearer secret, so keep it private. After restarting, add the newly printed source URL to BitChord again.
 

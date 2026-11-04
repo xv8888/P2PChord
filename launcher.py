@@ -1,6 +1,7 @@
+import hmac
+import ipaddress
 import json
 import os
-import queue
 import secrets
 import shutil
 import socket
@@ -8,29 +9,41 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
+import webbrowser
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlsplit
 
 from version import __version__
 
-
 APP_NAME = "BitSeekWin"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME / "slskd"
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_DOWNLOAD_DIR = PROJECT_DIR / "downloads"
+DEFAULT_DOWNLOAD_DIR = Path.home() / "Music" / APP_NAME / "downloads"
 SLSKD_URL = "http://127.0.0.1:5030"
 PORT = 8080
+MAX_REQUEST_SIZE = 64 * 1024
+MAX_LOG_LINES = 250
 
 
 def normalize_public_url(value: str) -> str:
     url = value.strip().rstrip("/")
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise ValueError("Enter a full public URL, such as https://device.tailnet.ts.net.")
-    if parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/"):
-        raise ValueError("Enter only the base URL; do not include credentials, a path, or query.")
+        raise ValueError("Enter a full URL, such as https://device.tailnet.ts.net.")
+    if (
+        parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or parts.path not in ("", "/")
+    ):
+        raise ValueError(
+            "Enter only the base URL; do not include credentials, a path, or query."
+        )
+    if any(ord(char) < 33 for char in url):
+        raise ValueError("The URL cannot contain spaces or control characters.")
     return url
 
 
@@ -81,7 +94,9 @@ def find_tailscale() -> str | None:
     if found:
         return found
     for candidate in (
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tailscale" / "tailscale.exe",
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        / "Tailscale"
+        / "tailscale.exe",
         Path(r"C:\Program Files (x86)\Tailscale IPN\tailscale.exe"),
     ):
         if candidate.is_file():
@@ -102,7 +117,9 @@ def detect_tailscale_url(tailscale: str | None = None) -> str:
             timeout=10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        dns_name = json.loads(result.stdout).get("Self", {}).get("DNSName", "").rstrip(".")
+        dns_name = (
+            json.loads(result.stdout).get("Self", {}).get("DNSName", "").rstrip(".")
+        )
         return f"https://{dns_name}" if dns_name else ""
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         return ""
@@ -124,559 +141,127 @@ def _terminate_process(process: subprocess.Popen | None) -> None:
             return
 
 
-class BitSeekWinLauncher:
-    COLORS = {
-        "background": "#111114",
-        "sidebar": "#19191e",
-        "surface": "#202026",
-        "surface_alt": "#28282f",
-        "surface_hover": "#33333c",
-        "text": "#f5f4f6",
-        "muted": "#aaa8b1",
-        "subtle": "#77757f",
-        "accent": "#fa315c",
-        "accent_dark": "#d91f49",
-        "green": "#54d68b",
-        "border": "#34343c",
-    }
-
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title(f"BitSeekWin v{__version__}")
-        self.root.geometry("1100x850")
-        self.root.minsize(920, 740)
-        self.root.configure(bg=self.COLORS["background"])
-        self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
+class LauncherController:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
         self.slskd_process: subprocess.Popen | None = None
         self.server_process: subprocess.Popen | None = None
         self.starting = False
+        self.status = "Ready"
+        self.detail = "Enter your slskd path and Soulseek login to get started."
+        self.source_url = ""
+        self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
+        self.stop_requested = threading.Event()
         self.tailscale = find_tailscale()
 
-        self.slskd_path = tk.StringVar()
-        self.username = tk.StringVar()
-        self.password = tk.StringVar()
-        self.downloads_dir = tk.StringVar(value=str(DEFAULT_DOWNLOAD_DIR))
-        self.public_url = tk.StringVar(value=detect_tailscale_url(self.tailscale) or "http://127.0.0.1:8080")
-        self.start_funnel = tk.BooleanVar(value=self.public_url.get().endswith(".ts.net"))
-        self.status = tk.StringVar(value="Enter your slskd location and Soulseek login to get started.")
-        self.status_detail = tk.StringVar(value="Ready")
-        self.source_url = tk.StringVar(value="")
+    def log(self, message: str) -> None:
+        with self.lock:
+            self.logs.append(message)
 
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(150, self._drain_messages)
+    def snapshot(self) -> dict:
+        with self.lock:
+            slskd_running = (
+                self.slskd_process is not None and self.slskd_process.poll() is None
+            )
+            server_running = (
+                self.server_process is not None and self.server_process.poll() is None
+            )
+            if not self.starting and (
+                self.slskd_process is not None or self.server_process is not None
+            ):
+                if not slskd_running or not server_running:
+                    self.status = "Stopped unexpectedly"
+                    self.detail = (
+                        "Check the activity log. Select Stop before starting again."
+                    )
+            return {
+                "status": self.status,
+                "detail": self.detail,
+                "starting": self.starting,
+                "running": slskd_running and server_running,
+                "active": slskd_running or server_running,
+                "source_url": self.source_url,
+                "logs": list(self.logs),
+            }
 
-    def _build_ui(self) -> None:
-        colors = self.COLORS
-        shell = tk.Frame(self.root, bg=colors["background"])
-        shell.pack(fill="both", expand=True)
-        shell.grid_columnconfigure(1, weight=1)
-        shell.grid_rowconfigure(0, weight=1)
+    def start(self, config: dict) -> None:
+        with self.lock:
+            if self.starting or self._any_process_running():
+                raise ValueError(
+                    "Services are already starting or running. Stop them before restarting."
+                )
 
-        sidebar = tk.Frame(shell, bg=colors["sidebar"], width=205)
-        sidebar.grid(row=0, column=0, sticky="ns")
-        sidebar.grid_propagate(False)
-        self._build_sidebar(sidebar)
+        executable_text = str(config.get("slskd_path", "")).strip()
+        username = str(config.get("username", "")).strip()
+        password = str(config.get("password", ""))
+        downloads_text = str(config.get("downloads_dir", "")).strip()
+        public_text = str(config.get("public_url", ""))
+        use_funnel = config.get("start_funnel") is True
 
-        main = tk.Frame(shell, bg=colors["background"], padx=28, pady=22)
-        main.grid(row=0, column=1, sticky="nsew")
-        main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(5, weight=1)
+        if not executable_text:
+            raise ValueError("Choose the slskd.exe application.")
+        executable = Path(executable_text)
+        if not executable.is_file():
+            raise ValueError("The selected slskd.exe file was not found.")
+        if not username or not password:
+            raise ValueError("Enter your Soulseek username and password.")
+        if not downloads_text:
+            raise ValueError("Choose a downloads folder.")
+        downloads = Path(downloads_text)
+        if not downloads.is_absolute():
+            raise ValueError("The downloads folder must be an absolute path.")
+        public_url = normalize_public_url(public_text)
+        if use_funnel and not public_url.startswith("https://"):
+            raise ValueError("Tailscale Funnel requires an https:// public URL.")
+        if use_funnel and not self.tailscale:
+            raise ValueError("Tailscale was not found. Install it or turn off Funnel.")
 
-        header = tk.Frame(main, bg=colors["background"])
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 17))
-        tk.Label(
-            header,
-            text="YOUR PERSONAL MUSIC BRIDGE",
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["muted"],
-            bg=colors["background"],
-        ).pack(side="left")
-        self.version_badge = tk.Label(
-            header,
-            text="VERY EARLY PRE-ALPHA",
-            font=("Segoe UI", 8, "bold"),
-            fg="#ff9aae",
-            bg="#39202a",
-            padx=10,
-            pady=5,
-        )
-        self.version_badge.pack(side="right")
+        with self.lock:
+            if self.starting or self._any_process_running():
+                raise ValueError(
+                    "Services are already starting or running. Stop them before restarting."
+                )
+            self.starting = True
+            self.status = "Starting"
+            self.detail = "Preparing slskd and BitSeekWin…"
+            self.source_url = ""
+            self.stop_requested.clear()
+            self.logs.clear()
+        threading.Thread(
+            target=self._start_worker,
+            args=(executable, username, password, downloads, public_url, use_funnel),
+            daemon=True,
+        ).start()
 
-        self.hero = tk.Canvas(
-            main,
-            height=158,
-            bg=colors["accent_dark"],
-            highlightthickness=0,
-            bd=0,
-        )
-        self.hero.grid(row=1, column=0, sticky="ew", pady=(0, 21))
-        self.hero.bind("<Configure>", self._draw_hero)
-        self.hero.bind("<Button-1>", lambda _event: None)
-
-        section_header = tk.Frame(main, bg=colors["background"])
-        section_header.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        tk.Label(
-            section_header,
-            text="CONNECT YOUR SOURCES",
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["muted"],
-            bg=colors["background"],
-        ).pack(side="left")
-        tk.Label(
-            section_header,
-            text="Your login stays on this device",
-            font=("Segoe UI", 9),
-            fg=colors["subtle"],
-            bg=colors["background"],
-        ).pack(side="right")
-
-        cards = tk.Frame(main, bg=colors["background"])
-        cards.grid(row=3, column=0, sticky="ew")
-        cards.grid_columnconfigure(0, weight=1, uniform="cards")
-        cards.grid_columnconfigure(1, weight=1, uniform="cards")
-        service_card = self._card(cards)
-        service_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        storage_card = self._card(cards)
-        storage_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        self._build_service_card(service_card)
-        self._build_storage_card(storage_card)
-
-        security_note = tk.Label(
-            main,
-            text=(
-                "Credentials are used for this session only. BitSeekWin does not save them. "
-                "slskd data uses a separate app folder; its API listens on this PC only."
-            ),
-            font=("Segoe UI", 8),
-            fg=colors["subtle"],
-            bg=colors["background"],
-            anchor="w",
-            justify="left",
-            wraplength=760,
-        )
-        security_note.grid(row=4, column=0, sticky="ew", pady=(10, 13))
-
-        status_panel = self._card(main, padding=13)
-        status_panel.grid(row=5, column=0, sticky="nsew")
-        status_panel.grid_columnconfigure(0, weight=1)
-        status_top = tk.Frame(status_panel, bg=colors["surface"])
-        status_top.grid(row=0, column=0, sticky="ew")
-        status_top.grid_columnconfigure(1, weight=1)
-        tk.Label(
-            status_top,
-            text="ACTIVITY",
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["muted"],
-            bg=colors["surface"],
-        ).grid(row=0, column=0, sticky="w")
-        self.status_dot = tk.Label(
-            status_top,
-            text="●",
-            font=("Segoe UI", 10),
-            fg=colors["subtle"],
-            bg=colors["surface"],
-        )
-        self.status_dot.grid(row=0, column=1, sticky="e", padx=(0, 6))
-        self.status_label = tk.Label(
-            status_top,
-            textvariable=self.status_detail,
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["muted"],
-            bg=colors["surface"],
-        )
-        self.status_label.grid(row=0, column=2, sticky="e")
-        self.copy_url_button = self._action_button(
-            status_top,
-            "Copy source URL",
-            self._copy_source_url,
-        )
-        self.copy_url_button.configure(state="disabled")
-        self.copy_url_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
-
-        output_frame = tk.Frame(status_panel, bg=colors["surface"])
-        output_frame.grid(row=1, column=0, sticky="nsew", pady=(9, 0))
-        status_panel.grid_rowconfigure(1, weight=1)
-        output_frame.grid_columnconfigure(0, weight=1)
-        output_frame.grid_rowconfigure(0, weight=1)
-        self.output = tk.Text(
-            output_frame,
-            height=5,
-            wrap="word",
-            state="disabled",
-            bg="#19191e",
-            fg="#d2d0d7",
-            insertbackground=colors["text"],
-            selectbackground=colors["accent_dark"],
-            relief="flat",
-            borderwidth=0,
-            padx=10,
-            pady=8,
-            font=("Consolas", 9),
-            highlightthickness=1,
-            highlightbackground=colors["border"],
-            highlightcolor=colors["border"],
-        )
-        self.output.grid(row=0, column=0, sticky="nsew")
-        self.output.tag_configure("url", foreground="#ff7791", underline=True)
-        self.output.bind("<Button-1>", self._copy_clicked_url)
-
-    def _build_sidebar(self, sidebar: tk.Frame) -> None:
-        colors = self.COLORS
-        brand = tk.Frame(sidebar, bg=colors["sidebar"], padx=19, pady=22)
-        brand.pack(fill="x")
-        mark = tk.Canvas(brand, width=39, height=39, bg=colors["sidebar"], highlightthickness=0)
-        mark.pack(side="left")
-        mark.create_oval(2, 2, 37, 37, fill=colors["accent"], outline="")
-        mark.create_text(20, 19, text="♪", fill="white", font=("Segoe UI", 20, "bold"))
-        brand_name = tk.Frame(brand, bg=colors["sidebar"])
-        brand_name.pack(side="left", padx=(9, 0))
-        tk.Label(
-            brand_name,
-            text="BitSeek",
-            font=("Segoe UI", 15, "bold"),
-            fg=colors["text"],
-            bg=colors["sidebar"],
-        ).pack(anchor="w")
-        tk.Label(
-            brand_name,
-            text="FOR BITCHORD",
-            font=("Segoe UI", 7, "bold"),
-            fg=colors["muted"],
-            bg=colors["sidebar"],
-        ).pack(anchor="w")
-
-        tk.Label(
-            sidebar,
-            text="WORKSPACE",
-            font=("Segoe UI", 8, "bold"),
-            fg=colors["subtle"],
-            bg=colors["sidebar"],
-            padx=20,
-        ).pack(anchor="w", pady=(26, 9))
-        self.nav_button = tk.Button(
-            sidebar,
-            text="  ♫    Player setup",
-            anchor="w",
-            command=lambda: None,
-            bg="#35202a",
-            fg="#ff6d89",
-            activebackground="#35202a",
-            activeforeground="#ff6d89",
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=11,
-            font=("Segoe UI", 10, "bold"),
-            cursor="arrow",
-        )
-        self.nav_button.pack(fill="x", padx=12)
-
-        spacer = tk.Frame(sidebar, bg=colors["sidebar"])
-        spacer.pack(fill="both", expand=True)
-        tk.Frame(sidebar, bg=colors["border"], height=1).pack(fill="x", padx=17, pady=(0, 15))
-        tk.Label(
-            sidebar,
-            text="SOULSEEK  •  BITCHORD",
-            font=("Segoe UI", 8, "bold"),
-            fg=colors["muted"],
-            bg=colors["sidebar"],
-            padx=20,
-        ).pack(anchor="w")
-        tk.Label(
-            sidebar,
-            text=f"Build {__version__}",
-            font=("Segoe UI", 8),
-            fg=colors["subtle"],
-            bg=colors["sidebar"],
-            padx=20,
-        ).pack(anchor="w", pady=(5, 20))
-
-    def _card(self, parent: tk.Widget, padding: int = 16) -> tk.Frame:
-        card = tk.Frame(parent, bg=self.COLORS["surface"], padx=padding, pady=padding)
-        card.configure(highlightthickness=1, highlightbackground=self.COLORS["border"])
-        return card
-
-    def _field_label(self, parent: tk.Widget, text: str) -> None:
-        tk.Label(
-            parent,
-            text=text.upper(),
-            font=("Segoe UI", 8, "bold"),
-            fg=self.COLORS["muted"],
-            bg=self.COLORS["surface"],
-        ).pack(anchor="w", pady=(9, 5))
-
-    def _entry(self, parent: tk.Widget, variable: tk.StringVar, show: str | None = None) -> tk.Entry:
-        entry = tk.Entry(
-            parent,
-            textvariable=variable,
-            show=show or "",
-            bg=self.COLORS["surface_alt"],
-            fg=self.COLORS["text"],
-            insertbackground=self.COLORS["text"],
-            selectbackground=self.COLORS["accent_dark"],
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=self.COLORS["border"],
-            highlightcolor=self.COLORS["accent"],
-            font=("Segoe UI", 9),
-        )
-        entry.pack(fill="x", ipady=8)
-        return entry
-
-    def _action_button(
-        self,
-        parent: tk.Widget,
-        text: str,
-        command,
-        *,
-        primary: bool = False,
-        width: int | None = None,
-    ) -> tk.Button:
-        background = self.COLORS["accent"] if primary else self.COLORS["surface_alt"]
-        active = self.COLORS["accent_dark"] if primary else self.COLORS["surface_hover"]
-        button = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=background,
-            fg="white" if primary else self.COLORS["text"],
-            activebackground=active,
-            activeforeground="white",
-            disabledforeground=self.COLORS["subtle"],
-            relief="flat",
-            bd=0,
-            padx=13,
-            pady=7,
-            font=("Segoe UI", 9, "bold"),
-            cursor="hand2",
-            width=width,
-        )
-        return button
-
-    def _build_service_card(self, card: tk.Frame) -> None:
-        colors = self.COLORS
-        header = tk.Frame(card, bg=colors["surface"])
-        header.pack(fill="x")
-        tk.Label(
-            header,
-            text="01",
-            font=("Segoe UI", 10, "bold"),
-            fg=colors["accent"],
-            bg=colors["surface"],
-        ).pack(side="left")
-        tk.Label(
-            header,
-            text="  SOULSEEK CONNECTION",
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["text"],
-            bg=colors["surface"],
-        ).pack(side="left")
-
-        self._field_label(card, "slskd application")
-        path_row = tk.Frame(card, bg=colors["surface"])
-        path_row.pack(fill="x")
-        path_entry = tk.Entry(
-            path_row,
-            textvariable=self.slskd_path,
-            bg=colors["surface_alt"],
-            fg=colors["text"],
-            insertbackground=colors["text"],
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=colors["border"],
-            highlightcolor=colors["accent"],
-            font=("Segoe UI", 9),
-        )
-        path_entry.pack(side="left", fill="x", expand=True, ipady=8)
-        self._action_button(path_row, "Browse", self._browse_slskd).pack(side="left", padx=(7, 0))
-
-        self._field_label(card, "Soulseek username")
-        self._entry(card, self.username)
-        self._field_label(card, "Soulseek password")
-        self._entry(card, self.password, show="*")
-        tk.Label(
-            card,
-            text="Private to this session · never saved",
-            font=("Segoe UI", 8),
-            fg=colors["subtle"],
-            bg=colors["surface"],
-        ).pack(anchor="w", pady=(8, 0))
-
-    def _build_storage_card(self, card: tk.Frame) -> None:
-        colors = self.COLORS
-        header = tk.Frame(card, bg=colors["surface"])
-        header.pack(fill="x")
-        tk.Label(
-            header,
-            text="02",
-            font=("Segoe UI", 10, "bold"),
-            fg=colors["accent"],
-            bg=colors["surface"],
-        ).pack(side="left")
-        tk.Label(
-            header,
-            text="  LIBRARY & STREAM",
-            font=("Segoe UI", 9, "bold"),
-            fg=colors["text"],
-            bg=colors["surface"],
-        ).pack(side="left")
-
-        self._field_label(card, "download destination")
-        path_row = tk.Frame(card, bg=colors["surface"])
-        path_row.pack(fill="x")
-        path_entry = tk.Entry(
-            path_row,
-            textvariable=self.downloads_dir,
-            bg=colors["surface_alt"],
-            fg=colors["text"],
-            insertbackground=colors["text"],
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=colors["border"],
-            highlightcolor=colors["accent"],
-            font=("Segoe UI", 9),
-        )
-        path_entry.pack(side="left", fill="x", expand=True, ipady=8)
-        self._action_button(path_row, "Choose", self._browse_downloads).pack(side="left", padx=(7, 0))
-
-        self._field_label(card, "public address")
-        self._entry(card, self.public_url)
-        self.funnel_check = tk.Checkbutton(
-            card,
-            text="Start Tailscale Funnel",
-            variable=self.start_funnel,
-            bg=colors["surface"],
-            fg=colors["text"],
-            activebackground=colors["surface"],
-            activeforeground=colors["text"],
-            selectcolor=colors["surface_alt"],
-            font=("Segoe UI", 9),
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-        )
-        self.funnel_check.pack(anchor="w", pady=(9, 0))
-        tk.Label(
-            card,
-            text="Use Funnel for a public HTTPS .ts.net address.",
-            font=("Segoe UI", 8),
-            fg=colors["subtle"],
-            bg=colors["surface"],
-        ).pack(anchor="w", padx=(22, 0), pady=(2, 0))
-
-        actions = tk.Frame(card, bg=colors["surface"])
-        actions.pack(fill="x", pady=(16, 0))
-        self.start_button = self._action_button(actions, "▶   Start listening", self.start, primary=True)
-        self.start_button.pack(side="left", fill="x", expand=True)
-        self.stop_button = self._action_button(actions, "Stop", self.stop)
-        self.stop_button.configure(state="disabled")
-        self.stop_button.pack(side="left", padx=(8, 0))
-
-    def _draw_hero(self, _event=None) -> None:
-        canvas = self.hero
-        width = max(canvas.winfo_width(), 2)
-        height = max(canvas.winfo_height(), 2)
-        canvas.delete("all")
-        left = (250, 49, 92)
-        right = (114, 35, 101)
-        for x in range(width):
-            ratio = x / max(width - 1, 1)
-            shade = tuple(int(a + (b - a) * ratio) for a, b in zip(left, right))
-            color = "#%02x%02x%02x" % shade
-            canvas.create_line(x, 0, x, height, fill=color)
-
-        canvas.create_oval(width - 226, -95, width - 18, 113, fill="#a83768", outline="")
-        canvas.create_oval(width - 198, -67, width - 46, 85, outline="#e787a3", width=2)
-        canvas.create_oval(width - 166, -35, width - 78, 53, outline="#f2a4b9", width=1)
-        canvas.create_oval(width - 137, -6, width - 107, 24, fill="#ffb5c3", outline="")
-        canvas.create_text(
-            26,
-            30,
-            text="BITSEEKWIN  /  BITCHORD",
-            anchor="w",
-            fill="#ffe5eb",
-            font=("Segoe UI", 8, "bold"),
-        )
-        canvas.create_text(
-            25,
-            67,
-            text="Your music,",
-            anchor="w",
-            fill="white",
-            font=("Segoe UI", 23, "bold"),
-        )
-        canvas.create_text(
-            25,
-            99,
-            text="connected.",
-            anchor="w",
-            fill="white",
-            font=("Segoe UI", 23, "bold"),
-        )
-        canvas.create_text(
-            27,
-            133,
-            text="Search Soulseek  ·  Queue a FLAC  ·  Listen in BitChord",
-            anchor="w",
-            fill="#ffe5eb",
-            font=("Segoe UI", 9),
+    def _any_process_running(self) -> bool:
+        return any(
+            process is not None and process.poll() is None
+            for process in (self.slskd_process, self.server_process)
         )
 
-    def _copy_clicked_url(self, event) -> None:
-        index = self.output.index(f"@{event.x},{event.y}")
-        if "url" in self.output.tag_names(index) and self.source_url.get():
-            self._copy_source_url()
+    def _port_in_use(self, port: int) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return True
+        except OSError:
+            return False
 
-    def _copy_source_url(self) -> None:
-        if not self.source_url.get():
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.source_url.get())
-        self.status_detail.set("Source URL copied")
-        self.status_label.configure(fg=self.COLORS["green"])
-
-    def _browse_slskd(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="Select slskd.exe",
-            filetypes=(("slskd executable", "slskd.exe"), ("Executables", "*.exe"), ("All files", "*.*")),
-        )
-        if selected:
-            self.slskd_path.set(selected)
-
-    def _browse_downloads(self) -> None:
-        selected = filedialog.askdirectory(title="Select slskd downloads folder")
-        if selected:
-            self.downloads_dir.set(selected)
-
-    def _append(self, text: str) -> None:
-        marker = "Add this source in BitChord: "
-        source_url = text.split(marker, 1)[1].strip() if marker in text else ""
-        if source_url:
-            self.source_url.set(source_url)
-            self.copy_url_button.configure(state="normal")
-        self.output.configure(state="normal")
-        if source_url:
-            before, after = text.split(source_url, 1)
-            self.output.insert("end", before)
-            start = self.output.index("end-1c")
-            self.output.insert("end", source_url)
-            end = self.output.index("end-1c")
-            self.output.tag_add("url", start, end)
-            self.output.insert("end", after.rstrip() + "\n")
-        else:
-            self.output.insert("end", text.rstrip() + "\n")
-        self.output.see("end")
-        self.output.configure(state="disabled")
-
-    def _read_output(self, name: str, process: subprocess.Popen) -> None:
+    def _read_output(
+        self, name: str, process: subprocess.Popen, sensitive: tuple[str, ...]
+    ) -> None:
         if process.stdout is None:
             return
         for line in process.stdout:
-            self.messages.put(("log", f"[{name}] {line.rstrip()}"))
+            message = line.rstrip()
+            marker = "Add this source in BitChord: "
+            if marker in message:
+                source_url = message.split(marker, 1)[1].strip()
+                with self.lock:
+                    self.source_url = source_url
+            for secret in sensitive:
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            self.log(f"[{name}] {message}")
 
     def _start_worker(
         self,
@@ -685,25 +270,28 @@ class BitSeekWinLauncher:
         password: str,
         downloads: Path,
         public_url: str,
-        start_funnel: bool,
+        use_funnel: bool,
     ) -> None:
+        api_key = secrets.token_urlsafe(32)
+        slskd_process: subprocess.Popen | None = None
+        server_process: subprocess.Popen | None = None
         try:
             downloads.mkdir(parents=True, exist_ok=True)
             APP_DIR.mkdir(parents=True, exist_ok=True)
-            api_key = secrets.token_urlsafe(32)
-            base_env = os.environ.copy()
-            slskd_env = build_slskd_environment(base_env, username, password, api_key, downloads)
-
             for port, service in ((5030, "slskd"), (PORT, "BitSeekWin")):
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-                        raise RuntimeError(f"Port {port} is already in use; close the existing {service} first.")
-                except OSError:
-                    pass
+                if self._port_in_use(port):
+                    raise RuntimeError(
+                        f"Port {port} is already in use; close the existing {service} first."
+                    )
+            if self.stop_requested.is_set():
+                raise RuntimeError("Startup was cancelled.")
 
-            if start_funnel:
-                if not self.tailscale:
-                    raise RuntimeError("Tailscale was not found. Install it or uncheck the Funnel option.")
+            base_env = os.environ.copy()
+            slskd_env = build_slskd_environment(
+                base_env, username, password, api_key, downloads
+            )
+
+            if use_funnel:
                 result = subprocess.run(
                     [self.tailscale, "funnel", "--bg", str(PORT)],
                     capture_output=True,
@@ -712,10 +300,16 @@ class BitSeekWinLauncher:
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 if result.returncode:
-                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Tailscale Funnel failed.")
-                self.messages.put(("log", "Tailscale Funnel configured for port 8080."))
+                    raise RuntimeError(
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                        or "Tailscale Funnel failed."
+                    )
+                self.log("Tailscale Funnel configured for local port 8080.")
 
-            self.slskd_process = subprocess.Popen(
+            if self.stop_requested.is_set():
+                raise RuntimeError("Startup was cancelled.")
+            slskd_process = subprocess.Popen(
                 [str(executable)],
                 cwd=str(executable.parent),
                 env=slskd_env,
@@ -726,29 +320,37 @@ class BitSeekWinLauncher:
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            with self.lock:
+                self.slskd_process = slskd_process
+            if self.stop_requested.is_set():
+                raise RuntimeError("Startup was cancelled.")
             threading.Thread(
                 target=self._read_output,
-                args=("slskd", self.slskd_process),
+                args=("slskd", slskd_process, (username, password, api_key)),
                 daemon=True,
             ).start()
-            self.messages.put(("log", "Starting slskd…"))
+            self.log("Starting slskd…")
 
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
-                if self.slskd_process.poll() is not None:
+                if self.stop_requested.is_set():
+                    raise RuntimeError("Startup was cancelled.")
+                if slskd_process.poll() is not None:
                     raise RuntimeError(
-                        f"slskd exited with code {self.slskd_process.returncode}. Check its status output."
+                        f"slskd exited with code {slskd_process.returncode}. Check the activity log."
                     )
-                try:
-                    with socket.create_connection(("127.0.0.1", 5030), timeout=0.5):
-                        break
-                except OSError:
-                    time.sleep(0.5)
+                if self._port_in_use(5030):
+                    break
+                time.sleep(0.5)
             else:
                 raise RuntimeError("slskd did not open port 5030 within 60 seconds.")
 
-            server_env = build_bitseekwin_environment(base_env, api_key, downloads, public_url)
-            self.server_process = subprocess.Popen(
+            if self.stop_requested.is_set():
+                raise RuntimeError("Startup was cancelled.")
+            server_env = build_bitseekwin_environment(
+                base_env, api_key, downloads, public_url
+            )
+            server_process = subprocess.Popen(
                 [sys.executable, str(PROJECT_DIR / "server.py")],
                 cwd=str(PROJECT_DIR),
                 env=server_env,
@@ -759,130 +361,260 @@ class BitSeekWinLauncher:
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            with self.lock:
+                self.server_process = server_process
+                self.status = "Listening"
+                self.detail = "slskd and BitSeekWin are running."
+            if self.stop_requested.is_set():
+                raise RuntimeError("Startup was cancelled.")
             threading.Thread(
                 target=self._read_output,
-                args=("BitSeekWin", self.server_process),
+                args=("BitSeekWin", server_process, (api_key,)),
                 daemon=True,
             ).start()
-            self.messages.put(("started", "Both services started. Keep this window open while testing."))
+            self.log("BitSeekWin started. Add the source URL below in BitChord.")
         except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
-            self.messages.put(("error", str(exc)))
-            _terminate_process(self.server_process)
-            _terminate_process(self.slskd_process)
-            self.server_process = None
-            self.slskd_process = None
-
-    def start(self) -> None:
-        if self.starting or self._any_process_running():
-            return
-        executable = Path(self.slskd_path.get().strip())
-        downloads = Path(self.downloads_dir.get().strip())
-        username = self.username.get().strip()
-        password = self.password.get()
-        try:
-            public_url = normalize_public_url(self.public_url.get())
-        except ValueError as exc:
-            messagebox.showerror("Check the public URL", str(exc))
-            return
-        if self.start_funnel.get() and not public_url.startswith("https://"):
-            messagebox.showerror("HTTPS required", "Use an https:// URL when starting Tailscale Funnel.")
-            return
-        if not executable.is_file():
-            messagebox.showerror("slskd.exe not found", "Browse to the slskd.exe file.")
-            return
-        if not username or not password:
-            messagebox.showerror("Soulseek login required", "Enter your Soulseek username and password.")
-            return
-        if not downloads.is_absolute():
-            messagebox.showerror("Invalid downloads folder", "Choose an absolute folder path.")
-            return
-        self.starting = True
-        self.password.set("")
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="disabled")
-        self.status.set("Starting slskd and BitSeekWin…")
-        self.status_detail.set("Connecting")
-        self.status_label.configure(fg=self.COLORS["accent"])
-        self.status_dot.configure(fg=self.COLORS["accent"])
-        self._append("Starting services. Secrets are not written to a settings file.")
-        threading.Thread(
-            target=self._start_worker,
-            args=(executable, username, password, downloads, public_url, self.start_funnel.get()),
-            daemon=True,
-        ).start()
-
-    def _any_process_running(self) -> bool:
-        return any(
-            process is not None and process.poll() is None
-            for process in (self.slskd_process, self.server_process)
-        )
+            self.log(f"Startup failed: {exc}")
+            self.stop_requested.set()
+            _terminate_process(server_process)
+            _terminate_process(slskd_process)
+            with self.lock:
+                if self.server_process is server_process:
+                    self.server_process = None
+                if self.slskd_process is slskd_process:
+                    self.slskd_process = None
+                if self.status != "Stopped":
+                    self.status = "Startup failed"
+                    self.detail = str(exc)
+        finally:
+            with self.lock:
+                self.starting = False
 
     def stop(self) -> None:
-        self.status.set("Stopping…")
-        self.status_detail.set("Stopping")
-        self.status_label.configure(fg=self.COLORS["accent"])
-        self.status_dot.configure(fg=self.COLORS["accent"])
-        _terminate_process(self.server_process)
-        _terminate_process(self.slskd_process)
-        self.server_process = None
-        self.slskd_process = None
-        self.starting = False
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-        self.status.set("Stopped. Tailscale Funnel, if enabled, remains configured.")
-        self.status_detail.set("Stopped")
-        self.status_label.configure(fg=self.COLORS["muted"])
-        self.status_dot.configure(fg=self.COLORS["subtle"])
-        self._append("Stopped BitSeekWin and slskd. Tailscale Funnel remains configured in Tailscale.")
+        self.stop_requested.set()
+        with self.lock:
+            server_process = self.server_process
+            slskd_process = self.slskd_process
+            self.server_process = None
+            self.slskd_process = None
+            self.status = "Stopped"
+            self.detail = "BitSeekWin and slskd have been stopped."
+            self.source_url = ""
+        self.log("Stopping BitSeekWin and slskd…")
+        _terminate_process(server_process)
+        _terminate_process(slskd_process)
+        self.log(
+            "Services stopped. Tailscale Funnel, if enabled, remains configured in Tailscale."
+        )
 
-    def _drain_messages(self) -> None:
-        while True:
-            try:
-                kind, text = self.messages.get_nowait()
-            except queue.Empty:
-                break
-            self._append(text)
-            if kind == "started":
-                self.starting = False
-                self.status.set(text)
-                self.status_detail.set("Listening")
-                self.status_label.configure(fg=self.COLORS["green"])
-                self.status_dot.configure(fg=self.COLORS["green"])
-                self.stop_button.configure(state="normal")
-            elif kind == "error":
-                self.starting = False
-                self.status.set("Startup failed.")
-                self.status_detail.set("Needs attention")
-                self.status_label.configure(fg=self.COLORS["accent"])
-                self.status_dot.configure(fg=self.COLORS["accent"])
-                self.start_button.configure(state="normal")
-                messagebox.showerror("BitSeekWin could not start", text)
-                self.stop_button.configure(state="disabled")
-        if not self.starting and not self._any_process_running():
-            self.start_button.configure(state="normal")
-            self.stop_button.configure(state="disabled")
-        elif not self.starting and (
-            (self.server_process is not None and self.server_process.poll() is not None)
-            or (self.slskd_process is not None and self.slskd_process.poll() is not None)
-        ):
-            self.status.set("A service stopped. Check the status output, then click Stop before restarting.")
-        self.root.after(150, self._drain_messages)
 
-    def _on_close(self) -> None:
-        if self.starting:
-            messagebox.showinfo("Starting services", "Wait for startup to finish before closing this window.")
+def _page(token: str, public_url: str) -> bytes:
+    html = (
+        _HTML.replace("__TOKEN_JSON__", json.dumps(token))
+        .replace("__VERSION__", __version__)
+        .replace("__PUBLIC_URL_JSON__", json.dumps(public_url))
+        .replace("__DOWNLOAD_DIR_JSON__", json.dumps(str(DEFAULT_DOWNLOAD_DIR)))
+    )
+    return html.encode("utf-8")
+
+
+_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>BitSeekWin • Setup</title>
+<style>
+:root{font-family:Inter,"Segoe UI",system-ui,sans-serif;color:#f6f4f6;background:#101014;font-synthesis:none;text-rendering:optimizeLegibility;--bg:#101014;--panel:#1b1b22;--field:#25252e;--line:#33333e;--muted:#a5a2ad;--subtle:#777480;--pink:#fa315c;--green:#57d998}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 78% -10%,#63213e 0,transparent 35%),var(--bg)}button,input{font:inherit}button{cursor:pointer}
+.app{min-height:100vh;display:grid;grid-template-columns:224px minmax(0,1fr)}aside{background:#17171d;border-right:1px solid #282830;padding:26px 17px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:11px;padding:2px 6px 36px}.mark{width:39px;height:39px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#ff7187,#d60e43);font-size:25px;font-weight:800;box-shadow:0 6px 22px #fa315c44}.brand-name{font-size:16px;font-weight:750;letter-spacing:-.4px}.brand-name small{display:block;color:var(--muted);font-size:9px;letter-spacing:1.3px;margin-top:3px}.nav-label{font-size:10px;font-weight:750;letter-spacing:1.2px;color:var(--subtle);padding:0 11px 9px}.nav-item{border-radius:8px;padding:11px 12px;color:#ff7791;background:#38202b;font-weight:650;font-size:13px}.side-foot{margin-top:auto;border-top:1px solid var(--line);padding:18px 9px 0;color:var(--muted);font-size:10px;line-height:1.7}.side-foot small{color:var(--subtle)}
+main{width:min(1120px,100%);margin:0 auto;padding:29px 38px 35px}.topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:17px;font-size:10px;font-weight:750;letter-spacing:1.3px;color:var(--muted)}.badge{background:#3a202a;color:#ff9daf;padding:7px 10px;border-radius:999px;font-size:9px;letter-spacing:.7px}.hero{height:166px;border-radius:13px;overflow:hidden;padding:24px 28px;background:linear-gradient(108deg,#f1325a 0,#bb245f 49%,#61245c 100%);position:relative;margin-bottom:21px;box-shadow:0 16px 42px #bd20552c}.hero:after{content:"";position:absolute;width:214px;height:214px;right:35px;top:-112px;border-radius:50%;border:1px solid #ffffff55;box-shadow:0 0 0 25px #ffffff12,0 0 0 52px #ffffff0a}.hero:before{content:"";position:absolute;width:58px;height:58px;right:113px;top:14px;border:2px solid #ffffff66;border-radius:50%;background:#ffcad344}.eyebrow{font-size:9px;letter-spacing:1.4px;color:#ffe0e8;font-weight:750}.hero h1{font-size:29px;letter-spacing:-1px;margin:9px 0 1px;line-height:1.08}.hero p{font-size:11px;color:#ffe3e9;margin:8px 0 0}.section-title{display:flex;align-items:center;justify-content:space-between;margin:0 1px 9px;font-size:10px;font-weight:750;letter-spacing:1.15px;color:var(--muted)}.section-title span:last-child{font-size:10px;font-weight:450;letter-spacing:0;color:var(--subtle)}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:13px}.card{background:linear-gradient(150deg,#1d1d24,#19191f);border:1px solid #30303a;border-radius:11px;padding:17px 18px}.card-title{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:750;letter-spacing:.7px}.step{color:var(--pink);font-size:12px}.field{margin-top:13px}.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:9px;font-weight:750;letter-spacing:.8px;text-transform:uppercase}.control{display:flex;gap:7px}.control input,.field input{width:100%;min-width:0;background:var(--field);border:1px solid #393944;border-radius:6px;padding:9px 10px;color:#f7f5f8;outline:none;font-size:11px;transition:border-color .15s,box-shadow .15s}.control input:focus,.field input:focus{border-color:#ed3a62;box-shadow:0 0 0 3px #fa315c24}.control input::placeholder,.field input::placeholder{color:#777480}.hint{font-size:9px;color:var(--subtle);margin:7px 0 0}.button{border:0;border-radius:6px;padding:9px 12px;background:#30303a;color:#f2eff3;font-size:10px;font-weight:700;white-space:nowrap;transition:filter .15s,transform .15s}.button:hover{filter:brightness(1.15)}.button:active{transform:translateY(1px)}.button.primary{background:linear-gradient(100deg,#fa315c,#df2458);color:white;box-shadow:0 5px 16px #fa315c30}.button:disabled{opacity:.45;cursor:not-allowed}.check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:10px;color:#d4d1da}.check input{accent-color:var(--pink);width:14px;height:14px}.actions{display:flex;gap:8px;margin-top:15px}.actions .primary{flex:1}
+.privacy{font-size:9px;line-height:1.5;color:var(--subtle);margin:12px 2px 13px}.activity{background:#1b1b22;border:1px solid #30303a;border-radius:10px;padding:12px 14px;min-height:152px}.activity-head{display:flex;align-items:center;gap:8px;font-size:9px;font-weight:750;letter-spacing:.9px;color:var(--muted)}.dot{width:7px;height:7px;border-radius:50%;background:#777480}.activity-state{margin-left:auto;font-size:10px;letter-spacing:0;color:#d9d6de}.copy{margin-left:7px}.url{margin-top:9px;padding:8px 9px;border-radius:5px;background:#141419;color:#ff8098;font:10px Consolas,monospace;overflow-wrap:anywhere;min-height:28px}.url.empty{color:#686671}.logs{height:82px;overflow:auto;margin-top:8px;color:#b8b5be;font:9px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.error{color:#ff849a}.success{color:var(--green)}
+@media(max-width:850px){.app{grid-template-columns:1fr}aside{display:none}main{padding:21px 18px}.hero{height:152px}.cards{grid-template-columns:1fr}.activity{min-height:145px}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside><div class="brand"><div class="mark">♪</div><div class="brand-name">BitSeekWin<small>FOR BITCHORD</small></div></div><div class="nav-label">WORKSPACE</div><div class="nav-item">♫ &nbsp; Player setup</div><div class="side-foot">SOULSEEK &nbsp;•&nbsp; BITCHORD<br><small>Build __VERSION__</small></div></aside>
+<main>
+<div class="topline"><span>YOUR PERSONAL MUSIC BRIDGE</span><span class="badge">VERY EARLY PRE-ALPHA</span></div>
+<section class="hero"><div class="eyebrow">BITSEEKWIN &nbsp;/&nbsp; BITCHORD</div><h1>Your music, connected.</h1><p>Search Soulseek &nbsp;·&nbsp; Queue a FLAC &nbsp;·&nbsp; Listen in BitChord</p></section>
+<div class="section-title"><span>CONNECT YOUR SOURCES</span><span>Your login stays on this device</span></div>
+<section class="cards">
+<article class="card"><div class="card-title"><span class="step">01</span> SOULSEEK CONNECTION</div>
+<div class="field"><label for="slskd">slskd application path</label><input id="slskd" type="text" placeholder="C:\Program Files\slskd\slskd.exe" autocomplete="off"><p class="hint">Enter the full path to slskd.exe. In File Explorer, use Shift+right-click &gt; Copy as path.</p></div>
+<div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
+<div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
+<p class="hint">Password is masked and cleared after starting. Credentials are not saved.</p>
+</article>
+<article class="card"><div class="card-title"><span class="step">02</span> LIBRARY &amp; STREAM</div>
+<div class="field"><label for="downloads">Download destination</label><input id="downloads" type="text" autocomplete="off"><p class="hint">Enter a full folder path; it will be created if it does not exist.</p></div>
+<div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" placeholder="https://device.tailnet.ts.net"></div>
+<label class="check"><input id="funnel" type="checkbox"> Start Tailscale Funnel on port 8080</label>
+<p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p>
+<div class="actions"><button class="button primary" id="start">▶ &nbsp; Start listening</button><button class="button" id="stop" disabled>Stop</button></div>
+</article>
+</section>
+<p class="privacy">Credentials are used for this launch only and are not written to a settings file. slskd uses a separate app-data folder and its API listens on this PC only. The printed source URL is a secret; keep it private.</p>
+<section class="activity"><div class="activity-head"><span>ACTIVITY</span><span id="dot" class="dot"></span><span id="state" class="activity-state">Ready</span><button class="button copy" id="copy" disabled>Copy source URL</button><button class="button" id="exit">Exit launcher</button></div><div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div><div id="logs" class="logs">Ready when you are.</div></section>
+</main></div>
+<script>
+const token=__TOKEN_JSON__, api="/"+token+"/api/";
+const $=id=>document.getElementById(id);
+let sourceUrl="";
+$("downloads").value=__DOWNLOAD_DIR_JSON__;
+$("publicUrl").value=__PUBLIC_URL_JSON__;
+$("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
+update();
+$("start").addEventListener("click",async()=>{
+  const config={slskd_path:$("slskd").value.trim(),username:$("username").value,password:$("password").value,downloads_dir:$("downloads").value.trim(),public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked};
+  $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
+  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Starting slskd…";}
+  catch(e){$("start").disabled=false;alert(e.message);}
+  await update();
+});
+$("stop").addEventListener("click",async()=>{try{await fetch(api+"stop",{method:"POST"});}catch(e){}await update();});
+$("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipboard.writeText(sourceUrl);$("state").textContent="URL copied";}});
+$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and stop slskd?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='hero'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
+async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});renderStatus(await r.json());}catch(e){}}
+function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;$("logs").textContent=(s.logs||[]).join("\n")||s.detail||"";$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
+setInterval(update,1000);
+</script>
+</body>
+</html>"""
+
+
+def make_handler(controller: LauncherController, token: str):
+    class LauncherHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args) -> None:
             return
-        if self._any_process_running():
-            if not messagebox.askyesno("Stop services?", "Stop slskd and BitSeekWin before closing?"):
+
+        def _is_local(self) -> bool:
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                return False
+
+        def _authorized(self) -> bool:
+            host = self.headers.get("Host", "")
+            try:
+                parsed_host = urlsplit(f"http://{host}")
+                address = parsed_host.hostname
+                origin = self.headers.get("Origin")
+                if address not in ("127.0.0.1", "localhost", "::1"):
+                    return False
+                if origin:
+                    parsed_origin = urlsplit(origin)
+                    if parsed_origin.scheme != "http" or parsed_origin.netloc != host:
+                        return False
+                elif self.command == "POST":
+                    return False
+            except ValueError:
+                return False
+            prefix = f"/{token}"
+            path = urlsplit(self.path).path
+            return (
+                self._is_local()
+                and (path == prefix or path.startswith(prefix + "/"))
+                and hmac.compare_digest(path[: len(prefix)], prefix)
+            )
+
+        def _send_json(self, value: dict, status: int = 200) -> None:
+            payload = json.dumps(value).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _security_headers(self) -> None:
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            )
+
+        def do_GET(self) -> None:
+            if not self._authorized():
+                self.send_error(403)
                 return
-            self.stop()
-        self.root.destroy()
+            path = urlsplit(self.path).path
+            if path == f"/{token}":
+                public_url = (
+                    detect_tailscale_url(controller.tailscale)
+                    or "http://127.0.0.1:8080"
+                )
+                body = _page(token, public_url)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self._security_headers()
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == f"/{token}/api/status":
+                self._send_json(controller.snapshot())
+            else:
+                self.send_error(404)
+
+        def do_POST(self) -> None:
+            if not self._authorized():
+                self.send_error(403)
+                return
+            path = urlsplit(self.path).path
+            if path == f"/{token}/api/start":
+                if self.headers.get_content_type() != "application/json":
+                    self._send_json({"error": "Expected a JSON request."}, 415)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > MAX_REQUEST_SIZE:
+                        raise ValueError(
+                            "Request body must be between 1 byte and 64 KB."
+                        )
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ValueError("Invalid launcher settings.")
+                    controller.start(payload)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+                self._send_json(controller.snapshot(), 202)
+            elif path == f"/{token}/api/stop":
+                threading.Thread(target=controller.stop, daemon=True).start()
+                self._send_json({"status": "Stopping"})
+            elif path == f"/{token}/api/exit":
+                self._send_json({"status": "Exiting"})
+                threading.Thread(target=controller.stop, daemon=True).start()
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            else:
+                self.send_error(404)
+
+    return LauncherHandler
 
 
 def main() -> None:
-    root = tk.Tk()
-    BitSeekWinLauncher(root)
-    root.mainloop()
+    token = secrets.token_urlsafe(32)
+    controller = LauncherController()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(controller, token))
+    server.daemon_threads = True
+    host, port = server.server_address
+    dashboard = f"http://{host}:{port}/{token}"
+    webbrowser.open(dashboard, new=1, autoraise=True)
+    print(f"{APP_NAME} v{__version__} dashboard: {dashboard}")
+    try:
+        server.serve_forever(poll_interval=0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        controller.stop()
+        server.server_close()
 
 
 if __name__ == "__main__":

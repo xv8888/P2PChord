@@ -23,7 +23,9 @@ class StubSlskd:
         self.last_query = query
         return self.tracks
 
-    def prepare_download(self, track: server.RemoteTrack) -> tuple[Path | None, str | None]:
+    def prepare_download(
+        self, track: server.RemoteTrack
+    ) -> tuple[Path | None, str | None]:
         self.prepare_calls += 1
         return None, "pending-batch"
 
@@ -57,7 +59,9 @@ class AddonServerTests(unittest.TestCase):
             size=10,
             title="Kick One",
         )
-        self.audio_path = self.root / "bitchord-cache" / self.track.id / self.track.filename
+        self.audio_path = (
+            self.root / "bitchord-cache" / self.track.id / self.track.filename
+        )
         self.audio_path.parent.mkdir(parents=True)
         self.audio_path.write_bytes(b"0123456789")
 
@@ -115,7 +119,9 @@ class AddonServerTests(unittest.TestCase):
 
     def test_file_supports_byte_ranges_and_head(self) -> None:
         self.get_json("/search?q=kick")
-        request = Request(self.base + f"/file/{self.track.id}", headers={"Range": "bytes=2-5"})
+        request = Request(
+            self.base + f"/file/{self.track.id}", headers={"Range": "bytes=2-5"}
+        )
         with urlopen(request) as response:
             self.assertEqual(response.status, 206)
             self.assertEqual(response.headers["Content-Range"], "bytes 2-5/10")
@@ -128,7 +134,9 @@ class AddonServerTests(unittest.TestCase):
 
     def test_rejects_bad_ranges_and_unknown_track_ids(self) -> None:
         self.get_json("/search?q=kick")
-        request = Request(self.base + f"/file/{self.track.id}", headers={"Range": "bytes=20-"})
+        request = Request(
+            self.base + f"/file/{self.track.id}", headers={"Range": "bytes=20-"}
+        )
         with self.assertRaises(HTTPError) as error:
             urlopen(request)
         self.assertEqual(error.exception.code, 416)
@@ -138,14 +146,16 @@ class AddonServerTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 404)
 
     def test_filters_non_flac_and_unsafe_search_results(self) -> None:
-        responses = [{
-            "username": "sample-owner",
-            "files": [
-                {"filename": "Drums/Kick.flac", "size": 20},
-                {"filename": "Drums/Kick.wav", "size": 20},
-                {"filename": "../outside.flac", "size": 20},
-            ],
-        }]
+        responses = [
+            {
+                "username": "sample-owner",
+                "files": [
+                    {"filename": "Drums/Kick.flac", "size": 20},
+                    {"filename": "Drums/Kick.wav", "size": 20},
+                    {"filename": "../outside.flac", "size": 20},
+                ],
+            }
+        ]
         tracks = server.SlskdClient._tracks_from_responses(responses)
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0].filename, "Drums/Kick.flac")
@@ -165,10 +175,14 @@ class AddonServerTests(unittest.TestCase):
                 return FakeResponse({"id": search_id})
             if request.full_url.endswith(f"/searches/{search_id}"):
                 return FakeResponse({"isComplete": True})
-            return FakeResponse([{
-                "username": "sample-owner",
-                "files": [{"filename": "Drum Kit/Break.flac", "size": 42}],
-            }])
+            return FakeResponse(
+                [
+                    {
+                        "username": "sample-owner",
+                        "files": [{"filename": "Drum Kit/Break.flac", "size": 42}],
+                    }
+                ]
+            )
 
         client = server.SlskdClient(
             "http://slskd.test",
@@ -199,16 +213,26 @@ class AddonServerTests(unittest.TestCase):
             if request.get_method() == "POST":
                 body = json.loads(request.data)
                 self.assertEqual(body["username"], self.track.username)
-                self.assertEqual(body["files"], [{"filename": self.track.filename, "size": 10}])
-                self.assertEqual(body["options"]["destination"], f"bitchord-cache/{self.track.id}")
+                self.assertEqual(
+                    body["files"], [{"filename": self.track.filename, "size": 10}]
+                )
+                self.assertEqual(
+                    body["options"]["destination"], f"bitchord-cache/{self.track.id}"
+                )
                 return FakeResponse({"failures": []})
             path = client._download_path(self.track)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"0123456789")
-            return FakeResponse({"transfers": [{
-                "filename": self.track.filename,
-                "state": "Completed, Succeeded",
-            }]})
+            return FakeResponse(
+                {
+                    "transfers": [
+                        {
+                            "filename": self.track.filename,
+                            "state": "Completed, Succeeded",
+                        }
+                    ]
+                }
+            )
 
         with patch.object(server.uuid, "uuid4", return_value=uuid.UUID(batch_id)):
             with patch.object(server, "urlopen", side_effect=fake_urlopen):

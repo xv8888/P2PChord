@@ -26,7 +26,9 @@ SLUG = os.environ.get(
 )
 SECRET = os.environ.get("BITCHORD_SECRET") or secrets.token_urlsafe(32)
 PORT = int(os.environ.get("PORT", "8080"))
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}").rstrip(
+    "/"
+)
 SLSKD_URL = os.environ.get("SLSKD_URL", "http://127.0.0.1:5030").rstrip("/")
 SLSKD_API_KEY = os.environ.get("SLSKD_API_KEY", "")
 SLSKD_DOWNLOAD_DIR = Path(os.environ.get("SLSKD_DOWNLOAD_DIR", ""))
@@ -53,7 +55,11 @@ def _value(obj: dict, key: str, default=None):
 def _safe_relative_filename(filename: str) -> PurePosixPath | None:
     normalized = filename.replace("\\", "/")
     path = PurePosixPath(normalized)
-    if path.is_absolute() or not path.parts or any(part in ("", ".", "..") for part in path.parts):
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
+    ):
         return None
     if re.match(r"^[A-Za-z]:", path.parts[0]):
         return None
@@ -108,7 +114,9 @@ class SlskdClient:
         self._download_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
-    def _request(self, method: str, path: str, body: dict | None = None, timeout: float = 15) -> dict | list:
+    def _request(
+        self, method: str, path: str, body: dict | None = None, timeout: float = 15
+    ) -> dict | list:
         if not self.api_key:
             raise RuntimeError("Set SLSKD_API_KEY to a slskd API key.")
         data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -127,9 +135,13 @@ class SlskdClient:
                 payload = response.read()
         except HTTPError as error:
             detail = error.read(2048).decode("utf-8", errors="replace")
-            raise RuntimeError(f"slskd API returned HTTP {error.code}: {detail}") from error
+            raise RuntimeError(
+                f"slskd API returned HTTP {error.code}: {detail}"
+            ) from error
         except URLError as error:
-            raise RuntimeError(f"Could not reach slskd at {self.base_url}: {error.reason}") from error
+            raise RuntimeError(
+                f"Could not reach slskd at {self.base_url}: {error.reason}"
+            ) from error
         if not payload:
             return {}
         try:
@@ -151,13 +163,17 @@ class SlskdClient:
             try:
                 self._request("PUT", f"/searches/{search_id}")
             except RuntimeError as stop_error:
-                LOG.warning("Could not stop failed slskd search %s: %s", search_id, stop_error)
+                LOG.warning(
+                    "Could not stop failed slskd search %s: %s", search_id, stop_error
+                )
             raise
         if not _value(search, "isComplete", False):
             try:
                 self._request("PUT", f"/searches/{search_id}")
             except RuntimeError as error:
-                LOG.warning("Could not stop timed-out slskd search %s: %s", search_id, error)
+                LOG.warning(
+                    "Could not stop timed-out slskd search %s: %s", search_id, error
+                )
         responses = self._request("GET", f"/searches/{search_id}/responses")
         return self._tracks_from_responses(responses)[:SEARCH_LIMIT]
 
@@ -185,13 +201,15 @@ class SlskdClient:
                 if track_id in seen:
                     continue
                 seen.add(track_id)
-                found.append(RemoteTrack(
-                    id=track_id,
-                    username=username,
-                    filename=filename,
-                    size=size,
-                    title=relative.stem.replace("_", " "),
-                ))
+                found.append(
+                    RemoteTrack(
+                        id=track_id,
+                        username=username,
+                        filename=filename,
+                        size=size,
+                        title=relative.stem.replace("_", " "),
+                    )
+                )
         return found
 
     def prepare_download(self, track: RemoteTrack) -> tuple[Path | None, str | None]:
@@ -202,7 +220,9 @@ class SlskdClient:
 
         with lock:
             target = self._download_path(track)
-            if target.is_file() and (track.size == 0 or target.stat().st_size == track.size):
+            if target.is_file() and (
+                track.size == 0 or target.stat().st_size == track.size
+            ):
                 return target, None
             pending_batch = self._pending_batches.get(track.id)
             if pending_batch:
@@ -210,12 +230,16 @@ class SlskdClient:
 
             batch_id = str(uuid.uuid4())
             destination = f"bitchord-cache/{track.id}"
-            response = self._request("POST", "/transfers/downloads/batches", {
-                "id": batch_id,
-                "username": track.username,
-                "files": [{"filename": track.filename, "size": track.size}],
-                "options": {"destination": destination},
-            })
+            response = self._request(
+                "POST",
+                "/transfers/downloads/batches",
+                {
+                    "id": batch_id,
+                    "username": track.username,
+                    "files": [{"filename": track.filename, "size": track.size}],
+                    "options": {"destination": destination},
+                },
+            )
             failures = _value(response, "failures", [])
             if failures:
                 raise RuntimeError(f"slskd could not queue this file: {failures}")
@@ -236,7 +260,9 @@ class SlskdClient:
             deadline = time.monotonic() + self.download_timeout
             while time.monotonic() < deadline:
                 try:
-                    batch = self._request("GET", f"/transfers/downloads/batches/{batch_id}")
+                    batch = self._request(
+                        "GET", f"/transfers/downloads/batches/{batch_id}"
+                    )
                 except RuntimeError as error:
                     if "HTTP 404" not in str(error):
                         raise
@@ -250,15 +276,23 @@ class SlskdClient:
                     if "succeeded" in state:
                         if target.is_file():
                             if track.size and target.stat().st_size != track.size:
-                                raise RuntimeError("slskd marked the transfer complete, but its file size is unexpected.")
+                                raise RuntimeError(
+                                    "slskd marked the transfer complete, but its file size is unexpected."
+                                )
                             self._pending_batches.pop(track.id, None)
                             return target
-                        raise RuntimeError(f"slskd completed the transfer but the file is missing at {target}.")
+                        raise RuntimeError(
+                            f"slskd completed the transfer but the file is missing at {target}."
+                        )
                     if "completed" in state or "failed" in state or "errored" in state:
                         self._pending_batches.pop(track.id, None)
-                        raise RuntimeError(f"slskd transfer did not complete successfully ({state}).")
+                        raise RuntimeError(
+                            f"slskd transfer did not complete successfully ({state})."
+                        )
                 time.sleep(0.2)
-            raise TimeoutError("Timed out waiting for slskd to download the selected FLAC.")
+            raise TimeoutError(
+                "Timed out waiting for slskd to download the selected FLAC."
+            )
 
     def _download_path(self, track: RemoteTrack) -> Path:
         relative = _safe_relative_filename(track.filename)
@@ -267,7 +301,9 @@ class SlskdClient:
         root = (self.download_dir / "bitchord-cache" / track.id).resolve()
         target = (root.joinpath(*relative.parts)).resolve()
         if not target.is_relative_to(root):
-            raise RuntimeError("Resolved download path escaped the slskd download directory.")
+            raise RuntimeError(
+                "Resolved download path escaped the slskd download directory."
+            )
         return target
 
 
@@ -280,20 +316,29 @@ class AddonHandler(BaseHTTPRequestHandler):
 
     def _headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+        self.send_header(
+            "Access-Control-Expose-Headers",
+            "Content-Length, Content-Range, Accept-Ranges",
+        )
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self._headers()
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Range, If-Range, Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Headers", "Range, If-Range, Content-Type"
+        )
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
     def _route(self) -> tuple[list[str], dict[str, list[str]]] | None:
         parsed = urlsplit(self.path)
         parts = [unquote(part) for part in parsed.path.split("/") if part]
-        if len(parts) < 3 or parts[0] != SLUG or not hmac.compare_digest(parts[1], SECRET):
+        if (
+            len(parts) < 3
+            or parts[0] != SLUG
+            or not hmac.compare_digest(parts[1], SECRET)
+        ):
             return None
         return parts[2:], parse_qs(parsed.query)
 
@@ -321,16 +366,18 @@ class AddonHandler(BaseHTTPRequestHandler):
         parts, query = route
 
         if parts == ["manifest.json"]:
-            self._json({
-                "id": f"bitseekwin-addon.{SLUG}",
-                "name": APP_NAME,
-                "version": VERSION,
-                "description": "BitSeekWin prototype for searching FLAC results through slskd and streaming them to BitChord",
-                "resources": ["search", "stream"],
-                "types": ["track"],
-                "contentType": "music",
-                "allowDownloads": False,
-            })
+            self._json(
+                {
+                    "id": f"bitseekwin-addon.{SLUG}",
+                    "name": APP_NAME,
+                    "version": VERSION,
+                    "description": "BitSeekWin prototype for searching FLAC results through slskd and streaming them to BitChord",
+                    "resources": ["search", "stream"],
+                    "types": ["track"],
+                    "contentType": "music",
+                    "allowDownloads": False,
+                }
+            )
         elif parts == ["search"] and self.command == "GET":
             search_text = query.get("q", [""])[0].strip()
             if not search_text:
@@ -343,20 +390,25 @@ class AddonHandler(BaseHTTPRequestHandler):
                 self.send_error(502, f"slskd search failed: {error}")
                 return
             self.tracks.update((track.id, track) for track in tracks)
-            self._json({
-                "tracks": [{
-                    "id": track.id,
-                    "title": track.title,
-                    "artist": f"Shared by {track.username}",
-                    "album": "",
-                    "duration": 0,
-                    "format": "flac",
-                    "audioQuality": "LOSSLESS",
-                } for track in tracks],
-                "albums": [],
-                "artists": [],
-                "playlists": [],
-            })
+            self._json(
+                {
+                    "tracks": [
+                        {
+                            "id": track.id,
+                            "title": track.title,
+                            "artist": f"Shared by {track.username}",
+                            "album": "",
+                            "duration": 0,
+                            "format": "flac",
+                            "audioQuality": "LOSSLESS",
+                        }
+                        for track in tracks
+                    ],
+                    "albums": [],
+                    "artists": [],
+                    "playlists": [],
+                }
+            )
         elif len(parts) == 2 and parts[0] == "stream" and self.command == "GET":
             track = self.tracks.get(parts[1])
             if track is None:
@@ -370,14 +422,16 @@ class AddonHandler(BaseHTTPRequestHandler):
                 LOG.exception("Could not queue selected slskd file")
                 self.send_error(502, f"Could not queue selected file: {error}")
                 return
-            self._json({
-                "url": f"{PUBLIC_BASE_URL}/{SLUG}/{SECRET}/file/{track.id}",
-                "format": "flac",
-                "quality": "lossless",
-                "codec": "FLAC",
-                "container": "flac",
-                "manifest": "none",
-            })
+            self._json(
+                {
+                    "url": f"{PUBLIC_BASE_URL}/{SLUG}/{SECRET}/file/{track.id}",
+                    "format": "flac",
+                    "quality": "lossless",
+                    "codec": "FLAC",
+                    "container": "flac",
+                    "manifest": "none",
+                }
+            )
         elif len(parts) == 2 and parts[0] == "file":
             self._file(parts[1])
         else:
@@ -443,20 +497,36 @@ class AddonHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     if not os.environ.get("SLSKD_DOWNLOAD_DIR"):
-        raise SystemExit("Set SLSKD_DOWNLOAD_DIR to slskd's downloads directory, visible to this server.")
+        raise SystemExit(
+            "Set SLSKD_DOWNLOAD_DIR to slskd's downloads directory, visible to this server."
+        )
     if not SLSKD_API_KEY:
-        raise SystemExit("Set SLSKD_API_KEY to an API key from your slskd configuration.")
+        raise SystemExit(
+            "Set SLSKD_API_KEY to an API key from your slskd configuration."
+        )
     if not SLSKD_DOWNLOAD_DIR.is_dir():
-        raise SystemExit("Set SLSKD_DOWNLOAD_DIR to slskd's downloads directory, visible to this server.")
+        raise SystemExit(
+            "Set SLSKD_DOWNLOAD_DIR to slskd's downloads directory, visible to this server."
+        )
     if not re.fullmatch(r"[A-Za-z0-9_-]+", SLUG):
-        raise SystemExit("BITSEEKWIN_SLUG must contain only letters, digits, underscores, or hyphens.")
+        raise SystemExit(
+            "BITSEEKWIN_SLUG must contain only letters, digits, underscores, or hyphens."
+        )
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     AddonHandler.slskd = SlskdClient(SLSKD_URL, SLSKD_API_KEY, SLSKD_DOWNLOAD_DIR)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), AddonHandler)
     print(f"\n{APP_NAME} v{VERSION}", file=sys.stderr)
-    print(f"Add this source in BitChord: {PUBLIC_BASE_URL}/{SLUG}/{SECRET}", file=sys.stderr)
-    LOG.info("Listening on port %d; slskd=%s; downloads=%s", PORT, SLSKD_URL, SLSKD_DOWNLOAD_DIR.resolve())
+    print(
+        f"Add this source in BitChord: {PUBLIC_BASE_URL}/{SLUG}/{SECRET}",
+        file=sys.stderr,
+    )
+    LOG.info(
+        "Listening on port %d; slskd=%s; downloads=%s",
+        PORT,
+        SLSKD_URL,
+        SLSKD_DOWNLOAD_DIR.resolve(),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
