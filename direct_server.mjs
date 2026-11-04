@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { readFile, rm } from "node:fs/promises";
 import { Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { SlskClient } from "slsk-client";
+import { FileAttribute, SlskClient } from "slsk-client";
 
 const APP_NAME = "BitSeekWin - BitChord-Soulseek Integration";
 const VERSION = (await readFile(new URL("./version.txt", import.meta.url), "utf8"))
@@ -17,7 +17,6 @@ const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`
 ).replace(/\/+$/, "");
 const SEARCH_TIMEOUT = 2000;
-const SEARCH_LIMIT = 50;
 const MAX_TRACKS = 1000;
 const MAX_ACTIVE_STREAMS = 2;
 const MAX_STREAM_BYTES = 128 * 1024 * 1024;
@@ -31,6 +30,64 @@ function trackId(result) {
     .slice(0, 24);
 }
 
+function normalizeName(value) {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/\.flac$/i, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function editSimilarity(left, right) {
+  if (!left || !right) return 0;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i++) {
+    const current = [i];
+    for (let j = 1; j <= right.length; j++) {
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return 1 - previous[right.length] / Math.max(left.length, right.length);
+}
+
+export function matchScore(query, filename) {
+  const normalizedQuery = normalizeName(query);
+  const normalizedName = normalizeName(
+    filename.replaceAll("\\", "/").split("/").at(-1),
+  );
+  if (!normalizedQuery || !normalizedName) return 0;
+
+  const queryTokens = new Set(normalizedQuery.split(" "));
+  const nameTokens = new Set(normalizedName.split(" "));
+  let overlap = 0;
+  for (const token of queryTokens) {
+    if (nameTokens.has(token)) overlap++;
+  }
+  const tokenRecall = overlap / queryTokens.size;
+  const tokenPrecision = overlap / nameTokens.size;
+  const tokenScore =
+    tokenPrecision + tokenRecall === 0
+      ? 0
+      : (2 * tokenPrecision * tokenRecall) / (tokenPrecision + tokenRecall);
+  const phraseScore =
+    normalizedName.includes(normalizedQuery) ||
+    normalizedQuery.includes(normalizedName)
+      ? 1
+      : 0;
+  return (
+    0.65 * tokenScore +
+    0.25 * editSimilarity(normalizedQuery, normalizedName) +
+    0.1 * phraseScore
+  );
+}
+
 function isSafeFlac(filename) {
   const normalized = filename.replaceAll("\\", "/");
   return (
@@ -39,6 +96,10 @@ function isSafeFlac(filename) {
     !/^[a-z]:/i.test(normalized) &&
     !normalized.split("/").some((part) => part === ".." || part === "." || !part)
   );
+}
+
+function validDuration(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function parseRange(value, size) {
@@ -96,6 +157,7 @@ function sendError(response, status, message) {
 
 export function createAddonServer({
   client,
+  logger = defaultLogger,
   secret = SECRET,
   slug = SLUG,
   publicBaseUrl = PUBLIC_BASE_URL,
@@ -104,6 +166,10 @@ export function createAddonServer({
 }) {
   const tracks = new Map();
   let activeStreams = 0;
+
+  function log(level, message) {
+    logger(level, message);
+  }
 
   async function handle(request, response) {
     response.on("error", (error) => {
@@ -182,8 +248,11 @@ export function createAddonServer({
         return;
       }
       try {
+        log("SEARCH", `Searching Soulseek for "${query}".`);
         const results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
-        const found = [];
+        let selected = null;
+        let selectedScore = -1;
+        let flacCount = 0;
         const seen = new Set();
         for (const result of results) {
           if (
@@ -197,24 +266,44 @@ export function createAddonServer({
           const id = trackId(result);
           if (seen.has(id)) continue;
           seen.add(id);
+          flacCount++;
           const title = result.file.replaceAll("\\", "/").split("/").at(-1)
             .replace(/\.flac$/i, "").replaceAll("_", " ");
-          const track = { id, user: result.user, file: result.file, size: result.size, title };
-          tracks.delete(id);
-          tracks.set(id, track);
-          found.push(track);
+          const track = {
+            id,
+            user: result.user,
+            file: result.file,
+            size: result.size,
+            title,
+            duration: validDuration(result.attribs?.[FileAttribute.Duration]),
+          };
+          const score = matchScore(query, result.file);
+          if (score > selectedScore) {
+            selected = track;
+            selectedScore = score;
+          }
+        }
+        const found = selected ? [selected] : [];
+        if (selected) {
+          log(
+            "SEARCH",
+            `Found ${flacCount} FLAC matches; selected "${selected.title}" from ${selected.user}${selected.duration ? ` (${selected.duration}s)` : ""} (${Math.round(selectedScore * 100)}% name match).`,
+          );
+          tracks.delete(selected.id);
+          tracks.set(selected.id, selected);
           while (tracks.size > MAX_TRACKS) {
             tracks.delete(tracks.keys().next().value);
           }
-          if (found.length === SEARCH_LIMIT) break;
+        } else {
+          log("SEARCH", `No FLAC matches found for "${query}".`);
         }
         sendJson(response, 200, {
           tracks: found.map((track) => ({
             id: track.id,
             title: track.title,
-            artist: `Shared by ${track.user}`,
+            artist: "",
             album: "",
-            duration: 0,
+            ...(track.duration ? { duration: track.duration } : {}),
             format: "flac",
             audioQuality: "LOSSLESS",
           })),
@@ -223,6 +312,7 @@ export function createAddonServer({
           playlists: [],
         });
       } catch (error) {
+        log("ERROR", `Search failed for "${query}": ${error.message}`);
         console.error("Soulseek search failed:", error.message);
         sendError(response, 502, "Soulseek search failed");
       }
@@ -239,6 +329,7 @@ export function createAddonServer({
         sendError(response, 404, "Track not found; search again");
         return;
       }
+      log("STREAM", `BitChord requested the stream URL for "${track.title}".`);
       sendJson(response, 200, {
         url: `${publicBaseUrl}/${slug}/${secret}/file/${track.id}`,
         format: "flac",
@@ -257,6 +348,7 @@ export function createAddonServer({
         return;
       }
       if (track.size > maxStreamBytes) {
+        log("WARN", `Rejected "${track.title}": file exceeds the stream-size limit.`);
         sendError(response, 413, "File exceeds the in-memory stream size limit");
         return;
       }
@@ -293,11 +385,16 @@ export function createAddonServer({
         return;
       }
       if (activeStreams >= maxActiveStreams) {
+        log("WARN", `Rejected "${track.title}": stream limit reached.`);
         sendError(response, 503, "Too many active Soulseek streams");
         return;
       }
 
       activeStreams++;
+      log(
+        "STREAM",
+        `BitChord requested "${track.title}" from ${track.user} (${track.size} bytes${request.headers.range ? `, ${request.headers.range}` : ""}).`,
+      );
       const abortController = new AbortController();
       const timer = setTimeout(
         () => abortController.abort(new Error("Stream timed out")),
@@ -313,6 +410,7 @@ export function createAddonServer({
         released = true;
         clearTimeout(timer);
         activeStreams--;
+        log("STREAM", `Stream slot released (${activeStreams} active).`);
       };
       try {
         download = client.download({
@@ -322,16 +420,62 @@ export function createAddonServer({
           timeout: STREAM_TIMEOUT,
           signal: abortController.signal,
         });
+        download.on("status", (status) => {
+          const label = {
+            requested: "Waiting for peer response",
+            queued: "Queued by peer",
+            connected: "Connected to peer",
+            downloading: "Receiving audio bytes",
+            interrupted: "Transfer interrupted; retrying",
+            complete: "Peer transfer complete",
+            failed: "Peer transfer failed",
+            cancelled: "Transfer cancelled",
+          }[status] ?? status;
+          if (!(rangeComplete && status === "cancelled")) {
+            log("STREAM", `"${track.title}": ${label}.`);
+          }
+        });
+        download.on("queue", (place) => {
+          log("STREAM", `"${track.title}" is queue position ${place} at ${track.user}.`);
+        });
+        let lastProgressBytes = start;
+        download.on("progress", (progress = {}) => {
+          if (progress.receivedBytes - lastProgressBytes < 1024 * 1024) return;
+          lastProgressBytes = progress.receivedBytes;
+          const percentage = Number.isFinite(progress.progress)
+            ? ` (${Math.round(progress.progress * 100)}%)`
+            : "";
+          log(
+            "STREAM",
+            `"${track.title}": ${formatBytes(progress.receivedBytes)} received${percentage}.`,
+          );
+        });
+        download.on("complete", (result = {}) => {
+          log(
+            "STREAM",
+            `"${track.title}" finished: ${formatBytes(result.receivedBytes ?? track.size)} received.`,
+          );
+        });
+        download.on("failed", (error) => {
+          if (!rangeComplete) {
+            log("ERROR", `"${track.title}" failed: ${error.message}`);
+          }
+        });
         let receivedBytes = start;
         download.on("data", (chunk) => {
           receivedBytes += chunk.length;
+          if (receivedBytes === start + chunk.length) {
+            log("STREAM", `First audio bytes received for "${track.title}".`);
+          }
           if (receivedBytes > maxStreamBytes && !download.isSettled) {
+            log("WARN", `"${track.title}" exceeded the stream-size limit.`);
             abortController.abort(new Error("Stream exceeded its size limit"));
             download.cancel("Stream exceeded its size limit");
           }
         });
         download.stream.on("error", (error) => {
           if (rangeComplete || response.destroyed) return;
+          log("ERROR", `Audio stream for "${track.title}" failed: ${error.message}`);
           console.error("Soulseek stream failed:", error.message);
           if (response.headersSent) response.destroy(error);
           else sendError(response, 502, "Soulseek file transfer failed");
@@ -349,6 +493,7 @@ export function createAddonServer({
         response.on("close", () => {
           clearTimeout(timer);
           if (!response.writableEnded) {
+            log("WARN", `BitChord disconnected while streaming "${track.title}".`);
             abortController.abort(new Error("BitChord disconnected"));
             download.cancel("BitChord disconnected");
           }
@@ -370,6 +515,7 @@ export function createAddonServer({
             if (remaining === 0) {
               setImmediate(() => {
                 rangeComplete = true;
+                log("STREAM", `Requested byte range sent for "${track.title}".`);
                 download.stream.unpipe(limiter);
                 limiter.end();
                 abortController.abort(new Error("Requested range complete"));
@@ -386,6 +532,7 @@ export function createAddonServer({
         release();
         await rm(tempPath, { force: true });
         console.error("Could not start Soulseek stream:", error.message);
+        log("ERROR", `Could not start "${track.title}": ${error.message}`);
         if (!response.headersSent) sendError(response, 502, "Could not start Soulseek stream");
         else response.destroy(error);
         return;
@@ -398,12 +545,24 @@ export function createAddonServer({
 
   const server = createServer((request, response) => {
     void handle(request, response).catch((error) => {
+      logger("ERROR", `HTTP request failed: ${error.message}`);
       console.error("Request failed:", error.message);
       if (!response.headersSent) sendError(response, 500, "Internal server error");
       else response.destroy(error);
     });
   });
   return { server, tracks };
+}
+
+function defaultLogger(level, message) {
+  const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
+  console.log(`[${time}] [${level}] ${message}`);
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 async function main() {
@@ -427,14 +586,14 @@ async function main() {
   });
   let server;
   client.on("server-error", (error) => {
-    console.error("Soulseek server error:", error.message);
+    defaultLogger("ERROR", `Soulseek server error: ${error.message}`);
   });
   client.on("server-disconnect", ({ reconnecting }) => {
-    console.error(`Soulseek disconnected; reconnecting=${reconnecting}`);
+    defaultLogger("WARN", `Soulseek disconnected; reconnecting=${reconnecting}.`);
   });
-  client.on("server-reconnect", () => console.error("Soulseek reconnected."));
+  client.on("server-reconnect", () => defaultLogger("INFO", "Soulseek reconnected."));
   client.on("relogged", () => {
-    console.error("Soulseek session was replaced by another login.");
+    defaultLogger("ERROR", "Soulseek session was replaced by another login.");
     client.destroy();
     const stopServer = () => {
       server.closeAllConnections();
@@ -447,16 +606,18 @@ async function main() {
 
   try {
     await client.login(username, password);
+    defaultLogger("INFO", "Connected to Soulseek.");
     ({ server } = createAddonServer({ client }));
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, "0.0.0.0", resolve);
     });
-    console.error(`\n${APP_NAME} v${VERSION}`);
-    console.error(`Add this source in BitChord: ${PUBLIC_BASE_URL}/${SLUG}/${SECRET}`);
-    console.error(
-      `Listening on port ${PORT}; connected to Soulseek as ${username}; direct streaming enabled`,
+    defaultLogger("INFO", `${APP_NAME} v${VERSION}.`);
+    defaultLogger(
+      "INFO",
+      `Add this source in BitChord: ${PUBLIC_BASE_URL}/${SLUG}/${SECRET}`,
     );
+    defaultLogger("INFO", `Listening on port ${PORT}; direct streaming enabled.`);
   } catch (error) {
     client.destroy();
     throw error;
@@ -481,7 +642,7 @@ if (
   fileURLToPath(import.meta.url) === resolve(process.argv[1])
 ) {
   main().catch((error) => {
-    console.error("BitSeekWin startup failed:", error.message);
+    defaultLogger("ERROR", `BitSeekWin startup failed: ${error.message}`);
     process.exitCode = 1;
   });
 }

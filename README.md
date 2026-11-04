@@ -11,7 +11,7 @@ BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches Sou
 ## How it works
 
 1. BitChord sends a music search to BitSeekWin.
-2. BitSeekWin searches Soulseek directly and returns matching FLAC files.
+2. BitSeekWin searches Soulseek directly and returns the single FLAC with the closest filename match.
 3. When you play a result, BitSeekWin requests the file directly from that Soulseek peer.
 4. Incoming FLAC bytes are sent to BitChord immediately; playback does not wait for the transfer to finish.
 
@@ -50,7 +50,7 @@ python .\launcher.py
 3. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
 4. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
-The launcher starts BitSeekWin, logs in to Soulseek, and displays the BitChord source URL in its status panel. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. Credentials are sent only to the local launcher and child-process environment; they are not saved to a settings file. Stop with **Stop**, or use **Exit launcher** to disconnect and close the dashboard.
+The launcher starts BitSeekWin, logs in to Soulseek, and displays the BitChord source URL in its status panel. The live activity console shows searches, peer transfer status, and streaming progress. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. Credentials are sent only to the local launcher and child-process environment; they are not saved to a settings file. Stop with **Stop**, or use **Exit launcher** to disconnect and close the dashboard.
 
 BitSeekWin no longer starts slskd, creates an slskd API key, or requires a downloads folder. It connects with uploads disabled and does not share local files. The source URL contains a temporary bearer secret, so keep it private. After restarting, add the newly printed URL to BitChord again.
 
@@ -158,13 +158,13 @@ For regular streaming, Caddy avoids tunnel bandwidth caps, but availability stil
 2. Open `<printed-source-url>/manifest.json` in a browser. The JSON should include **BitSeekWin - BitChord-Soulseek Integration**.
 3. Add the printed source URL in BitChord under **Sources → Add addon**. Search for a known FLAC result and try playback.
 
-When BitChord requests the file URL, BitSeekWin requests the file from its Soulseek peer and forwards data as it arrives. If login or search fails, check the launcher activity log and Soulseek connection. For playback failures, check that the peer is online and serving the file and that `PUBLIC_BASE_URL` is reachable from BitChord.
+When BitChord requests the file URL, BitSeekWin requests the file from its Soulseek peer and forwards data as it arrives. For automatic lossless replacement of YouTube audio, keep the BitSeekWin add-on enabled and ranked above YouTube in BitChord's source settings. If login or search fails, check the launcher activity log and Soulseek connection. For playback failures, check that the peer is online and serving the file and that `PUBLIC_BASE_URL` is reachable from BitChord.
 
 ---
 
 ## What to expect
 
-- Search results are limited to FLAC files. Titles come from shared filenames; duration and full music tags are not read from search results.
+- Search results are limited to one FLAC, selected by closest filename match. Titles come from shared filenames, and duration is included when the Soulseek peer reports it. Peer usernames are not presented as artist credits; full music tags are not read from search results.
 - BitSeekWin starts playback from bytes received directly from a Soulseek peer; it does not wait for the transfer to finish or maintain a reusable download cache. The current client library buffers the active file in memory and temporarily writes a completed copy before BitSeekWin removes it. To limit memory use, files over 128 MiB are rejected and at most two streams run at once.
 - BitSeekWin uses BitChord's **HTTP add-on API**, not its JavaScript module API.
 - The source URL contains a bearer secret; keep it private. Soulseek credentials are used by the local client and are never sent to BitChord.

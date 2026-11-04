@@ -3,6 +3,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import threading
 from unittest.mock import patch
+from pathlib import Path
 
 from launcher import (
     LauncherController,
@@ -64,10 +65,19 @@ class LauncherConfigurationTests(unittest.TestCase):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
         self.assertIn("Stream FLAC bytes live", page)
+        self.assertIn("Stream console", page)
+        self.assertIn('role="log"', page)
         self.assertNotIn("slskd", page.casefold())
         self.assertIn("device.example.ts.net", page)
         self.assertNotIn("__TOKEN_JSON__", page)
         self.assertNotIn("tkinter", page.casefold())
+
+    def test_ez_start_launches_the_browser_launcher(self):
+        script = Path(__file__).with_name("ez-start.bat").read_text(encoding="utf-8")
+        self.assertIn('cd /d "%~dp0"', script)
+        self.assertIn('pythonw.exe "%~dp0launcher.py"', script)
+        self.assertIn('python "%~dp0launcher.py"', script)
+        self.assertNotIn("server.py", script)
 
     def test_dashboard_requires_loopback_host_and_session_token(self):
         token = "test-session-token"

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
-import { createAddonServer } from "./direct_server.mjs";
+import { FileAttribute } from "slsk-client";
+import { createAddonServer, matchScore } from "./direct_server.mjs";
 
 class FakeDownload extends EventEmitter {
   constructor(options, chunks, delay = 0) {
@@ -19,7 +20,10 @@ class FakeDownload extends EventEmitter {
     for (const chunk of chunks) {
       elapsed += delay;
       setTimeout(() => {
-        if (!this.isSettled) this.stream.write(chunk);
+        if (!this.isSettled) {
+          this.stream.write(chunk);
+          this.emit("data", chunk);
+        }
       }, elapsed);
     }
     setTimeout(() => {
@@ -27,6 +31,7 @@ class FakeDownload extends EventEmitter {
       this.isSettled = true;
       this.stream.end();
       this.resolve({ receivedBytes: options.offset + chunks.reduce((n, c) => n + c.length, 0) });
+      this.emit("status", "complete");
       this.emit("complete");
     }, elapsed + delay);
   }
@@ -66,9 +71,11 @@ let server;
 let base;
 let client;
 let downloads;
+let logEntries;
 
 beforeEach(async () => {
   downloads = [];
+  logEntries = [];
   client = {
     async search(options) {
       this.lastSearch = options;
@@ -96,6 +103,7 @@ beforeEach(async () => {
     secret: "test-secret",
     slug: "bitseekwin",
     publicBaseUrl: "https://music.example.test",
+    logger: (level, message) => logEntries.push({ level, message }),
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
@@ -122,8 +130,34 @@ test("manifest and search expose only safe FLAC results", async () => {
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
   assert.equal(body.tracks[0].format, "flac");
+  assert.equal(body.tracks[0].artist, "");
+  assert.equal("duration" in body.tracks[0], false);
   assert.equal(client.lastSearch.req, "kick");
   assert.equal(client.lastSearch.timeout, 2000);
+});
+
+test("search returns only the closest matching FLAC", async () => {
+  client.search = async () => [
+    { ...track, file: "Album\\Kick Song Remix.flac" },
+    {
+      ...track,
+      file: "Album\\Kick Song.flac",
+      attribs: { [FileAttribute.Duration]: 214 },
+    },
+    { ...track, file: "Album\\Kick Song.flac", user: "second-owner" },
+  ];
+  const response = await fetch(`${base}/search?q=kick%20song`);
+  const body = await response.json();
+  assert.equal(body.tracks.length, 1);
+  assert.equal(body.tracks[0].title, "Kick Song");
+  assert.equal(body.tracks[0].duration, 214);
+  assert.equal(body.tracks[0].artist, "");
+  assert.equal(matchScore("kick song", "Album\\Kick Song.flac"), 1);
+  assert.ok(
+    matchScore("kick song", "Kick Song.flac") >
+      matchScore("kick song", "Kick Song Remix.flac"),
+  );
+  assert.match(logEntries.at(-1).message, /selected "Kick Song"/);
 });
 
 test("stream descriptor points to the authenticated direct-stream endpoint", async () => {
@@ -149,6 +183,26 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   const second = await reader.read();
   assert.equal(Buffer.from(second.value).toString(), "456789");
   assert.equal((await reader.read()).done, true);
+});
+
+test("search and stream lifecycle events are logged for the launcher", async () => {
+  const id = await searchTrack();
+  await fetch(`${base}/stream/${id}`);
+  const response = await fetch(`${base}/file/${id}`);
+  await response.arrayBuffer();
+  await downloads[0].promise;
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "SEARCH" && message.includes("Searching Soulseek"),
+  ));
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "STREAM" && message.includes("BitChord requested"),
+  ));
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "STREAM" && message.includes("First audio bytes received"),
+  ));
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "STREAM" && message.includes("Peer transfer complete"),
+  ));
 });
 
 test("completed transfers release an active-stream slot", async () => {
