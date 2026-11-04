@@ -25,7 +25,7 @@ The desktop launcher is the easiest way to start slskd and BitSeekWin together. 
 
 ### 1. Open the launcher
 
-Double-click `Start BitSeekWin.bat` in the project folder. If Windows cannot find Python, open PowerShell in that folder and run:
+Double-click `ez-start.bat` in the project folder. If Windows cannot find Python, open PowerShell in that folder and run:
 
 ```powershell
 python .\launcher.py
