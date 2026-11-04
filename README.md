@@ -198,6 +198,14 @@ For each published pre-alpha build, increment `N`. When moving to the next featu
 
 Use BitSeekWin only to search for and stream public-domain music or music you have permission to access and stream. BitSeekWin does not verify copyright status, public-domain status, or streaming permissions; Soulseek search results are not proof of authorization. You are responsible for confirming that you have the necessary rights before streaming a file.
 
+## License and third-party software
+
+Copyright (C) 2026 BitSeekWin contributors. BitSeekWin is licensed under the GNU General Public License, version 3 only; see [LICENSE](./LICENSE) for the complete terms.
+
+BitSeekWin is an independent project. It is not affiliated with, endorsed by, or sponsored by BitChord, Soulseek, Tailscale, or Caddy. Their names and marks belong to their respective owners.
+
+The runtime packages and upstream project references are listed in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). These notices do not change the license of BitSeekWin.
+
 ## Vibecoded AI Prototype Disclaimer
 
 BitSeekWin is an experimental proof-of-concept, AI-assisted prototype. Its code and instructions may contain mistakes and have not been independently audited or tested against every Soulseek peer, network setup, or BitChord release. Review the code and configuration, and test in a controlled environment before exposing it to the internet. Use it at your own risk; the authors provide no warranty or guarantee of availability, security, or fitness for a particular purpose.

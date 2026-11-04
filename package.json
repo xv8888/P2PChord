@@ -1,6 +1,7 @@
 {
   "name": "bitseekwin",
   "private": true,
+  "license": "GPL-3.0-only",
   "description": "Direct Soulseek-to-BitChord streaming add-on",
   "type": "module",
   "scripts": {
