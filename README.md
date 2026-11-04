@@ -6,6 +6,8 @@
 
 BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches your configured slskd instance for FLAC files, queues the selected file through slskd, then serves the completed download to BitChord with byte-range seeking.
 
+> **Version `0.3.0-pre-alpha.0` — very early pre-alpha prototype.** Expect bugs, breaking changes, and incomplete behavior.
+
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 
 Please read the [public-domain and authorized-use notice](#public-domain-and-authorized-music) and [prototype disclaimer](#vibecoded-prototype-disclaimer).
@@ -169,7 +171,7 @@ For regular streaming, Caddy avoids tunnel bandwidth caps, but availability stil
 | `BITCHORD_SECRET` | No | Generated at startup | Secret included in the add-on URL. Set it to keep the URL stable across restarts. |
 | `BITSEEKWIN_SLUG` | No | `bitseekwin` | URL path for this add-on. Older `BITSEEK_SLUG` and `BITCHORD_SLUG` variables are also accepted. |
 | `PORT` | No | `8080` | Local port for the add-on server. |
-| `SEARCH_TIMEOUT` | No | `6` seconds | How long to collect search results. |
+| `SEARCH_TIMEOUT` | No | `2` seconds | How long to collect search results. Increase it for more results on slower connections; shorter waits may return fewer matches. |
 | `DOWNLOAD_TIMEOUT` | No | `600` seconds | Maximum time to wait for a selected download. |
 
 ---
@@ -181,14 +183,14 @@ For regular streaming, Caddy avoids tunnel bandwidth caps, but availability stil
 3. Open `<printed-source-url>/manifest.json` in a browser. The JSON should include **BitSeekWin - BitChord-Soulseek Integration**.
 4. Add the printed source URL in BitChord under **Sources → Add addon**. Search for a known FLAC result and try playback.
 
-The first play waits while slskd downloads the selected result. If search fails, check that `SLSKD_URL` is reachable and the API key allows searches. If playback fails, check the downloads path, slskd transfer, and that `PUBLIC_BASE_URL` is reachable by BitChord. A `504` response means the download did not finish before `DOWNLOAD_TIMEOUT`.
+When BitChord requests a track's stream descriptor, BitSeekWin queues the chosen file immediately; this starts the slskd transfer before the player requests the audio bytes. If search fails, check that `SLSKD_URL` is reachable and the API key allows searches. If playback fails, check the downloads path, slskd transfer, and that `PUBLIC_BASE_URL` is reachable by BitChord. A `504` response means the download did not finish before `DOWNLOAD_TIMEOUT`.
 
 ---
 
 ## What to expect
 
 - Search results are limited to FLAC files. Titles come from shared filenames; duration and full music tags are not read from search results.
-- On first playback, BitSeekWin asks slskd to download the selected file into a per-track `bitchord-cache` subdirectory, waits for completion, then serves it. Later playback uses the cached file.
+- On the first play, BitSeekWin queues the selected FLAC as soon as BitChord asks for its stream descriptor, then serves it after slskd completes the download. Later playback uses the cached file. The first play still waits for the full download: slskd locks its incomplete file while writing it and does not expose a supported live byte stream, so playback cannot progressively read it or stream it from RAM through this API.
 - BitSeekWin uses BitChord's **HTTP add-on API**, not its JavaScript module API.
 - The source URL contains a bearer secret; keep it private. Do not expose slskd's API key or API endpoint to BitChord.
 
@@ -206,6 +208,12 @@ The tests use a stub slskd client and do not connect to Soulseek:
 ```powershell
 python -m unittest -v
 ```
+
+### Versioning
+
+The project follows Semantic Versioning's `MAJOR.MINOR.PATCH` format with a `pre-alpha.N` prerelease suffix while it is experimental. The version is defined once in `version.py` and is shown in the launcher and server startup output and the BitChord manifest.
+
+For each published pre-alpha build, increment `N` (for example, `0.3.0-pre-alpha.0` to `0.3.0-pre-alpha.1`). When moving to the next feature milestone, increment `MINOR` and restart the prerelease number at `.0`. Reserve `1.0.0` for a stable release; until then, interfaces and behavior may change.
 
 ---
 

@@ -13,6 +13,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlsplit
 
+from version import __version__
+
 
 APP_NAME = "BitSeekWin"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME / "slskd"
@@ -125,7 +127,7 @@ def _terminate_process(process: subprocess.Popen | None) -> None:
 class BitSeekWinLauncher:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("BitSeekWin Launcher")
+        self.root.title(f"BitSeekWin Launcher v{__version__}")
         self.root.geometry("760x690")
         self.root.minsize(680, 620)
         self.messages: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -151,7 +153,7 @@ class BitSeekWinLauncher:
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(1, weight=1)
 
-        ttk.Label(outer, text="BitSeekWin", font=("Segoe UI", 20, "bold")).grid(
+        ttk.Label(outer, text=f"BitSeekWin v{__version__}", font=("Segoe UI", 20, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
         ttk.Label(

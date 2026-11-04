@@ -17,10 +17,15 @@ class StubSlskd:
         self.tracks = tracks
         self.last_query = None
         self.download_calls = 0
+        self.prepare_calls = 0
 
     def search(self, query: str) -> list[server.RemoteTrack]:
         self.last_query = query
         return self.tracks
+
+    def prepare_download(self, track: server.RemoteTrack) -> tuple[Path | None, str | None]:
+        self.prepare_calls += 1
+        return None, "pending-batch"
 
     def download(self, track: server.RemoteTrack) -> Path:
         self.download_calls += 1
@@ -92,6 +97,7 @@ class AddonServerTests(unittest.TestCase):
         self.assertIn("search", manifest["resources"])
         self.assertEqual(manifest["id"], "bitseekwin-addon.bitseekwin")
         self.assertEqual(manifest["name"], "BitSeekWin - BitChord-Soulseek Integration")
+        self.assertRegex(server.VERSION, r"^\d+\.\d+\.\d+-pre-alpha\.\d+$")
         self.assertEqual(manifest["version"], server.VERSION)
         self.assertEqual(self.client.last_query, "drum kick")
         self.assertEqual(results["tracks"][0]["id"], self.track.id)
@@ -105,6 +111,7 @@ class AddonServerTests(unittest.TestCase):
             f"https://music.example.test/bitseekwin/test-secret/file/{self.track.id}",
         )
         self.assertEqual(descriptor["manifest"], "none")
+        self.assertEqual(self.client.prepare_calls, 1)
 
     def test_file_supports_byte_ranges_and_head(self) -> None:
         self.get_json("/search?q=kick")
@@ -194,10 +201,10 @@ class AddonServerTests(unittest.TestCase):
                 self.assertEqual(body["username"], self.track.username)
                 self.assertEqual(body["files"], [{"filename": self.track.filename, "size": 10}])
                 self.assertEqual(body["options"]["destination"], f"bitchord-cache/{self.track.id}")
-                path = client._download_path(self.track)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"0123456789")
                 return FakeResponse({"failures": []})
+            path = client._download_path(self.track)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"0123456789")
             return FakeResponse({"transfers": [{
                 "filename": self.track.filename,
                 "state": "Completed, Succeeded",
@@ -205,9 +212,23 @@ class AddonServerTests(unittest.TestCase):
 
         with patch.object(server.uuid, "uuid4", return_value=uuid.UUID(batch_id)):
             with patch.object(server, "urlopen", side_effect=fake_urlopen):
+                prepared_path, prepared_batch = client.prepare_download(self.track)
+                self.assertIsNone(prepared_path)
+                self.assertEqual(prepared_batch, batch_id)
                 path = client.download(self.track)
         self.assertTrue(path.is_file())
         self.assertEqual(len(requests), 2)
+
+    def test_completed_cached_file_skips_slskd_queue(self) -> None:
+        client = server.SlskdClient("http://slskd.test", "test-api-key", self.root)
+        with patch.object(server, "urlopen") as request:
+            path, batch_id = client.prepare_download(self.track)
+        self.assertEqual(path, self.audio_path)
+        self.assertIsNone(batch_id)
+        request.assert_not_called()
+
+    def test_faster_default_search_timeout(self) -> None:
+        self.assertLessEqual(server.SEARCH_TIMEOUT, 2)
 
 
 if __name__ == "__main__":
