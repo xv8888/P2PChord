@@ -14,29 +14,53 @@ Please read the [public-domain and authorized-use notice](#public-domain-and-aut
 
 ## Quick start (Windows)
 
-Follow these steps in order: install and configure slskd, start it, then connect BitSeekWin. For initial testing, run both programs on the same computer.
+The desktop launcher is the easiest way to start slskd and BitSeekWin together. It asks for your Soulseek login in a masked password field and does not save credentials.
 
 ### Before you start
 
 - A Soulseek account (username and password).
-- Python 3.10 or newer. BitSeekWin needs no extra Python packages.
-- The BitSeekWin project files downloaded to your computer.
+- Python 3.10 or newer with Tcl/Tk (included with the standard Windows installer).
+- BitSeekWin downloaded and extracted.
+- The Windows `slskd.exe` application downloaded from [slskd Releases](https://github.com/slskd/slskd/releases).
 
-### 1. Install and start slskd
+### 1. Open the launcher
 
-1. Download the Windows version from [slskd Releases](https://github.com/slskd/slskd/releases) and follow the release's Windows instructions.
-2. Start slskd and open its web interface, usually at `http://localhost:5030`.
-3. Find the `slskd.yml` configuration file in slskd's application/configuration directory. The exact location depends on how you installed it. If you already have the example YAML open, edit the actual `slskd.yml` used by the running instance. See slskd's [configuration guide](https://github.com/slskd/slskd/blob/master/docs/config.md) if you need help locating or editing it.
+Double-click `Start BitSeekWin.bat` in the project folder. If Windows cannot find Python, open PowerShell in that folder and run:
 
-### 2. Configure your Soulseek login and API key
+```powershell
+python .\launcher.py
+```
 
-Generate a private API key in PowerShell:
+### 2. Enter settings and start
+
+1. Browse to the `slskd.exe` you downloaded.
+2. Enter your Soulseek username and password. The password field is masked.
+3. Choose a downloads folder. BitSeekWin creates it if needed.
+4. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`.
+5. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
+6. Click **Start**. Keep the launcher open while using BitChord.
+
+The launcher starts slskd and BitSeekWin, generates a temporary API key, and displays the BitChord source URL in its status box. Add that URL in BitChord under **Sources → Add addon**. The API key and login fields are passed to the child processes through their startup environment; the launcher does not write credentials to a settings file. Stop both services with **Stop**.
+
+slskd runs with a separate data/configuration directory at `%LOCALAPPDATA%\BitSeekWin\slskd`; your existing slskd configuration is left untouched. BitSeekWin secrets are not persisted, but they exist in process memory while the services are running. The slskd API is bound to this computer only. The source URL contains a temporary bearer secret, so keep it private. After restarting, add the newly printed source URL to BitChord again.
+
+If the launcher cannot find Tailscale, enter the URL manually and start Funnel separately:
+
+```powershell
+tailscale funnel --bg 8080
+```
+
+### Manual setup (without the launcher)
+
+If you prefer to run slskd yourself, download and start it, then configure its `slskd.yml`. Find the existing `web:`, `soulseek:`, and `directories:` sections; remove leading `#` from the settings you use, and edit existing sections instead of adding duplicate keys.
+
+Generate an API key:
 
 ```powershell
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Copy the printed value. Create a downloads folder in File Explorer, for example `C:\Users\YOUR_WINDOWS_NAME\Music\slskd\downloads`. In `slskd.yml`, find the existing `web:`, `soulseek:`, and `directories:` sections and set the values as shown below. The example YAML often has every line commented out with `#`; remove `#` from the settings you use. If a section already exists, edit it rather than adding a second section with the same name.
+Configure slskd with your credentials, API key, and the same downloads folder you will give BitSeekWin:
 
 ```yaml
 web:
@@ -56,32 +80,18 @@ directories:
   downloads: 'C:\Users\YOUR_WINDOWS_NAME\Music\slskd\downloads'
 ```
 
-Replace the placeholders with your own values, using the same real folder path in both places. `bitseekwin` is just the API key's label; the `key` value is the secret. The `readwrite` role allows BitSeekWin to search and queue downloads. Change the sample slskd web-interface credentials too, rather than leaving the default login in place. Keep your Soulseek password and API key private.
+Change the sample slskd web-interface credentials; do not leave the defaults. Keep the Soulseek password and API key private. Save the file, restart slskd, and confirm it connects. The API is normally available at `http://127.0.0.1:5030`. See the [slskd configuration guide](https://github.com/slskd/slskd/blob/master/docs/config.md) for details.
 
-Save `slskd.yml`, then restart slskd so it loads the credentials and API key. Sign in to its web interface and confirm it connects to Soulseek. The API is normally available at `http://127.0.0.1:5030`.
-
-### 3. Start BitSeekWin
-
-In File Explorer, open the BitSeekWin project folder, click the address bar, type `powershell`, and press **Enter**. In the PowerShell window, paste the following, replacing the API key and downloads path:
+Open PowerShell in the BitSeekWin project folder and run (use the same API key and downloads folder as in `slskd.yml`):
 
 ```powershell
 $env:SLSKD_URL = 'http://127.0.0.1:5030'
 $env:SLSKD_API_KEY = 'PASTE_THE_SAME_API_KEY_FROM_slskd.yml'
 $env:SLSKD_DOWNLOAD_DIR = 'C:\Users\YOUR_WINDOWS_NAME\Music\slskd\downloads'
-# Optional: set a private secret to keep the printed source URL stable on restart
-# $env:BITCHORD_SECRET = 'replace-with-a-long-random-secret'
 python server.py
 ```
 
-`SLSKD_API_KEY` must exactly match the `key:` value in slskd's YAML; it is not your Soulseek password. Set `SLSKD_DOWNLOAD_DIR` to the completed downloads directory configured in slskd. For Docker, mount the same folder into both containers at the same container path.
-
-### 4. Add the source to BitChord
-
-Copy the **Add this source in BitChord** URL printed in PowerShell. In BitChord, open **Sources → Add addon** and paste the URL. Open `<printed-source-url>/manifest.json` in a browser to check that the server responds.
-
-The default address is local to this computer. Use it only when BitChord can reach BitSeekWin at that address. For another device or internet access, first configure [HTTPS access](#remote-access-https), then set `PUBLIC_BASE_URL` to that public address before starting the server.
-
-If you leave the optional `BITCHORD_SECRET` setting commented out, BitSeekWin generates a secret at startup, and the printed source URL changes each time. Treat the URL as a password: anyone who has it can access the add-on.
+To use HTTPS in manual mode, set `PUBLIC_BASE_URL` to your public URL before starting the server. In either mode, add the printed source URL to BitChord.
 
 ---
 
