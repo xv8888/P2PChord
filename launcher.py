@@ -125,6 +125,63 @@ def detect_tailscale_url(tailscale: str | None = None) -> str:
         return ""
 
 
+def browse_for_slskd() -> str:
+    if sys.platform != "win32":
+        raise RuntimeError("The slskd file picker is available only on Windows.")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class OpenFileName(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD),
+            ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE),
+            ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR),
+            ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD),
+            ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD),
+            ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD),
+            ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR),
+            ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD),
+            ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR),
+            ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", ctypes.c_void_p),
+            ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", ctypes.c_void_p),
+            ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    filename = ctypes.create_unicode_buffer(32768)
+    dialog = OpenFileName()
+    dialog.lStructSize = ctypes.sizeof(dialog)
+    dialog.lpstrFilter = (
+        "slskd.exe\0slskd.exe\0Executables (*.exe)\0*.exe\0All files\0*.*\0\0"
+    )
+    dialog.lpstrFile = ctypes.cast(filename, wintypes.LPWSTR)
+    dialog.nMaxFile = len(filename)
+    dialog.lpstrTitle = "Select slskd.exe"
+    dialog.Flags = 0x00001000 | 0x00000800 | 0x00000008
+
+    get_open_file_name = ctypes.WinDLL("comdlg32", use_last_error=True).GetOpenFileNameW
+    get_open_file_name.argtypes = [ctypes.POINTER(OpenFileName)]
+    get_open_file_name.restype = wintypes.BOOL
+    if get_open_file_name(ctypes.byref(dialog)):
+        return filename.value
+
+    error = ctypes.get_last_error()
+    if error:
+        raise OSError(error, "Could not open the slskd file picker.")
+    return ""
+
+
 def _terminate_process(process: subprocess.Popen | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -444,7 +501,7 @@ main{width:min(1120px,100%);margin:0 auto;padding:29px 38px 35px}.topline{displa
 <div class="section-title"><span>CONNECT YOUR SOURCES</span><span>Your login stays on this device</span></div>
 <section class="cards">
 <article class="card"><div class="card-title"><span class="step">01</span> SOULSEEK CONNECTION</div>
-<div class="field"><label for="slskd">slskd application path</label><input id="slskd" type="text" placeholder="C:\Program Files\slskd\slskd.exe" autocomplete="off"><p class="hint">Enter the full path to slskd.exe. In File Explorer, use Shift+right-click &gt; Copy as path.</p></div>
+<div class="field"><label for="slskd">slskd application path</label><div class="control"><input id="slskd" type="text" placeholder="C:\Program Files\slskd\slskd.exe" autocomplete="off"><button class="button" id="browse" type="button">Browse</button></div><p class="hint">Select slskd.exe or enter its full path.</p></div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
 <div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
 <p class="hint">Password is masked and cleared after starting. Credentials are not saved.</p>
@@ -468,6 +525,12 @@ $("downloads").value=__DOWNLOAD_DIR_JSON__;
 $("publicUrl").value=__PUBLIC_URL_JSON__;
 $("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
 update();
+$("browse").addEventListener("click",async()=>{
+  $("browse").disabled=true;
+  try{const r=await fetch(api+"browse-slskd",{method:"POST"});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not open the file picker.");if(d.path)$("slskd").value=d.path;}
+  catch(e){alert(e.message);}
+  finally{$("browse").disabled=false;}
+});
 $("start").addEventListener("click",async()=>{
   const config={slskd_path:$("slskd").value.trim(),username:$("username").value,password:$("password").value,downloads_dir:$("downloads").value.trim(),public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
@@ -568,7 +631,12 @@ def make_handler(controller: LauncherController, token: str):
                 self.send_error(403)
                 return
             path = urlsplit(self.path).path
-            if path == f"/{token}/api/start":
+            if path == f"/{token}/api/browse-slskd":
+                try:
+                    self._send_json({"path": browse_for_slskd()})
+                except (OSError, RuntimeError) as exc:
+                    self._send_json({"error": str(exc)}, 500)
+            elif path == f"/{token}/api/start":
                 if self.headers.get_content_type() != "application/json":
                     self._send_json({"error": "Expected a JSON request."}, 415)
                     return

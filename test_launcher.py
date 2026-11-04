@@ -1,5 +1,7 @@
+import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import threading
@@ -7,6 +9,7 @@ import threading
 from launcher import (
     LauncherController,
     _page,
+    browse_for_slskd,
     build_bitseekwin_environment,
     build_slskd_environment,
     make_handler,
@@ -63,10 +66,17 @@ class LauncherConfigurationTests(unittest.TestCase):
     def test_dashboard_uses_browser_ui_and_escapes_default_windows_path(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
+        self.assertIn('id="browse"', page)
+        self.assertIn('fetch(api+"browse-slskd"', page)
         self.assertIn("device.example.ts.net", page)
         self.assertIn("downloads", page)
         self.assertNotIn("__TOKEN_JSON__", page)
         self.assertNotIn("tkinter", page.casefold())
+
+    def test_slskd_picker_is_available_only_on_windows(self):
+        with patch("launcher.sys.platform", "linux"):
+            with self.assertRaisesRegex(RuntimeError, "only on Windows"):
+                browse_for_slskd()
 
     def test_dashboard_requires_loopback_host_and_session_token(self):
         token = "test-session-token"
@@ -100,6 +110,16 @@ class LauncherConfigurationTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as error:
                 urlopen(request, timeout=3)
             self.assertEqual(error.exception.code, 403)
+            request = Request(
+                f"{base}/{token}/api/browse-slskd",
+                headers={"Origin": base},
+                method="POST",
+            )
+            with patch("launcher.browse_for_slskd", return_value=r"C:\slskd\slskd.exe"):
+                with urlopen(request, timeout=3) as response:
+                    self.assertEqual(
+                        json.loads(response.read()), {"path": r"C:\slskd\slskd.exe"}
+                    )
         finally:
             httpd.shutdown()
             httpd.server_close()

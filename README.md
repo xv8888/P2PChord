@@ -2,11 +2,20 @@
 
 ### BitChord-Soulseek Integration
 
+Connect [BitChord](https://github.com/kushagrasinghx/BitChord) to [Soulseek](https://www.slsknet.org/) with slskd.
+
 **Search. Queue. Stream.**
 
 BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches your configured slskd instance for FLAC files, queues the selected file through slskd, then serves the completed download to BitChord with byte-range seeking.
 
-> **Version `0.3.0-pre-alpha.0` — very early pre-alpha prototype.** Expect bugs, breaking changes, and incomplete behavior.
+## How it works
+
+1. BitChord sends a music search to BitSeekWin.
+2. BitSeekWin asks slskd to search Soulseek and returns matching FLAC files.
+3. When you play a result, slskd downloads it to your selected folder.
+4. BitSeekWin serves the completed file to BitChord, including support for seeking.
+
+> **Version `0.3.0-pre-alpha.1` — very early pre-alpha prototype.** Expect bugs, breaking changes, and incomplete behavior.
 
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 
@@ -35,7 +44,7 @@ python .\launcher.py
 
 ### 2. Enter settings and start
 
-1. Enter the full path to the `slskd.exe` you downloaded. In File Explorer, use **Shift + right-click → Copy as path**.
+1. Click **Browse** to select the `slskd.exe` you downloaded, or enter its full path. In File Explorer, use **Shift + right-click → Copy as path**.
 2. Enter your Soulseek username and password. The password field is masked.
 3. Enter a downloads folder path. BitSeekWin creates it if needed. The default is under your Music folder, outside the project.
 4. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`.
