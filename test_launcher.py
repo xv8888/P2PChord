@@ -10,6 +10,7 @@ from launcher import (
     _page,
     build_bitseekwin_environment,
     find_node_runtime,
+    generate_source_secret,
     make_handler,
     normalize_public_url,
 )
@@ -61,12 +62,22 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertNotIn("SLSKD_API_KEY", env)
         self.assertNotIn("SLSKD_SLSK_PASSWORD", env)
 
+    def test_source_secret_is_a_secure_readable_word_passphrase(self):
+        with patch("launcher.secrets.token_bytes", return_value=bytes(range(16))):
+            self.assertEqual(
+                generate_source_secret(),
+                "babe-bibo-buban-benbin-bonbun-barber-birbor-burby",
+            )
+
     def test_dashboard_uses_browser_ui_and_describes_direct_streaming(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
         self.assertIn("Stream FLAC bytes live", page)
         self.assertIn("Stream console", page)
         self.assertIn('role="log"', page)
+        self.assertIn(".hero:before,.hero:after{display:none}", page)
+        self.assertIn("background:#1b1b22", page)
+        self.assertIn("match=/^", page)
         self.assertNotIn("slskd", page.casefold())
         self.assertIn("device.example.ts.net", page)
         self.assertNotIn("__TOKEN_JSON__", page)

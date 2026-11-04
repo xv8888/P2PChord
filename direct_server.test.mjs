@@ -3,7 +3,11 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
 import { FileAttribute } from "slsk-client";
-import { createAddonServer, matchScore } from "./direct_server.mjs";
+import {
+  createAddonServer,
+  generateSourceSecret,
+  matchScore,
+} from "./direct_server.mjs";
 
 class FakeDownload extends EventEmitter {
   constructor(options, chunks, delay = 0) {
@@ -41,6 +45,8 @@ class FakeDownload extends EventEmitter {
     this.isSettled = true;
     const error = new Error(reason);
     this.stream.destroy(error);
+    this.emit("status", "cancelled");
+    this.emit("failed", error);
     this.reject(error);
     return true;
   }
@@ -66,6 +72,15 @@ const track = {
   attribs: {},
   speed: 1000,
 };
+
+test("source secrets are readable word passphrases with 128 bits of entropy", () => {
+  const expected = "babe-bibo-buban-benbin-bonbun-barber-birbor-burby";
+  assert.equal(
+    generateSourceSecret(Buffer.from(Array.from({ length: 16 }, (_, i) => i))),
+    expected,
+  );
+  assert.equal(generateSourceSecret().split("-").length, 8);
+});
 
 let server;
 let base;
@@ -124,19 +139,20 @@ async function searchTrack() {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "0.4.0-pre-alpha.0");
+  assert.equal(manifest.version, "0.4.0-pre-alpha.1");
   assert.match(manifest.description, /directly from Soulseek peers/);
   const response = await fetch(`${base}/search?q=kick`);
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
   assert.equal(body.tracks[0].format, "flac");
+  assert.equal(body.tracks[0].audioQuality, "LOSSLESS");
   assert.equal(body.tracks[0].artist, "");
   assert.equal("duration" in body.tracks[0], false);
   assert.equal(client.lastSearch.req, "kick");
   assert.equal(client.lastSearch.timeout, 2000);
 });
 
-test("search returns only the closest matching FLAC", async () => {
+test("search ranks the closest FLAC candidates first", async () => {
   client.search = async () => [
     { ...track, file: "Album\\Kick Song Remix.flac" },
     {
@@ -148,16 +164,44 @@ test("search returns only the closest matching FLAC", async () => {
   ];
   const response = await fetch(`${base}/search?q=kick%20song`);
   const body = await response.json();
-  assert.equal(body.tracks.length, 1);
+  assert.equal(body.tracks.length, 3);
   assert.equal(body.tracks[0].title, "Kick Song");
-  assert.equal(body.tracks[0].duration, 214);
   assert.equal(body.tracks[0].artist, "");
+  assert.equal(
+    body.tracks.find((candidate) => candidate.duration === 214)?.title,
+    "Kick Song",
+  );
   assert.equal(matchScore("kick song", "Album\\Kick Song.flac"), 1);
   assert.ok(
     matchScore("kick song", "Kick Song.flac") >
       matchScore("kick song", "Kick Song Remix.flac"),
   );
-  assert.match(logEntries.at(-1).message, /selected "Kick Song"/);
+  assert.match(logEntries.at(-1).message, /returning 3 ranked candidates/);
+});
+
+test("track-numbered artist-title filenames expose matchable metadata", async () => {
+  client.search = async () => [
+    { ...track, file: "Nettspend - nite nite.flac", attribs: { 1: 134 } },
+    { ...track, file: "06 - Nite Ride.flac", attribs: { 1: 193 } },
+    { ...track, file: "05. nite nite.flac", attribs: { 1: 134 } },
+  ];
+  const response = await fetch(`${base}/search?q=nite%20nite%20nettspend`);
+  const body = await response.json();
+  assert.equal(body.tracks.length, 3);
+  assert.deepEqual(
+    body.tracks[0],
+    {
+      id: body.tracks[0].id,
+      title: "nite nite",
+      artist: "Nettspend",
+      album: "",
+      duration: 134,
+      format: "flac",
+      audioQuality: "LOSSLESS",
+    },
+  );
+  assert.equal(body.tracks[1].title, "nite nite");
+  assert.equal(body.tracks[1].duration, 134);
 });
 
 test("stream descriptor points to the authenticated direct-stream endpoint", async () => {
@@ -169,6 +213,10 @@ test("stream descriptor points to the authenticated direct-stream endpoint", asy
     descriptor.url,
     `https://music.example.test/bitseekwin/test-secret/file/${id}`,
   );
+  assert.equal(descriptor.format, "flac");
+  assert.equal(descriptor.codec, "flac");
+  assert.equal(descriptor.container, "flac");
+  assert.equal(descriptor.mimeType, "audio/flac");
   assert.equal(downloads.length, 0);
 });
 
@@ -212,10 +260,10 @@ test("completed transfers release an active-stream slot", async () => {
     assert.equal(response.status, 200);
     await response.arrayBuffer();
   }
-  assert.equal(downloads.length, 3);
+  assert.equal(downloads.length, 1);
 });
 
-test("range requests start a peer transfer at the requested byte offset", async () => {
+test("range requests are served from the beginning of a peer transfer", async () => {
   const id = await searchTrack();
   const response = await fetch(`${base}/file/${id}`, {
     headers: { Range: "bytes=2-5" },
@@ -223,7 +271,34 @@ test("range requests start a peer transfer at the requested byte offset", async 
   assert.equal(response.status, 206);
   assert.equal(response.headers.get("content-range"), "bytes 2-5/10");
   assert.equal(await response.text(), "2345");
-  assert.equal(downloads[0].options.offset, 2);
+  assert.equal(downloads[0].options.offset, 0);
+});
+
+test("successive range requests share one active peer transfer", async () => {
+  const id = await searchTrack();
+  const firstResponse = await fetch(`${base}/file/${id}`);
+  assert.equal(firstResponse.status, 200);
+  assert.equal(downloads.length, 1);
+  const firstReader = firstResponse.body.getReader();
+  assert.equal(
+    Buffer.from((await firstReader.read()).value).toString(),
+    "0123",
+  );
+  await firstReader.cancel();
+
+  const secondResponse = await fetch(`${base}/file/${id}`, {
+    headers: { Range: "bytes=2-5" },
+  });
+  assert.equal(secondResponse.status, 206);
+  assert.equal(secondResponse.headers.get("content-range"), "bytes 2-5/10");
+  assert.equal(await secondResponse.text(), "2345");
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].options.offset, 0);
+  await downloads[0].promise;
+  assert.equal(
+    logEntries.some(({ level }) => level === "ERROR"),
+    false,
+  );
 });
 
 test("HEAD reports file metadata without opening a peer transfer", async () => {

@@ -22,6 +22,25 @@ PROJECT_DIR = Path(__file__).resolve().parent
 PORT = 8080
 MAX_REQUEST_SIZE = 64 * 1024
 MAX_LOG_LINES = 250
+SECRET_ONSETS = (
+    "b", "br", "d", "dr", "f", "g", "gr", "h",
+    "k", "kr", "l", "m", "n", "p", "pr", "s",
+)
+SECRET_RIMES = (
+    "a", "e", "i", "o", "u", "an", "en", "in",
+    "on", "un", "ar", "er", "ir", "or", "ur", "y",
+)
+
+
+def generate_source_secret() -> str:
+    random_bytes = secrets.token_bytes(16)
+    words = []
+    for offset in range(0, len(random_bytes), 2):
+        syllables = []
+        for value in random_bytes[offset : offset + 2]:
+            syllables.append(SECRET_ONSETS[value >> 4] + SECRET_RIMES[value & 15])
+        words.append("".join(syllables))
+    return "-".join(words)
 
 
 def normalize_public_url(value: str) -> str:
@@ -282,7 +301,7 @@ class LauncherController:
                 base_env,
                 username,
                 password,
-                secrets.token_urlsafe(32),
+                generate_source_secret(),
                 public_url,
             )
 
@@ -397,7 +416,16 @@ _HTML = r"""<!doctype html>
 main{width:min(1120px,100%);margin:0 auto;padding:29px 38px 35px}.topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:17px;font-size:10px;font-weight:750;letter-spacing:1.3px;color:var(--muted)}.badge{background:#3a202a;color:#ff9daf;padding:7px 10px;border-radius:999px;font-size:9px;letter-spacing:.7px}.hero{height:166px;border-radius:13px;overflow:hidden;padding:24px 28px;background:linear-gradient(108deg,#f1325a 0,#bb245f 49%,#61245c 100%);position:relative;margin-bottom:21px;box-shadow:0 16px 42px #bd20552c}.hero:after{content:"";position:absolute;width:214px;height:214px;right:35px;top:-112px;border-radius:50%;border:1px solid #ffffff55;box-shadow:0 0 0 25px #ffffff12,0 0 0 52px #ffffff0a}.hero:before{content:"";position:absolute;width:58px;height:58px;right:113px;top:14px;border:2px solid #ffffff66;border-radius:50%;background:#ffcad344}.eyebrow{font-size:9px;letter-spacing:1.4px;color:#ffe0e8;font-weight:750}.hero h1{font-size:29px;letter-spacing:-1px;margin:9px 0 1px;line-height:1.08}.hero p{font-size:11px;color:#ffe3e9;margin:8px 0 0}.section-title{display:flex;align-items:center;justify-content:space-between;margin:0 1px 9px;font-size:10px;font-weight:750;letter-spacing:1.15px;color:var(--muted)}.section-title span:last-child{font-size:10px;font-weight:450;letter-spacing:0;color:var(--subtle)}
 .cards{display:grid;grid-template-columns:1fr 1fr;gap:13px}.card{background:linear-gradient(150deg,#1d1d24,#19191f);border:1px solid #30303a;border-radius:11px;padding:17px 18px}.card-title{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:750;letter-spacing:.7px}.step{color:var(--pink);font-size:12px}.field{margin-top:13px}.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:9px;font-weight:750;letter-spacing:.8px;text-transform:uppercase}.control{display:flex;gap:7px}.control input,.field input{width:100%;min-width:0;background:var(--field);border:1px solid #393944;border-radius:6px;padding:9px 10px;color:#f7f5f8;outline:none;font-size:11px;transition:border-color .15s,box-shadow .15s}.control input:focus,.field input:focus{border-color:#ed3a62;box-shadow:0 0 0 3px #fa315c24}.control input::placeholder,.field input::placeholder{color:#777480}.hint{font-size:9px;color:var(--subtle);margin:7px 0 0}.button{border:0;border-radius:6px;padding:9px 12px;background:#30303a;color:#f2eff3;font-size:10px;font-weight:700;white-space:nowrap;transition:filter .15s,transform .15s}.button:hover{filter:brightness(1.15)}.button:active{transform:translateY(1px)}.button.primary{background:linear-gradient(100deg,#fa315c,#df2458);color:white;box-shadow:0 5px 16px #fa315c30}.button:disabled{opacity:.45;cursor:not-allowed}.check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:10px;color:#d4d1da}.check input{accent-color:var(--pink);width:14px;height:14px}.actions{display:flex;gap:8px;margin-top:15px}.actions .primary{flex:1}
 .privacy{font-size:9px;line-height:1.5;color:var(--subtle);margin:12px 2px 13px}.activity{background:linear-gradient(145deg,#191a20,#111216);border:1px solid #33343e;border-radius:12px;padding:14px;box-shadow:0 12px 34px #0003}.activity-head{display:flex;align-items:center;gap:9px;min-height:31px}.console-title{display:flex;align-items:center;gap:10px;margin-right:8px}.console-title strong{font-size:12px;letter-spacing:.1px}.console-kicker{font-size:8px;font-weight:800;letter-spacing:1px;color:#ff8098}.dot{width:8px;height:8px;border-radius:50%;background:#777480}.dot.success{background:var(--green);box-shadow:0 0 10px #57d99888}.dot.error{background:#ff617b;box-shadow:0 0 10px #ff617b88}.activity-state{font-size:10px;letter-spacing:0;color:#d9d6de}.copy{margin-left:auto}.url{margin-top:10px;padding:9px 10px;border:1px solid #292a32;border-radius:6px;background:#111216;color:#ff8098;font:10px Consolas,monospace;overflow-wrap:anywhere;min-height:30px}.url.empty{color:#686671}.console-meta{display:flex;justify-content:space-between;margin:13px 2px 6px;color:#777986;font-size:8px;font-weight:750;letter-spacing:1px}.logs{height:204px;overflow:auto;padding:8px 9px;border:1px solid #282a32;border-radius:7px;background:#0b0c0f;color:#c6c7cf;font:10px/1.65 Consolas,"Cascadia Mono",monospace;scrollbar-color:#454650 #0b0c0f}.log-line{display:grid;grid-template-columns:58px 55px minmax(0,1fr);gap:8px;padding:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}.log-time{color:#696c78}.log-kind{font-size:8px;font-weight:800;color:#8f93a0}.log-message{color:#d0d1d8}.log-line.search .log-kind{color:#80bfff}.log-line.stream .log-kind{color:#63dfaa}.log-line.warn .log-kind{color:#ffd27a}.log-line.error .log-kind,.error{color:#ff849a}.success{color:var(--green)}
-@media(max-width:850px){.app{grid-template-columns:1fr}aside{display:none}main{padding:21px 18px}.hero{height:152px}.cards{grid-template-columns:1fr}.activity-head{flex-wrap:wrap}.activity-state{margin-left:auto}.copy{margin-left:0}.logs{height:190px}.log-line{grid-template-columns:50px 48px minmax(0,1fr);gap:5px}}
+.mark{border-radius:9px;background:#fa315c;box-shadow:none}
+body{background:var(--bg)}
+.hero{height:auto;min-height:145px;background:#1b1b22;border:1px solid #30303a;box-shadow:none}
+.hero:before,.hero:after{display:none}
+.eyebrow,.hero p{color:var(--muted)}
+.badge{border-radius:6px;background:#2c2025}
+.card{background:#1b1b22}
+.button.primary{background:#ed3157;box-shadow:none}
+.activity{background:#17181d;box-shadow:none}
+@media(max-width:850px){.app{grid-template-columns:1fr}aside{display:none}main{padding:21px 18px}.hero{height:auto;min-height:152px}.cards{grid-template-columns:1fr}.activity-head{flex-wrap:wrap}.activity-state{margin-left:auto}.copy{margin-left:0}.logs{height:190px}.log-line{grid-template-columns:50px 48px minmax(0,1fr);gap:5px}}
 </style>
 </head>
 <body>
@@ -442,7 +470,7 @@ $("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipb
 $("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and disconnect from Soulseek?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='hero'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
 async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});renderStatus(await r.json());}catch(e){}}
 function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;renderLogs(s.logs||[],s.detail||"");$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
-function renderLogs(entries,fallback){const box=$("logs"),follow=box.scrollHeight-box.scrollTop-box.clientHeight<24,lines=entries.length?entries:[fallback||"Waiting for activity…"];box.replaceChildren();for(const line of lines){const row=document.createElement("div"),time=document.createElement("span"),kind=document.createElement("span"),message=document.createElement("span"),match=/\[(\d{2}:\d{2}:\d{2})\]\s+\[(SEARCH|STREAM|WARN|ERROR|INFO)\]\s*/i.exec(line);const level=match?match[2].toLowerCase():"info";row.className="log-line "+level;time.className="log-time";time.textContent=match?match[1]:"";kind.className="log-kind";kind.textContent=level.toUpperCase();message.className="log-message";message.textContent=match?line.slice(match[0].length):line;row.append(time,kind,message);box.append(row);}$("log-count").textContent=entries.length+" EVENT"+(entries.length===1?"":"S");if(follow)box.scrollTop=box.scrollHeight;}
+function renderLogs(entries,fallback){const box=$("logs"),follow=box.scrollHeight-box.scrollTop-box.clientHeight<24,lines=entries.length?entries:[fallback||"Waiting for activity…"];box.replaceChildren();for(const line of lines){const row=document.createElement("div"),time=document.createElement("span"),kind=document.createElement("span"),message=document.createElement("span"),match=/^(?:\[[^\]]+\]\s*)?\[(\d{2}:\d{2}:\d{2})\]\s+\[(SEARCH|STREAM|WARN|ERROR|INFO)\]\s*(.*)$/i.exec(line);const level=match?match[2].toLowerCase():"info";row.className="log-line "+level;time.className="log-time";time.textContent=match?match[1]:"";kind.className="log-kind";kind.textContent=level.toUpperCase();message.className="log-message";message.textContent=match?match[3]:line;row.append(time,kind,message);box.append(row);}$("log-count").textContent=entries.length+" EVENT"+(entries.length===1?"":"S");if(follow)box.scrollTop=box.scrollHeight;}
 setInterval(update,1000);
 </script>
 </body>
