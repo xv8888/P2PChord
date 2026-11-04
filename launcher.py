@@ -2,11 +2,11 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
 import subprocess
-import sys
 import threading
 import time
 import webbrowser
@@ -18,10 +18,7 @@ from urllib.parse import urlsplit
 from version import __version__
 
 APP_NAME = "BitSeekWin"
-APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME / "slskd"
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_DOWNLOAD_DIR = Path.home() / "Music" / APP_NAME / "downloads"
-SLSKD_URL = "http://127.0.0.1:5030"
 PORT = 8080
 MAX_REQUEST_SIZE = 64 * 1024
 MAX_LOG_LINES = 250
@@ -47,46 +44,47 @@ def normalize_public_url(value: str) -> str:
     return url
 
 
-def build_slskd_environment(
+def build_bitseekwin_environment(
     base: dict[str, str],
     username: str,
     password: str,
-    api_key: str,
-    downloads_dir: Path,
-    app_dir: Path = APP_DIR,
-) -> dict[str, str]:
-    env = base.copy()
-    env.pop("SLSKD_CONFIG", None)
-    env.update(
-        {
-            "APP_DIR": str(app_dir),
-            "SLSKD_SLSK_USERNAME": username,
-            "SLSKD_SLSK_PASSWORD": password,
-            "SLSKD_DOWNLOADS_DIR": str(downloads_dir),
-            "SLSKD_API_KEY": f"role=ReadWrite;{api_key}",
-            "SLSKD_HTTP_IP_ADDRESS": "127.0.0.1",
-            "SLSKD_HTTP_PORT": "5030",
-        }
-    )
-    return env
-
-
-def build_bitseekwin_environment(
-    base: dict[str, str],
-    api_key: str,
-    downloads_dir: Path,
+    secret: str,
     public_url: str,
 ) -> dict[str, str]:
     env = base.copy()
+    for key in ("SLSKD_API_KEY", "SLSKD_SLSK_USERNAME", "SLSKD_SLSK_PASSWORD"):
+        env.pop(key, None)
     env.update(
         {
-            "SLSKD_URL": SLSKD_URL,
-            "SLSKD_API_KEY": api_key,
-            "SLSKD_DOWNLOAD_DIR": str(downloads_dir),
+            "SOULSEEK_USERNAME": username,
+            "SOULSEEK_PASSWORD": password,
+            "BITCHORD_SECRET": secret,
             "PUBLIC_BASE_URL": public_url,
+            "PORT": str(PORT),
         }
     )
     return env
+
+
+def find_node_runtime() -> str:
+    executable = shutil.which("node")
+    if not executable:
+        raise ValueError("Install Node.js 22 or newer, then restart the launcher.")
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("Could not check the installed Node.js version.") from error
+    version = re.fullmatch(r"v(\d+)\.\d+\.\d+", result.stdout.strip())
+    if version is None or int(version.group(1)) < 22:
+        raise ValueError("Node.js 22 or newer is required.")
+    return executable
 
 
 def find_tailscale() -> str | None:
@@ -125,63 +123,6 @@ def detect_tailscale_url(tailscale: str | None = None) -> str:
         return ""
 
 
-def browse_for_slskd() -> str:
-    if sys.platform != "win32":
-        raise RuntimeError("The slskd file picker is available only on Windows.")
-
-    import ctypes
-    from ctypes import wintypes
-
-    class OpenFileName(ctypes.Structure):
-        _fields_ = [
-            ("lStructSize", wintypes.DWORD),
-            ("hwndOwner", wintypes.HWND),
-            ("hInstance", wintypes.HINSTANCE),
-            ("lpstrFilter", wintypes.LPCWSTR),
-            ("lpstrCustomFilter", wintypes.LPWSTR),
-            ("nMaxCustFilter", wintypes.DWORD),
-            ("nFilterIndex", wintypes.DWORD),
-            ("lpstrFile", wintypes.LPWSTR),
-            ("nMaxFile", wintypes.DWORD),
-            ("lpstrFileTitle", wintypes.LPWSTR),
-            ("nMaxFileTitle", wintypes.DWORD),
-            ("lpstrInitialDir", wintypes.LPCWSTR),
-            ("lpstrTitle", wintypes.LPCWSTR),
-            ("Flags", wintypes.DWORD),
-            ("nFileOffset", wintypes.WORD),
-            ("nFileExtension", wintypes.WORD),
-            ("lpstrDefExt", wintypes.LPCWSTR),
-            ("lCustData", wintypes.LPARAM),
-            ("lpfnHook", ctypes.c_void_p),
-            ("lpTemplateName", wintypes.LPCWSTR),
-            ("pvReserved", ctypes.c_void_p),
-            ("dwReserved", wintypes.DWORD),
-            ("FlagsEx", wintypes.DWORD),
-        ]
-
-    filename = ctypes.create_unicode_buffer(32768)
-    dialog = OpenFileName()
-    dialog.lStructSize = ctypes.sizeof(dialog)
-    dialog.lpstrFilter = (
-        "slskd.exe\0slskd.exe\0Executables (*.exe)\0*.exe\0All files\0*.*\0\0"
-    )
-    dialog.lpstrFile = ctypes.cast(filename, wintypes.LPWSTR)
-    dialog.nMaxFile = len(filename)
-    dialog.lpstrTitle = "Select slskd.exe"
-    dialog.Flags = 0x00001000 | 0x00000800 | 0x00000008
-
-    get_open_file_name = ctypes.WinDLL("comdlg32", use_last_error=True).GetOpenFileNameW
-    get_open_file_name.argtypes = [ctypes.POINTER(OpenFileName)]
-    get_open_file_name.restype = wintypes.BOOL
-    if get_open_file_name(ctypes.byref(dialog)):
-        return filename.value
-
-    error = ctypes.get_last_error()
-    if error:
-        raise OSError(error, "Could not open the slskd file picker.")
-    return ""
-
-
 def _terminate_process(process: subprocess.Popen | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -201,11 +142,10 @@ def _terminate_process(process: subprocess.Popen | None) -> None:
 class LauncherController:
     def __init__(self) -> None:
         self.lock = threading.RLock()
-        self.slskd_process: subprocess.Popen | None = None
         self.server_process: subprocess.Popen | None = None
         self.starting = False
         self.status = "Ready"
-        self.detail = "Enter your slskd path and Soulseek login to get started."
+        self.detail = "Enter your Soulseek login to get started."
         self.source_url = ""
         self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.stop_requested = threading.Event()
@@ -217,26 +157,20 @@ class LauncherController:
 
     def snapshot(self) -> dict:
         with self.lock:
-            slskd_running = (
-                self.slskd_process is not None and self.slskd_process.poll() is None
-            )
-            server_running = (
+            running = (
                 self.server_process is not None and self.server_process.poll() is None
             )
-            if not self.starting and (
-                self.slskd_process is not None or self.server_process is not None
-            ):
-                if not slskd_running or not server_running:
-                    self.status = "Stopped unexpectedly"
-                    self.detail = (
-                        "Check the activity log. Select Stop before starting again."
-                    )
+            if not self.starting and self.server_process is not None and not running:
+                self.status = "Stopped unexpectedly"
+                self.detail = (
+                    "Check the activity log. Select Stop before starting again."
+                )
             return {
                 "status": self.status,
                 "detail": self.detail,
                 "starting": self.starting,
-                "running": slskd_running and server_running,
-                "active": slskd_running or server_running,
+                "running": running,
+                "active": running,
                 "source_url": self.source_url,
                 "logs": list(self.logs),
             }
@@ -248,25 +182,14 @@ class LauncherController:
                     "Services are already starting or running. Stop them before restarting."
                 )
 
-        executable_text = str(config.get("slskd_path", "")).strip()
         username = str(config.get("username", "")).strip()
         password = str(config.get("password", ""))
-        downloads_text = str(config.get("downloads_dir", "")).strip()
         public_text = str(config.get("public_url", ""))
         use_funnel = config.get("start_funnel") is True
 
-        if not executable_text:
-            raise ValueError("Choose the slskd.exe application.")
-        executable = Path(executable_text)
-        if not executable.is_file():
-            raise ValueError("The selected slskd.exe file was not found.")
         if not username or not password:
             raise ValueError("Enter your Soulseek username and password.")
-        if not downloads_text:
-            raise ValueError("Choose a downloads folder.")
-        downloads = Path(downloads_text)
-        if not downloads.is_absolute():
-            raise ValueError("The downloads folder must be an absolute path.")
+        node = find_node_runtime()
         public_url = normalize_public_url(public_text)
         if use_funnel and not public_url.startswith("https://"):
             raise ValueError("Tailscale Funnel requires an https:// public URL.")
@@ -280,21 +203,18 @@ class LauncherController:
                 )
             self.starting = True
             self.status = "Starting"
-            self.detail = "Preparing slskd and BitSeekWin…"
+            self.detail = "Connecting directly to Soulseek…"
             self.source_url = ""
             self.stop_requested.clear()
             self.logs.clear()
         threading.Thread(
             target=self._start_worker,
-            args=(executable, username, password, downloads, public_url, use_funnel),
+            args=(node, username, password, public_url, use_funnel),
             daemon=True,
         ).start()
 
     def _any_process_running(self) -> bool:
-        return any(
-            process is not None and process.poll() is None
-            for process in (self.slskd_process, self.server_process)
-        )
+        return self.server_process is not None and self.server_process.poll() is None
 
     def _port_in_use(self, port: int) -> bool:
         try:
@@ -322,30 +242,48 @@ class LauncherController:
 
     def _start_worker(
         self,
-        executable: Path,
+        node: str,
         username: str,
         password: str,
-        downloads: Path,
         public_url: str,
         use_funnel: bool,
     ) -> None:
-        api_key = secrets.token_urlsafe(32)
-        slskd_process: subprocess.Popen | None = None
         server_process: subprocess.Popen | None = None
         try:
-            downloads.mkdir(parents=True, exist_ok=True)
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            for port, service in ((5030, "slskd"), (PORT, "BitSeekWin")):
-                if self._port_in_use(port):
+            if not (PROJECT_DIR / "node_modules" / "slsk-client").is_dir():
+                npm = shutil.which("npm.cmd") or shutil.which("npm")
+                if not npm:
                     raise RuntimeError(
-                        f"Port {port} is already in use; close the existing {service} first."
+                        "npm was not found. Install Node.js 22 or newer and restart."
                     )
+                self.log("Installing the direct Soulseek client dependency…")
+                install = subprocess.run(
+                    [npm, "install", "--no-audit", "--no-fund"],
+                    cwd=str(PROJECT_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if install.returncode:
+                    detail = (install.stderr or install.stdout).strip()
+                    raise RuntimeError(
+                        f"npm install failed: {detail[-2000:] or 'unknown error'}"
+                    )
+            if self._port_in_use(PORT):
+                raise RuntimeError(
+                    f"Port {PORT} is already in use; close the existing BitSeekWin first."
+                )
             if self.stop_requested.is_set():
                 raise RuntimeError("Startup was cancelled.")
 
             base_env = os.environ.copy()
-            slskd_env = build_slskd_environment(
-                base_env, username, password, api_key, downloads
+            server_env = build_bitseekwin_environment(
+                base_env,
+                username,
+                password,
+                secrets.token_urlsafe(32),
+                public_url,
             )
 
             if use_funnel:
@@ -366,49 +304,8 @@ class LauncherController:
 
             if self.stop_requested.is_set():
                 raise RuntimeError("Startup was cancelled.")
-            slskd_process = subprocess.Popen(
-                [str(executable)],
-                cwd=str(executable.parent),
-                env=slskd_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            with self.lock:
-                self.slskd_process = slskd_process
-            if self.stop_requested.is_set():
-                raise RuntimeError("Startup was cancelled.")
-            threading.Thread(
-                target=self._read_output,
-                args=("slskd", slskd_process, (username, password, api_key)),
-                daemon=True,
-            ).start()
-            self.log("Starting slskd…")
-
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
-                if self.stop_requested.is_set():
-                    raise RuntimeError("Startup was cancelled.")
-                if slskd_process.poll() is not None:
-                    raise RuntimeError(
-                        f"slskd exited with code {slskd_process.returncode}. Check the activity log."
-                    )
-                if self._port_in_use(5030):
-                    break
-                time.sleep(0.5)
-            else:
-                raise RuntimeError("slskd did not open port 5030 within 60 seconds.")
-
-            if self.stop_requested.is_set():
-                raise RuntimeError("Startup was cancelled.")
-            server_env = build_bitseekwin_environment(
-                base_env, api_key, downloads, public_url
-            )
             server_process = subprocess.Popen(
-                [sys.executable, str(PROJECT_DIR / "server.py")],
+                [node, str(PROJECT_DIR / "direct_server.mjs")],
                 cwd=str(PROJECT_DIR),
                 env=server_env,
                 stdout=subprocess.PIPE,
@@ -420,26 +317,41 @@ class LauncherController:
             )
             with self.lock:
                 self.server_process = server_process
-                self.status = "Listening"
-                self.detail = "slskd and BitSeekWin are running."
             if self.stop_requested.is_set():
                 raise RuntimeError("Startup was cancelled.")
             threading.Thread(
                 target=self._read_output,
-                args=("BitSeekWin", server_process, (api_key,)),
+                args=("BitSeekWin", server_process, (username, password)),
                 daemon=True,
             ).start()
+            self.log("Connecting directly to Soulseek…")
+
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if self.stop_requested.is_set():
+                    raise RuntimeError("Startup was cancelled.")
+                if server_process.poll() is not None:
+                    raise RuntimeError(
+                        f"BitSeekWin exited with code {server_process.returncode}. Check the activity log."
+                    )
+                if self._port_in_use(PORT):
+                    break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    "BitSeekWin could not connect to Soulseek and open port 8080 within 90 seconds."
+                )
+            with self.lock:
+                self.status = "Listening"
+                self.detail = "Connected to Soulseek; direct streaming is ready."
             self.log("BitSeekWin started. Add the source URL below in BitChord.")
         except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             self.log(f"Startup failed: {exc}")
             self.stop_requested.set()
             _terminate_process(server_process)
-            _terminate_process(slskd_process)
             with self.lock:
                 if self.server_process is server_process:
                     self.server_process = None
-                if self.slskd_process is slskd_process:
-                    self.slskd_process = None
                 if self.status != "Stopped":
                     self.status = "Startup failed"
                     self.detail = str(exc)
@@ -451,17 +363,14 @@ class LauncherController:
         self.stop_requested.set()
         with self.lock:
             server_process = self.server_process
-            slskd_process = self.slskd_process
             self.server_process = None
-            self.slskd_process = None
             self.status = "Stopped"
-            self.detail = "BitSeekWin and slskd have been stopped."
+            self.detail = "BitSeekWin has been stopped."
             self.source_url = ""
-        self.log("Stopping BitSeekWin and slskd…")
+        self.log("Stopping BitSeekWin and the Soulseek connection…")
         _terminate_process(server_process)
-        _terminate_process(slskd_process)
         self.log(
-            "Services stopped. Tailscale Funnel, if enabled, remains configured in Tailscale."
+            "BitSeekWin stopped. Tailscale Funnel, if enabled, remains configured in Tailscale."
         )
 
 
@@ -470,7 +379,6 @@ def _page(token: str, public_url: str) -> bytes:
         _HTML.replace("__TOKEN_JSON__", json.dumps(token))
         .replace("__VERSION__", __version__)
         .replace("__PUBLIC_URL_JSON__", json.dumps(public_url))
-        .replace("__DOWNLOAD_DIR_JSON__", json.dumps(str(DEFAULT_DOWNLOAD_DIR)))
     )
     return html.encode("utf-8")
 
@@ -497,50 +405,41 @@ main{width:min(1120px,100%);margin:0 auto;padding:29px 38px 35px}.topline{displa
 <aside><div class="brand"><div class="mark">♪</div><div class="brand-name">BitSeekWin<small>FOR BITCHORD</small></div></div><div class="nav-label">WORKSPACE</div><div class="nav-item">♫ &nbsp; Player setup</div><div class="side-foot">SOULSEEK &nbsp;•&nbsp; BITCHORD<br><small>Build __VERSION__</small></div></aside>
 <main>
 <div class="topline"><span>YOUR PERSONAL MUSIC BRIDGE</span><span class="badge">VERY EARLY PRE-ALPHA</span></div>
-<section class="hero"><div class="eyebrow">BITSEEKWIN &nbsp;/&nbsp; BITCHORD</div><h1>Your music, connected.</h1><p>Search Soulseek &nbsp;·&nbsp; Queue a FLAC &nbsp;·&nbsp; Listen in BitChord</p></section>
+<section class="hero"><div class="eyebrow">BITSEEKWIN &nbsp;/&nbsp; BITCHORD</div><h1>Your music, connected.</h1><p>Search Soulseek &nbsp;·&nbsp; Stream FLAC bytes live &nbsp;·&nbsp; Listen in BitChord</p></section>
 <div class="section-title"><span>CONNECT YOUR SOURCES</span><span>Your login stays on this device</span></div>
 <section class="cards">
-<article class="card"><div class="card-title"><span class="step">01</span> SOULSEEK CONNECTION</div>
-<div class="field"><label for="slskd">slskd application path</label><div class="control"><input id="slskd" type="text" placeholder="C:\Program Files\slskd\slskd.exe" autocomplete="off"><button class="button" id="browse" type="button">Browse</button></div><p class="hint">Select slskd.exe or enter its full path.</p></div>
+<article class="card"><div class="card-title"><span class="step">01</span> DIRECT SOULSEEK CONNECTION</div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
 <div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
 <p class="hint">Password is masked and cleared after starting. Credentials are not saved.</p>
 </article>
-<article class="card"><div class="card-title"><span class="step">02</span> LIBRARY &amp; STREAM</div>
-<div class="field"><label for="downloads">Download destination</label><input id="downloads" type="text" autocomplete="off"><p class="hint">Enter a full folder path; it will be created if it does not exist.</p></div>
+<article class="card"><div class="card-title"><span class="step">02</span> DIRECT STREAM</div>
 <div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" placeholder="https://device.tailnet.ts.net"></div>
 <label class="check"><input id="funnel" type="checkbox"> Start Tailscale Funnel on port 8080</label>
 <p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p>
 <div class="actions"><button class="button primary" id="start">▶ &nbsp; Start listening</button><button class="button" id="stop" disabled>Stop</button></div>
 </article>
 </section>
-<p class="privacy">Credentials are used for this launch only and are not written to a settings file. slskd uses a separate app-data folder and its API listens on this PC only. The printed source URL is a secret; keep it private.</p>
+<p class="privacy">Credentials are used for this launch only and are not written to a settings file. BitSeekWin connects directly to Soulseek and streams incoming file data to BitChord without waiting for a completed download. The printed source URL is a secret; keep it private.</p>
 <section class="activity"><div class="activity-head"><span>ACTIVITY</span><span id="dot" class="dot"></span><span id="state" class="activity-state">Ready</span><button class="button copy" id="copy" disabled>Copy source URL</button><button class="button" id="exit">Exit launcher</button></div><div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div><div id="logs" class="logs">Ready when you are.</div></section>
 </main></div>
 <script>
 const token=__TOKEN_JSON__, api="/"+token+"/api/";
 const $=id=>document.getElementById(id);
 let sourceUrl="";
-$("downloads").value=__DOWNLOAD_DIR_JSON__;
 $("publicUrl").value=__PUBLIC_URL_JSON__;
 $("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
 update();
-$("browse").addEventListener("click",async()=>{
-  $("browse").disabled=true;
-  try{const r=await fetch(api+"browse-slskd",{method:"POST"});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not open the file picker.");if(d.path)$("slskd").value=d.path;}
-  catch(e){alert(e.message);}
-  finally{$("browse").disabled=false;}
-});
 $("start").addEventListener("click",async()=>{
-  const config={slskd_path:$("slskd").value.trim(),username:$("username").value,password:$("password").value,downloads_dir:$("downloads").value.trim(),public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked};
+  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
-  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Starting slskd…";}
+  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}
   await update();
 });
 $("stop").addEventListener("click",async()=>{try{await fetch(api+"stop",{method:"POST"});}catch(e){}await update();});
 $("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipboard.writeText(sourceUrl);$("state").textContent="URL copied";}});
-$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and stop slskd?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='hero'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
+$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and disconnect from Soulseek?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='hero'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
 async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});renderStatus(await r.json());}catch(e){}}
 function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;$("logs").textContent=(s.logs||[]).join("\n")||s.detail||"";$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
 setInterval(update,1000);
@@ -631,12 +530,7 @@ def make_handler(controller: LauncherController, token: str):
                 self.send_error(403)
                 return
             path = urlsplit(self.path).path
-            if path == f"/{token}/api/browse-slskd":
-                try:
-                    self._send_json({"path": browse_for_slskd()})
-                except (OSError, RuntimeError) as exc:
-                    self._send_json({"error": str(exc)}, 500)
-            elif path == f"/{token}/api/start":
+            if path == f"/{token}/api/start":
                 if self.headers.get_content_type() != "application/json":
                     self._send_json({"error": "Expected a JSON request."}, 415)
                     return

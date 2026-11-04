@@ -1,0 +1,15 @@
+{
+  "name": "bitseekwin",
+  "private": true,
+  "description": "Direct Soulseek-to-BitChord streaming add-on",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "slsk-client": "2.0.2"
+  }
+}
