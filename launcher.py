@@ -1,3 +1,4 @@
+import base64
 import hmac
 import ipaddress
 import json
@@ -15,32 +16,85 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from version import __version__
-
 APP_NAME = "BitSeekWin"
 PROJECT_DIR = Path(__file__).resolve().parent
+__version__ = (PROJECT_DIR / "version.txt").read_text(encoding="utf-8").strip()
 PORT = 8080
 MAX_REQUEST_SIZE = 64 * 1024
 MAX_LOG_LINES = 250
-SECRET_ONSETS = (
-    "b", "br", "d", "dr", "f", "g", "gr", "h",
-    "k", "kr", "l", "m", "n", "p", "pr", "s",
-)
-SECRET_RIMES = (
-    "a", "e", "i", "o", "u", "an", "en", "in",
-    "on", "un", "ar", "er", "ir", "or", "ur", "y",
+DEFAULT_SECRET_WORD_COUNT = 3
+DEFAULT_SECRET_WORD_LENGTH = 6
+MIN_SECRET_WORD_COUNT = 2
+MAX_SECRET_WORD_COUNT = 8
+MIN_SECRET_WORD_LENGTH = 3
+MAX_SECRET_WORD_LENGTH = 9
+SECRET_WORD_LENGTH_VARIANCE = 3
+SOURCE_WORDS = json.loads(
+    (PROJECT_DIR / "source_words.json").read_text(encoding="utf-8")
 )
 
 
-def generate_source_secret() -> str:
-    random_bytes = secrets.token_bytes(16)
+def generate_source_secret(
+    word_count: int = DEFAULT_SECRET_WORD_COUNT,
+    word_length: int = DEFAULT_SECRET_WORD_LENGTH,
+    random_bytes: bytes | None = None,
+    phrase_bytes: bytes | None = None,
+) -> str:
+    if (
+        isinstance(word_count, bool)
+        or not isinstance(word_count, int)
+        or not MIN_SECRET_WORD_COUNT <= word_count <= MAX_SECRET_WORD_COUNT
+    ):
+        raise ValueError(
+            f"Word count must be between {MIN_SECRET_WORD_COUNT} and "
+            f"{MAX_SECRET_WORD_COUNT}."
+        )
+    if (
+        isinstance(word_length, bool)
+        or not isinstance(word_length, int)
+        or not MIN_SECRET_WORD_LENGTH <= word_length <= MAX_SECRET_WORD_LENGTH
+    ):
+        raise ValueError(
+            f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
+            f"{MAX_SECRET_WORD_LENGTH}."
+        )
+    entropy = random_bytes if random_bytes is not None else secrets.token_bytes(16)
+    if not isinstance(entropy, bytes) or len(entropy) != 16:
+        raise ValueError("Source URL token entropy must be exactly 16 bytes.")
+    phrase_entropy = (
+        phrase_bytes if phrase_bytes is not None else secrets.token_bytes(32)
+    )
+    if not isinstance(phrase_entropy, bytes) or len(phrase_entropy) != 32:
+        raise ValueError("Source phrase entropy must be exactly 32 bytes.")
+
+    lower_length = max(
+        MIN_SECRET_WORD_LENGTH, word_length - SECRET_WORD_LENGTH_VARIANCE
+    )
+    upper_length = min(
+        MAX_SECRET_WORD_LENGTH, word_length + SECRET_WORD_LENGTH_VARIANCE
+    )
     words = []
-    for offset in range(0, len(random_bytes), 2):
-        syllables = []
-        for value in random_bytes[offset : offset + 2]:
-            syllables.append(SECRET_ONSETS[value >> 4] + SECRET_RIMES[value & 15])
-        words.append("".join(syllables))
-    return "-".join(words)
+    for index in range(word_count):
+        length_entropy = int.from_bytes(
+            phrase_entropy[index * 4 : index * 4 + 2], "big"
+        )
+        actual_length = lower_length + length_entropy % (
+            upper_length - lower_length + 1
+        )
+        word_list = SOURCE_WORDS[
+            "nouns" if index == word_count - 1 else "adjectives"
+        ][str(actual_length)]
+        word_entropy = int.from_bytes(
+            phrase_entropy[index * 4 + 2 : index * 4 + 4], "big"
+        )
+        words.append(word_list[word_entropy % len(word_list)])
+    token = (
+        base64.urlsafe_b64encode(entropy)
+        .decode("ascii")
+        .rstrip("=")
+        .replace("-", "~")
+    )
+    return "-".join((*words, token))
 
 
 def normalize_public_url(value: str) -> str:
@@ -69,6 +123,8 @@ def build_bitseekwin_environment(
     password: str,
     secret: str,
     public_url: str,
+    word_count: int = DEFAULT_SECRET_WORD_COUNT,
+    word_length: int = DEFAULT_SECRET_WORD_LENGTH,
 ) -> dict[str, str]:
     env = base.copy()
     for key in ("SLSKD_API_KEY", "SLSKD_SLSK_USERNAME", "SLSKD_SLSK_PASSWORD"):
@@ -80,6 +136,8 @@ def build_bitseekwin_environment(
             "BITCHORD_SECRET": secret,
             "PUBLIC_BASE_URL": public_url,
             "PORT": str(PORT),
+            "BITSEEKWIN_WORD_COUNT": str(word_count),
+            "BITSEEKWIN_WORD_LENGTH": str(word_length),
         }
     )
     return env
@@ -205,9 +263,29 @@ class LauncherController:
         password = str(config.get("password", ""))
         public_text = str(config.get("public_url", ""))
         use_funnel = config.get("start_funnel") is True
+        word_count = config.get("word_count", DEFAULT_SECRET_WORD_COUNT)
+        word_length = config.get("word_length", DEFAULT_SECRET_WORD_LENGTH)
 
         if not username or not password:
             raise ValueError("Enter your Soulseek username and password.")
+        if (
+            isinstance(word_count, bool)
+            or not isinstance(word_count, int)
+            or not MIN_SECRET_WORD_COUNT <= word_count <= MAX_SECRET_WORD_COUNT
+        ):
+            raise ValueError(
+                f"Word count must be between {MIN_SECRET_WORD_COUNT} and "
+                f"{MAX_SECRET_WORD_COUNT}."
+            )
+        if (
+            isinstance(word_length, bool)
+            or not isinstance(word_length, int)
+            or not MIN_SECRET_WORD_LENGTH <= word_length <= MAX_SECRET_WORD_LENGTH
+        ):
+            raise ValueError(
+                f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
+                f"{MAX_SECRET_WORD_LENGTH}."
+            )
         node = find_node_runtime()
         public_url = normalize_public_url(public_text)
         if use_funnel and not public_url.startswith("https://"):
@@ -228,7 +306,15 @@ class LauncherController:
             self.logs.clear()
         threading.Thread(
             target=self._start_worker,
-            args=(node, username, password, public_url, use_funnel),
+            args=(
+                node,
+                username,
+                password,
+                public_url,
+                use_funnel,
+                word_count,
+                word_length,
+            ),
             daemon=True,
         ).start()
 
@@ -266,6 +352,8 @@ class LauncherController:
         password: str,
         public_url: str,
         use_funnel: bool,
+        word_count: int,
+        word_length: int,
     ) -> None:
         server_process: subprocess.Popen | None = None
         try:
@@ -301,8 +389,10 @@ class LauncherController:
                 base_env,
                 username,
                 password,
-                generate_source_secret(),
+                generate_source_secret(word_count, word_length),
                 public_url,
+                word_count,
+                word_length,
             )
 
             if use_funnel:
@@ -410,46 +500,90 @@ _HTML = r"""<!doctype html>
 <meta name="color-scheme" content="dark">
 <title>BitSeekWin • Setup</title>
 <style>
-:root{font-family:Inter,"Segoe UI",system-ui,sans-serif;color:#f6f4f6;background:#101014;font-synthesis:none;text-rendering:optimizeLegibility;--bg:#101014;--panel:#1b1b22;--field:#25252e;--line:#33333e;--muted:#a5a2ad;--subtle:#777480;--pink:#fa315c;--green:#57d998}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 78% -10%,#63213e 0,transparent 35%),var(--bg)}button,input{font:inherit}button{cursor:pointer}
-.app{min-height:100vh;display:grid;grid-template-columns:224px minmax(0,1fr)}aside{background:#17171d;border-right:1px solid #282830;padding:26px 17px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:11px;padding:2px 6px 36px}.mark{width:39px;height:39px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#ff7187,#d60e43);font-size:25px;font-weight:800;box-shadow:0 6px 22px #fa315c44}.brand-name{font-size:16px;font-weight:750;letter-spacing:-.4px}.brand-name small{display:block;color:var(--muted);font-size:9px;letter-spacing:1.3px;margin-top:3px}.nav-label{font-size:10px;font-weight:750;letter-spacing:1.2px;color:var(--subtle);padding:0 11px 9px}.nav-item{border-radius:8px;padding:11px 12px;color:#ff7791;background:#38202b;font-weight:650;font-size:13px}.side-foot{margin-top:auto;border-top:1px solid var(--line);padding:18px 9px 0;color:var(--muted);font-size:10px;line-height:1.7}.side-foot small{color:var(--subtle)}
-main{width:min(1120px,100%);margin:0 auto;padding:29px 38px 35px}.topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:17px;font-size:10px;font-weight:750;letter-spacing:1.3px;color:var(--muted)}.badge{background:#3a202a;color:#ff9daf;padding:7px 10px;border-radius:999px;font-size:9px;letter-spacing:.7px}.hero{height:166px;border-radius:13px;overflow:hidden;padding:24px 28px;background:linear-gradient(108deg,#f1325a 0,#bb245f 49%,#61245c 100%);position:relative;margin-bottom:21px;box-shadow:0 16px 42px #bd20552c}.hero:after{content:"";position:absolute;width:214px;height:214px;right:35px;top:-112px;border-radius:50%;border:1px solid #ffffff55;box-shadow:0 0 0 25px #ffffff12,0 0 0 52px #ffffff0a}.hero:before{content:"";position:absolute;width:58px;height:58px;right:113px;top:14px;border:2px solid #ffffff66;border-radius:50%;background:#ffcad344}.eyebrow{font-size:9px;letter-spacing:1.4px;color:#ffe0e8;font-weight:750}.hero h1{font-size:29px;letter-spacing:-1px;margin:9px 0 1px;line-height:1.08}.hero p{font-size:11px;color:#ffe3e9;margin:8px 0 0}.section-title{display:flex;align-items:center;justify-content:space-between;margin:0 1px 9px;font-size:10px;font-weight:750;letter-spacing:1.15px;color:var(--muted)}.section-title span:last-child{font-size:10px;font-weight:450;letter-spacing:0;color:var(--subtle)}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:13px}.card{background:linear-gradient(150deg,#1d1d24,#19191f);border:1px solid #30303a;border-radius:11px;padding:17px 18px}.card-title{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:750;letter-spacing:.7px}.step{color:var(--pink);font-size:12px}.field{margin-top:13px}.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:9px;font-weight:750;letter-spacing:.8px;text-transform:uppercase}.control{display:flex;gap:7px}.control input,.field input{width:100%;min-width:0;background:var(--field);border:1px solid #393944;border-radius:6px;padding:9px 10px;color:#f7f5f8;outline:none;font-size:11px;transition:border-color .15s,box-shadow .15s}.control input:focus,.field input:focus{border-color:#ed3a62;box-shadow:0 0 0 3px #fa315c24}.control input::placeholder,.field input::placeholder{color:#777480}.hint{font-size:9px;color:var(--subtle);margin:7px 0 0}.button{border:0;border-radius:6px;padding:9px 12px;background:#30303a;color:#f2eff3;font-size:10px;font-weight:700;white-space:nowrap;transition:filter .15s,transform .15s}.button:hover{filter:brightness(1.15)}.button:active{transform:translateY(1px)}.button.primary{background:linear-gradient(100deg,#fa315c,#df2458);color:white;box-shadow:0 5px 16px #fa315c30}.button:disabled{opacity:.45;cursor:not-allowed}.check{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:10px;color:#d4d1da}.check input{accent-color:var(--pink);width:14px;height:14px}.actions{display:flex;gap:8px;margin-top:15px}.actions .primary{flex:1}
-.privacy{font-size:9px;line-height:1.5;color:var(--subtle);margin:12px 2px 13px}.activity{background:linear-gradient(145deg,#191a20,#111216);border:1px solid #33343e;border-radius:12px;padding:14px;box-shadow:0 12px 34px #0003}.activity-head{display:flex;align-items:center;gap:9px;min-height:31px}.console-title{display:flex;align-items:center;gap:10px;margin-right:8px}.console-title strong{font-size:12px;letter-spacing:.1px}.console-kicker{font-size:8px;font-weight:800;letter-spacing:1px;color:#ff8098}.dot{width:8px;height:8px;border-radius:50%;background:#777480}.dot.success{background:var(--green);box-shadow:0 0 10px #57d99888}.dot.error{background:#ff617b;box-shadow:0 0 10px #ff617b88}.activity-state{font-size:10px;letter-spacing:0;color:#d9d6de}.copy{margin-left:auto}.url{margin-top:10px;padding:9px 10px;border:1px solid #292a32;border-radius:6px;background:#111216;color:#ff8098;font:10px Consolas,monospace;overflow-wrap:anywhere;min-height:30px}.url.empty{color:#686671}.console-meta{display:flex;justify-content:space-between;margin:13px 2px 6px;color:#777986;font-size:8px;font-weight:750;letter-spacing:1px}.logs{height:204px;overflow:auto;padding:8px 9px;border:1px solid #282a32;border-radius:7px;background:#0b0c0f;color:#c6c7cf;font:10px/1.65 Consolas,"Cascadia Mono",monospace;scrollbar-color:#454650 #0b0c0f}.log-line{display:grid;grid-template-columns:58px 55px minmax(0,1fr);gap:8px;padding:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}.log-time{color:#696c78}.log-kind{font-size:8px;font-weight:800;color:#8f93a0}.log-message{color:#d0d1d8}.log-line.search .log-kind{color:#80bfff}.log-line.stream .log-kind{color:#63dfaa}.log-line.warn .log-kind{color:#ffd27a}.log-line.error .log-kind,.error{color:#ff849a}.success{color:var(--green)}
-.mark{border-radius:9px;background:#fa315c;box-shadow:none}
-body{background:var(--bg)}
-.hero{height:auto;min-height:145px;background:#1b1b22;border:1px solid #30303a;box-shadow:none}
-.hero:before,.hero:after{display:none}
-.eyebrow,.hero p{color:var(--muted)}
-.badge{border-radius:6px;background:#2c2025}
-.card{background:#1b1b22}
-.button.primary{background:#ed3157;box-shadow:none}
-.activity{background:#17181d;box-shadow:none}
-@media(max-width:850px){.app{grid-template-columns:1fr}aside{display:none}main{padding:21px 18px}.hero{height:auto;min-height:152px}.cards{grid-template-columns:1fr}.activity-head{flex-wrap:wrap}.activity-state{margin-left:auto}.copy{margin-left:0}.logs{height:190px}.log-line{grid-template-columns:50px 48px minmax(0,1fr);gap:5px}}
+:root{font-family:"Segoe UI",system-ui,sans-serif;color:#e8e9eb;background:#111315;font-synthesis:none;--panel:#191c1f;--field:#101214;--line:#30353a;--muted:#a2a8ad;--subtle:#7f878d;--accent:#70c8a0;--green:#70c8a0}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#111315}
+button,input{font:inherit}
+button{cursor:pointer}
+.app{min-height:100vh}
+aside,.topline,.hero,.section-title{display:none}
+main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
+.simple-header{margin-bottom:22px}
+.simple-header h1{font-size:23px;letter-spacing:-.4px;margin:0 0 5px}
+.simple-header p{margin:0;color:var(--muted);font-size:13px}
+.cards{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;margin-bottom:14px}
+.card-title{font-size:13px;letter-spacing:0;margin-bottom:12px}
+.step{display:none}
+.field{margin-top:14px}
+.field label,.slider-label{display:flex;justify-content:space-between;margin-bottom:7px;color:#c5cacf;font-size:12px;font-weight:600;letter-spacing:0;text-transform:none}
+.field input:not([type=range]){width:100%;min-width:0;background:var(--field);border:1px solid var(--line);border-radius:5px;padding:10px 11px;color:#e8e9eb;outline:none;font-size:13px}
+.field input:focus{border-color:var(--accent)}
+.field input::placeholder{color:#747b81}
+.slider{width:100%;accent-color:var(--accent)}
+.slider-value{color:#e8e9eb;font-variant-numeric:tabular-nums}
+.hint{font-size:11px;color:var(--subtle);line-height:1.5;margin:8px 0 0}
+.phrase-preview{font:12px Consolas,monospace;color:#c6d6ce;overflow-wrap:anywhere}
+.check{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12px;color:#c5cacf}
+.check input{accent-color:var(--accent);width:14px;height:14px}
+.button{border:1px solid var(--line);border-radius:5px;padding:9px 12px;background:#24282b;color:#e8e9eb;font-size:12px;white-space:nowrap}
+.button:hover{filter:brightness(1.12)}
+.button:disabled{opacity:.45;cursor:not-allowed}
+.button.primary{background:var(--accent);border-color:var(--accent);color:#101613;font-weight:700}
+.actions{display:flex;gap:8px;margin-top:16px}
+.privacy{font-size:11px;line-height:1.55;color:var(--subtle);margin:12px 2px 18px}
+.activity{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+.activity-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:31px}
+.console-title{margin-right:4px}
+.console-title strong{font-size:13px}
+.console-kicker{display:none}
+.dot{width:8px;height:8px;border-radius:50%;background:#777480}
+.dot.success{background:var(--green)}
+.dot.error{background:#ff617b}
+.activity-state{font-size:12px;color:#d9d6de}
+.copy{margin-left:auto}
+.url{margin-top:10px;padding:9px 10px;border:1px solid var(--line);border-radius:5px;background:var(--field);color:#85d2ad;font:11px Consolas,monospace;overflow-wrap:anywhere}
+.url.empty{color:var(--subtle)}
+.console-meta{display:flex;justify-content:space-between;margin:13px 2px 6px;color:var(--subtle);font-size:9px;font-weight:700;letter-spacing:.5px}
+.logs{height:210px;overflow:auto;padding:8px 9px;border:1px solid #292e32;border-radius:5px;background:#101214;color:#c6c7cf;font:11px/1.65 Consolas,"Cascadia Mono",monospace}
+.log-line{display:grid;grid-template-columns:58px 52px minmax(0,1fr);gap:7px;padding:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.log-time{color:#696c78}
+.log-kind{font-size:9px;font-weight:800;color:#8f93a0}
+.log-message{color:#d0d1d8}
+.log-line.search .log-kind{color:#8fb4d0}
+.log-line.stream .log-kind{color:#83d6ae}
+.log-line.warn .log-kind{color:#d7b87d}
+.log-line.error .log-kind,.error{color:#ff849a}
+.success{color:var(--green)}
+@media(max-width:600px){main{padding:24px 14px}.card{padding:16px}.activity-head{align-items:flex-start}.copy{margin-left:0}.logs{height:190px}.log-line{grid-template-columns:48px 45px minmax(0,1fr);gap:5px}}
 </style>
 </head>
 <body>
 <div class="app">
-<aside><div class="brand"><div class="mark">♪</div><div class="brand-name">BitSeekWin<small>FOR BITCHORD</small></div></div><div class="nav-label">WORKSPACE</div><div class="nav-item">♫ &nbsp; Player setup</div><div class="side-foot">SOULSEEK &nbsp;•&nbsp; BITCHORD<br><small>Build __VERSION__</small></div></aside>
 <main>
-<div class="topline"><span>YOUR PERSONAL MUSIC BRIDGE</span><span class="badge">VERY EARLY PRE-ALPHA</span></div>
-<section class="hero"><div class="eyebrow">BITSEEKWIN &nbsp;/&nbsp; BITCHORD</div><h1>Your music, connected.</h1><p>Search Soulseek &nbsp;·&nbsp; Stream FLAC bytes live &nbsp;·&nbsp; Listen in BitChord</p></section>
-<div class="section-title"><span>CONNECT YOUR SOURCES</span><span>Your login stays on this device</span></div>
+<header class="simple-header"><h1>BitSeekWin</h1><p>Connect Soulseek to BitChord · Build __VERSION__</p></header>
 <section class="cards">
 <article class="card"><div class="card-title"><span class="step">01</span> DIRECT SOULSEEK CONNECTION</div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
 <div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
-<p class="hint">Password is masked and cleared after starting. Credentials are not saved.</p>
-</article>
-<article class="card"><div class="card-title"><span class="step">02</span> DIRECT STREAM</div>
 <div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" placeholder="https://device.tailnet.ts.net"></div>
 <label class="check"><input id="funnel" type="checkbox"> Start Tailscale Funnel on port 8080</label>
 <p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p>
+<div class="field">
+<label class="slider-label" for="wordCount">Words in source URL <output id="wordCountValue" class="slider-value">3</output></label>
+<input class="slider" id="wordCount" type="range" min="2" max="8" value="3">
+</div>
+<div class="field">
+<label class="slider-label" for="wordLength">Target letters per word <output id="wordLengthValue" class="slider-value">6</output></label>
+<input class="slider" id="wordLength" type="range" min="3" max="9" value="6">
+</div>
+<p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. A separate random token provides 128-bit access security.</p>
+<p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p>
 <div class="actions"><button class="button primary" id="start">▶ &nbsp; Start listening</button><button class="button" id="stop" disabled>Stop</button></div>
 </article>
 </section>
-<p class="privacy">Credentials are used for this launch only and are not written to a settings file. BitSeekWin connects directly to Soulseek and streams incoming file data to BitChord without waiting for a completed download. The printed source URL is a secret; keep it private.</p>
-<section class="activity"><div class="activity-head"><div class="console-title"><span class="console-kicker">BITSEEKWIN / LIVE ACTIVITY</span><strong>Stream console</strong></div><span id="dot" class="dot"></span><span id="state" class="activity-state">Ready</span><button class="button copy" id="copy" disabled>Copy source URL</button><button class="button" id="exit">Exit launcher</button></div><div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div><div class="console-meta"><span>SOULSEEK &amp; BITCHORD EVENTS</span><span id="log-count">0 EVENTS</span></div><div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">Ready when you are.</div></section>
+<p class="privacy">Your login is used only for this launch. Keep the printed BitChord source URL private. Stop the service before closing the launcher.</p>
+<section class="activity"><div class="activity-head"><div class="console-title"><strong>Activity</strong></div><span id="dot" class="dot"></span><span id="state" class="activity-state">Ready</span><button class="button copy" id="copy" disabled>Copy source URL</button><button class="button" id="exit">Exit</button></div><div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div><div class="console-meta"><span>SOULSEEK / BITCHORD</span><span id="log-count">0 EVENTS</span></div><div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">Ready when you are.</div></section>
 </main></div>
 <script>
 const token=__TOKEN_JSON__, api="/"+token+"/api/";
@@ -457,9 +591,12 @@ const $=id=>document.getElementById(id);
 let sourceUrl="";
 $("publicUrl").value=__PUBLIC_URL_JSON__;
 $("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
+for(const id of ["wordCount","wordLength"])$(id).addEventListener("input",updatePhrasePreview);
+function updatePhrasePreview(){const count=Number($("wordCount").value),length=Number($("wordLength").value);const low=Math.max(3,length-3),high=Math.min(9,length+3);$("wordCountValue").textContent=count;$("wordLengthValue").textContent=length;$("phrasePreview").textContent="Word lengths: "+low+"–"+high+" letters.";}
+updatePhrasePreview();
 update();
 $("start").addEventListener("click",async()=>{
-  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked};
+  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked,word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
   try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}

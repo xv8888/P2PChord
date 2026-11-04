@@ -10,17 +10,29 @@ import { FileAttribute, SlskClient } from "slsk-client";
 const APP_NAME = "BitSeekWin - BitChord-Soulseek Integration";
 const VERSION = (await readFile(new URL("./version.txt", import.meta.url), "utf8"))
   .trim();
+const SOURCE_WORDS = JSON.parse(
+  await readFile(new URL("./source_words.json", import.meta.url), "utf8"),
+);
+const DEFAULT_SECRET_WORD_COUNT = 3;
+const DEFAULT_SECRET_WORD_LENGTH = 6;
+const SECRET_WORD_LENGTH_VARIANCE = 3;
+const SECRET_WORD_COUNT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_WORD_COUNT",
+  DEFAULT_SECRET_WORD_COUNT,
+  2,
+  8,
+);
+const SECRET_WORD_LENGTH = readIntegerEnvironmentValue(
+  "BITSEEKWIN_WORD_LENGTH",
+  DEFAULT_SECRET_WORD_LENGTH,
+  3,
+  9,
+);
 const SLUG = process.env.BITSEEKWIN_SLUG ?? "bitseekwin";
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
-const SECRET_ONSETS = [
-  "b", "br", "d", "dr", "f", "g", "gr", "h",
-  "k", "kr", "l", "m", "n", "p", "pr", "s",
-];
-const SECRET_RIMES = [
-  "a", "e", "i", "o", "u", "an", "en", "in",
-  "on", "un", "ar", "er", "ir", "or", "ur", "y",
-];
-const SECRET = process.env.BITCHORD_SECRET ?? generateSourceSecret();
+const SECRET =
+  process.env.BITCHORD_SECRET ??
+  generateSourceSecret(randomBytes(16), SECRET_WORD_COUNT, SECRET_WORD_LENGTH);
 const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`
 ).replace(/\/+$/, "");
@@ -32,22 +44,56 @@ const MAX_STREAM_BYTES = 128 * 1024 * 1024;
 const STREAM_TIMEOUT = 15 * 60 * 1000;
 const TEMP_DIRECTORY = join(tmpdir(), "BitSeekWin");
 
-export function generateSourceSecret(bytes = randomBytes(16)) {
+function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  if (!/^\d+$/.test(raw)) {
+    throw new TypeError(`${name} must be a whole number.`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} must be between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+export function generateSourceSecret(
+  bytes = randomBytes(16),
+  wordCount = DEFAULT_SECRET_WORD_COUNT,
+  wordLength = DEFAULT_SECRET_WORD_LENGTH,
+  phraseBytes = randomBytes(32),
+) {
   if (!Buffer.isBuffer(bytes) || bytes.length !== 16) {
     throw new TypeError("Source secret entropy must be exactly 16 bytes.");
   }
-  const words = [];
-  for (let offset = 0; offset < bytes.length; offset += 2) {
-    const first = bytes[offset];
-    const second = bytes[offset + 1];
-    words.push(
-      SECRET_ONSETS[first >> 4] +
-        SECRET_RIMES[first & 15] +
-        SECRET_ONSETS[second >> 4] +
-        SECRET_RIMES[second & 15],
-    );
+  if (!Buffer.isBuffer(phraseBytes) || phraseBytes.length !== 32) {
+    throw new TypeError("Source phrase entropy must be exactly 32 bytes.");
   }
-  return words.join("-");
+  if (!Number.isInteger(wordCount) || wordCount < 2 || wordCount > 8) {
+    throw new RangeError("Source URL word count must be between 2 and 8.");
+  }
+  if (!Number.isInteger(wordLength) || wordLength < 3 || wordLength > 9) {
+    throw new RangeError("Source URL word length must be between 3 and 9.");
+  }
+  const lowerLength = Math.max(3, wordLength - SECRET_WORD_LENGTH_VARIANCE);
+  const upperLength = Math.min(9, wordLength + SECRET_WORD_LENGTH_VARIANCE);
+  const words = Array.from({ length: wordCount }, (_, index) => {
+    const lengthOffset =
+      phraseBytes.readUInt16BE(index * 4) % (upperLength - lowerLength + 1);
+    const actualLength = lowerLength + lengthOffset;
+    const wordLists = index === wordCount - 1
+      ? SOURCE_WORDS.nouns
+      : SOURCE_WORDS.adjectives;
+    const options = wordLists[String(actualLength)];
+    if (!options?.length) {
+      throw new RangeError(
+        `No ${index === wordCount - 1 ? "noun" : "adjective"} words are available with ${actualLength} letters.`,
+      );
+    }
+    return options[phraseBytes.readUInt16BE(index * 4 + 2) % options.length];
+  });
+  const token = bytes.toString("base64url").replaceAll("-", "~");
+  return `${words.join("-")}-${token}`;
 }
 
 function trackId(result) {

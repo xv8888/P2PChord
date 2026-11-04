@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
 import { FileAttribute } from "slsk-client";
@@ -8,6 +9,10 @@ import {
   generateSourceSecret,
   matchScore,
 } from "./direct_server.mjs";
+
+const sourceWords = JSON.parse(
+  readFileSync(new URL("./source_words.json", import.meta.url), "utf8"),
+);
 
 class FakeDownload extends EventEmitter {
   constructor(options, chunks, delay = 0) {
@@ -73,13 +78,84 @@ const track = {
   speed: 1000,
 };
 
-test("source secrets are readable word passphrases with 128 bits of entropy", () => {
-  const expected = "babe-bibo-buban-benbin-bonbun-barber-birbor-burby";
+test("source URLs use adjective words followed by a noun and a 128-bit token", () => {
+  const entropy = Buffer.from(Array.from({ length: 16 }, (_, i) => i));
+  const phraseEntropy = Buffer.from([
+    0, 0, 0, 0,
+    0, 3, 0, 0,
+    0, 6, 0, 0,
+    ...Array(20).fill(0),
+  ]);
+  const secret = generateSourceSecret(entropy, 3, 6, phraseEntropy);
+  const parts = secret.split("-");
+  assert.deepEqual(parts.slice(0, -1).map((word) => word.length), [3, 6, 9]);
+  assert.ok(sourceWords.adjectives["3"].includes(parts[0]));
+  assert.ok(sourceWords.adjectives["6"].includes(parts[1]));
+  assert.ok(sourceWords.nouns["9"].includes(parts[2]));
+  assert.equal(parts.at(-1), "AAECAwQFBgcICQoLDA0ODw");
+  assert.equal(generateSourceSecret().split("-").length, 4);
+});
+
+test("each word varies by up to three letters from the target", () => {
+  const entropy = Buffer.from(Array.from({ length: 16 }, (_, i) => i));
+  const phraseEntropy = Buffer.from(Array.from({ length: 32 }, (_, i) => i));
+  for (let wordCount = 2; wordCount <= 8; wordCount++) {
+    for (let wordLength = 3; wordLength <= 9; wordLength++) {
+      const parts = generateSourceSecret(
+        entropy,
+        wordCount,
+        wordLength,
+        phraseEntropy,
+      ).split("-");
+      assert.equal(parts.length, wordCount + 1);
+      const low = Math.max(3, wordLength - 3);
+      const high = Math.min(9, wordLength + 3);
+      assert.ok(parts.slice(0, -1).every((word) => word.length >= low && word.length <= high));
+      assert.ok(
+        parts.slice(0, -2).every((word) =>
+          sourceWords.adjectives[String(word.length)].includes(word),
+        ),
+      );
+      assert.ok(sourceWords.nouns[String(parts.at(-2).length)].includes(parts.at(-2)));
+      assert.match(parts.at(-1), /^[A-Za-z0-9_~]{22}$/);
+    }
+  }
+});
+
+test("word-length variance clamps to the available dictionary at boundaries", () => {
+  const tokenEntropy = Buffer.alloc(16);
+  const phraseEntropy = Buffer.alloc(32, 255);
+  for (const [target, low, high] of [[3, 3, 6], [9, 6, 9]]) {
+    const words = generateSourceSecret(
+      tokenEntropy,
+      8,
+      target,
+      phraseEntropy,
+    ).split("-").slice(0, -1);
+    assert.ok(words.every((word) => word.length >= low && word.length <= high));
+  }
+});
+
+test("source word dictionaries are expanded tenfold and stay length-consistent", () => {
   assert.equal(
-    generateSourceSecret(Buffer.from(Array.from({ length: 16 }, (_, i) => i))),
-    expected,
+    Object.values(sourceWords.adjectives).flat().length,
+    710,
   );
-  assert.equal(generateSourceSecret().split("-").length, 8);
+  assert.equal(Object.values(sourceWords.nouns).flat().length, 650);
+  for (const [kind, groups] of Object.entries(sourceWords)) {
+    for (const [length, words] of Object.entries(groups)) {
+      assert.ok(words.every((word) => word.length === Number(length)));
+      assert.equal(new Set(words).size, words.length, `${kind} ${length}-letter words`);
+    }
+  }
+});
+
+test("source URL generation rejects unsupported word settings", () => {
+  const entropy = Buffer.alloc(16);
+  assert.throws(() => generateSourceSecret(entropy, 1, 6), /word count/);
+  assert.throws(() => generateSourceSecret(entropy, 9, 6), /word count/);
+  assert.throws(() => generateSourceSecret(entropy, 3, 2), /word length/);
+  assert.throws(() => generateSourceSecret(entropy, 3, 10), /word length/);
 });
 
 let server;
@@ -139,7 +215,7 @@ async function searchTrack() {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "0.4.0-pre-alpha.1");
+  assert.equal(manifest.version, "alpha-0.4.2");
   assert.match(manifest.description, /directly from Soulseek peers/);
   const response = await fetch(`${base}/search?q=kick`);
   const body = await response.json();

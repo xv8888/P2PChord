@@ -15,7 +15,7 @@ BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches Sou
 3. BitChord compares candidate titles and reported durations to the requested track, then asks BitSeekWin to stream its selected match.
 4. Incoming FLAC bytes are sent to BitChord immediately; playback does not wait for the transfer to finish.
 
-> **Version `0.4.0-pre-alpha.1` — first public GitHub pre-release.** This is still a very early pre-alpha prototype; expect bugs, breaking changes, and incomplete behavior.
+> **Version `alpha-0.4.2`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
 
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 
@@ -48,11 +48,12 @@ python .\launcher.py
 1. Enter your Soulseek username and password. The password field is masked.
 2. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`.
 3. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
-4. Click **Start**. Keep the dashboard and launcher running while using BitChord.
+4. Optionally adjust **Words in source URL** and **Target letters per word**. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
+5. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
 The launcher starts BitSeekWin, logs in to Soulseek, and displays the BitChord source URL in its status panel. The live activity console shows searches, peer transfer status, and streaming progress. If it shows repeated searches but no stream activity, BitChord is still checking candidates and has not accepted a FLAC match yet. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. Credentials are sent only to the local launcher and child-process environment; they are not saved to a settings file. Stop with **Stop**, or use **Exit launcher** to disconnect and close the dashboard.
 
-BitSeekWin no longer starts slskd, creates an slskd API key, or requires a downloads folder. It connects with uploads disabled and does not share local files. The source URL contains a temporary, eight-word secret generated from 128 random bits; keep it private. After restarting, add the newly printed URL to BitChord again.
+BitSeekWin no longer starts slskd, creates an slskd API key, or requires a downloads folder. It connects with uploads disabled and does not share local files. The launcher lets you choose 2–8 readable words and a target length of 3–9 letters; each word independently varies up to 3 letters from that target, clamped to available 3–9 letter word lists. Each URL uses one or more adjectives followed by a noun. The lexicon has 10 times as many word choices as before, derived in part from WordNet (see [third-party notices](./THIRD_PARTY_NOTICES.md)). The final URL segment is a separate 128-bit random bearer token, so changing the readable words does not weaken access security. Keep the complete URL private. After restarting, add the newly printed URL to BitChord again.
 
 If the launcher cannot find Tailscale, enter the URL manually and start Funnel separately:
 
@@ -146,7 +147,9 @@ For regular streaming, Caddy avoids tunnel bandwidth caps, but availability stil
 | `SOULSEEK_USERNAME` | Yes | — | Soulseek account used to search and request authorized files directly from peers. |
 | `SOULSEEK_PASSWORD` | Yes | — | Soulseek password; keep it private. |
 | `PUBLIC_BASE_URL` | No | `http://127.0.0.1:8080` | Address BitChord uses to reach BitSeekWin. Set this for HTTPS or a non-local address. |
-| `BITCHORD_SECRET` | No | Generated eight-word secret | Secret included in the add-on URL. Set a securely generated value to keep the URL stable across restarts. |
+| `BITCHORD_SECRET` | No | Generated URL-safe 128-bit token, appended after the readable words | Overrides the generated add-on URL secret. Treat it as a bearer token and keep it private. |
+| `BITSEEKWIN_WORD_COUNT` | No | `3` | Number of readable URL words for direct/manual server launches (2–8); the last word is a noun. |
+| `BITSEEKWIN_WORD_LENGTH` | No | `6` | Target number of letters per readable URL word for direct/manual server launches (3–9); each word varies by up to 3 letters, clamped to 3–9. |
 | `BITSEEKWIN_SLUG` | No | `bitseekwin` | URL path for this add-on. |
 | `PORT` | No | `8080` | Local port for the add-on server. |
 
@@ -168,7 +171,7 @@ When BitChord requests the file URL, BitSeekWin requests the file from its Souls
 - Search rows identify the format as `flac` and quality as `LOSSLESS`; stream responses also declare the FLAC codec, container, and `audio/flac` MIME type.
 - BitSeekWin starts playback from bytes received directly from a Soulseek peer; it does not wait for the transfer to finish or maintain a reusable download cache. To support BitChord's follow-up byte-range requests without replacing an active Soulseek transfer, one peer transfer stays open and its incoming bytes are shared with each HTTP range request. The client library also buffers the active file in memory and temporarily writes a completed copy before BitSeekWin removes it. To limit memory use, files over 128 MiB are rejected and at most two peer transfers run at once.
 - BitSeekWin uses BitChord's **HTTP add-on API**, not its JavaScript module API.
-- The source URL contains an eight-word bearer secret with 128 bits of randomness; keep it private. Soulseek credentials are used by the local client and are never sent to BitChord.
+- The source URL has a configurable adjective-and-noun phrase followed by a separate bearer token with 128 bits of randomness; keep the complete URL private. The phrase is descriptive only and does not provide authentication. Soulseek credentials are used by the local client and are never sent to BitChord.
 
 ### Endpoints
 
@@ -188,9 +191,9 @@ python -m unittest -v
 
 ### Versioning
 
-The project follows Semantic Versioning's `MAJOR.MINOR.PATCH` format with a `pre-alpha.N` prerelease suffix while it is experimental. The version is defined once in `version.txt`, read by the Python launcher and Node server, and shown in the launcher and BitChord manifest.
+The project uses `alpha-MAJOR.MINOR.PATCH` labels while it is experimental. The version is defined once in `version.txt`, read by the Python launcher and Node server, and shown in the launcher and BitChord manifest.
 
-For each published pre-alpha build, increment `N`. When moving to the next feature milestone, increment `MINOR` and restart the prerelease number at `.0`. Reserve `1.0.0` for a stable release; until then, interfaces and behavior may change.
+For alpha updates, increment the patch number for small changes and the minor number for larger feature milestones. Reserve `1.0.0` for a stable release; until then, interfaces and behavior may change.
 
 ---
 
