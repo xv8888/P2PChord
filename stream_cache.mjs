@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { performance } from "node:perf_hooks";
 
 const WRITE_BATCH_BYTES = 128 * 1024;
 const WRITE_BATCH_DELAY_MS = 1;
@@ -57,6 +58,8 @@ export class StreamCache {
     maxActiveStreams,
     maxStreamBytes,
     streamTimeout,
+    firstByteTimeout,
+    peerIdleTimeout,
     idleTransferTimeout,
     formatBytes,
     writeBatchBytes = WRITE_BATCH_BYTES,
@@ -70,6 +73,8 @@ export class StreamCache {
     this.maxActiveStreams = maxActiveStreams;
     this.maxStreamBytes = maxStreamBytes;
     this.streamTimeout = streamTimeout;
+    this.firstByteTimeout = firstByteTimeout;
+    this.peerIdleTimeout = peerIdleTimeout;
     this.idleTransferTimeout = idleTransferTimeout;
     this.formatBytes = formatBytes;
     this.writeBatchBytes = writeBatchBytes;
@@ -79,6 +84,12 @@ export class StreamCache {
     }
     if (!Number.isSafeInteger(writeBatchDelayMs) || writeBatchDelayMs < 0) {
       throw new RangeError("writeBatchDelayMs must be a non-negative whole number.");
+    }
+    if (!Number.isSafeInteger(firstByteTimeout) || firstByteTimeout < 1) {
+      throw new RangeError("firstByteTimeout must be a positive whole number.");
+    }
+    if (!Number.isSafeInteger(peerIdleTimeout) || peerIdleTimeout < 1) {
+      throw new RangeError("peerIdleTimeout must be a positive whole number.");
     }
     this.entries = new Map();
     this.entryInitializations = new Map();
@@ -347,7 +358,7 @@ export class StreamCache {
       this.log(
         "INFO",
         `File request ${context.requestId ?? "unknown"} has a transfer slot for result id=${track.id} ` +
-          `(${this.activeStreams + 1}/${this.maxActiveStreams}).`,
+          `(${this.activeStreams + 1}/${this.maxActiveStreams}; +${(performance.now() - (context.requestStartedAt ?? performance.now())).toFixed(1)}ms).`,
       );
       transfer = this.createTransfer(entry, track, peerFileKey, context);
     }
@@ -382,7 +393,13 @@ export class StreamCache {
       released: null,
       resolveReleased: null,
       timer: null,
+      firstByteTimer: null,
       controller: new AbortController(),
+      requestStartedAt: context.requestStartedAt ?? performance.now(),
+      downloadStartedAt: null,
+      firstPeerDataLogged: false,
+      firstDiskWriteStarted: false,
+      firstDiskWriteCompleted: false,
       speedBytesPerSecond: null,
       lastProgressBytes: entry.receivedBytes,
       lastProgressAt: null,
@@ -438,11 +455,24 @@ export class StreamCache {
         entry.receivedBytes = 0;
       }
       const tempPath = join(tmpdir(), "BitSeekWin", `${randomUUID()}.flac`);
+      transfer.downloadStartedAt = performance.now();
+      this.log(
+        "STREAM",
+        `Soulseek download() invoked for result id=${track.id} from ${track.user} ` +
+          `(+${(transfer.downloadStartedAt - transfer.requestStartedAt).toFixed(1)}ms from HTTP request).`,
+      );
+      transfer.firstByteTimer = setTimeout(
+        () => transfer.cancel(
+          `No peer audio bytes received within ${this.firstByteTimeout}ms`,
+        ),
+        this.firstByteTimeout,
+      );
+      transfer.firstByteTimer.unref();
       const download = this.client.download({
         ...track,
         path: tempPath,
         offset: transfer.writePosition,
-        timeout: this.streamTimeout,
+        timeout: this.peerIdleTimeout,
         signal: transfer.controller.signal,
       });
       transfer.download = download;
@@ -460,7 +490,9 @@ export class StreamCache {
         this.log(
           status === "failed" ? "WARN" : "STREAM",
           `Soulseek result id=${track.id} from ${track.user}\\${track.file} ` +
-            `(file request ${transfer.requestId ?? "unknown"}): ${label}.`,
+            `(file request ${transfer.requestId ?? "unknown"}): ${label} ` +
+            `(+${(performance.now() - transfer.downloadStartedAt).toFixed(1)}ms after download() ` +
+            `/ +${(performance.now() - transfer.requestStartedAt).toFixed(1)}ms from HTTP request).`,
         );
       });
       download.on("queue", (place) => {
@@ -529,6 +561,18 @@ export class StreamCache {
   }
 
   writeChunk(transfer, chunk) {
+    if (chunk.length > 0 && !transfer.firstPeerDataLogged) {
+      transfer.firstPeerDataLogged = true;
+      clearTimeout(transfer.firstByteTimer);
+      transfer.firstByteTimer = null;
+      this.log(
+        "STREAM",
+        `First Soulseek data chunk for result id=${transfer.track.id} ` +
+          `(${chunk.length} bytes; +${(performance.now() - transfer.downloadStartedAt).toFixed(1)}ms after download() ` +
+          `/ +${(performance.now() - transfer.requestStartedAt).toFixed(1)}ms from HTTP request).`,
+      );
+    }
+    if (chunk.length === 0) return;
     const position = transfer.writePosition;
     transfer.writePosition += chunk.length;
     if (transfer.writePosition > this.maxStreamBytes) {
@@ -567,6 +611,14 @@ export class StreamCache {
 
     transfer.writeQueue = transfer.writeQueue.then(async () => {
       if (transfer.writeError) return;
+      if (!transfer.firstDiskWriteStarted) {
+        transfer.firstDiskWriteStarted = true;
+        this.log(
+          "STREAM",
+          `First cache write started for result id=${transfer.track.id} ` +
+            `(+${(performance.now() - transfer.requestStartedAt).toFixed(1)}ms from HTTP request).`,
+        );
+      }
       await writeBuffersAt(
         transfer.fileHandle,
         buffers,
@@ -575,8 +627,13 @@ export class StreamCache {
         () => this.diskWriteOperations++,
       );
       transfer.entry.receivedBytes = position + byteLength;
-      if (position === 0) {
-        this.log("STREAM", `First audio bytes received for "${transfer.track.title}".`);
+      if (!transfer.firstDiskWriteCompleted) {
+        transfer.firstDiskWriteCompleted = true;
+        this.log(
+          "STREAM",
+          `First cache write completed for result id=${transfer.track.id}; First audio bytes received for "${transfer.track.title}" ` +
+            `(${byteLength} bytes persisted; +${(performance.now() - transfer.requestStartedAt).toFixed(1)}ms from HTTP request).`,
+        );
       }
       this.notify(transfer.entry);
     }).catch((error) => {
@@ -649,6 +706,7 @@ export class StreamCache {
           transfer.fileHandle = null;
         }
         clearTimeout(transfer.timer);
+        clearTimeout(transfer.firstByteTimer);
         clearTimeout(transfer.entry.idleTimer);
         transfer.entry.idleTimer = null;
         if (transfer.entry.activeTransfer === transfer) {
@@ -759,9 +817,10 @@ export class StreamCache {
     };
   }
 
-  async *readRange(entry, start, end, response, signal) {
+  async *readRange(entry, start, end, response, signal, onFirstReadable = () => {}) {
     let position = start;
     const fileHandle = await open(entry.dataPath, "r");
+    let firstReadable = true;
     const stopped = () => response.destroyed || signal.aborted;
     const waitForChange = async () => {
       if (stopped()) return;
@@ -802,6 +861,10 @@ export class StreamCache {
         if (bytesRead === 0) {
           await waitForChange();
           continue;
+        }
+        if (firstReadable) {
+          firstReadable = false;
+          onFirstReadable();
         }
         position += bytesRead;
         yield buffer.subarray(0, bytesRead);

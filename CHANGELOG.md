@@ -3,6 +3,26 @@
 Notable changes are recorded here. Historical entries summarize changes
 available in the project history and prior session records.
 
+## Unreleased
+
+- Added an explicit LAN source mode that detects a private IPv4 address, uses
+  that reachable base URL, and authenticates with the readable adjective/noun
+  phrase without appending the separate random bearer-token suffix. The
+  localhost and custom/Tailscale URL paths retain their existing token.
+- Moved the Activity/source URL panel above the Soulseek login controls and
+  added a one-click LAN address selector.
+- Documented that Android BitChord currently blocks cleartext HTTP and that
+  this cannot be changed by the launcher/server; secure options are a scoped
+  client-side LAN opt-in or HTTPS trusted by Android.
+- Added high-resolution elapsed-time logs from file-request receipt through peer
+  data, cache persistence/readability, and the first HTTP response-body write.
+- Added search diagnostics for candidate availability, self-reported speed,
+  queue length, match score, and whether a candidate was returned to BitChord.
+- Added configurable 30-second defaults for the first peer audio byte and peer
+  connection inactivity. Nonresponsive/stalled transfers now fail promptly
+  while retaining already-persisted partial data; the existing 15-minute
+  overall transfer limit and two-transfer maximum are unchanged.
+
 ## alpha-0.5.2
 
 - Added launcher controls for search result selection, result count, query

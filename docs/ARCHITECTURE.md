@@ -28,10 +28,12 @@ flowchart LR
 ```
 
 BitSeekWin is an HTTP add-on bridge. It does not expose a JavaScript add-on
-module inside BitChord. The public source URL contains a path slug and a
-bearer secret; all add-on routes are under that prefix. The Node HTTP server
-listens on `0.0.0.0` and uses `PUBLIC_BASE_URL` when constructing the playable
-audio URL.
+module inside BitChord. A source URL contains a path slug and a route
+credential; all add-on routes are under that prefix. Localhost and custom
+non-LAN URLs use a separate random 128-bit bearer token. Launcher LAN mode
+uses only the randomly generated adjective/noun phrase as that route
+credential. The Node HTTP server listens on `0.0.0.0` and uses
+`PUBLIC_BASE_URL` when constructing the playable audio URL.
 
 ## BitChord add-on protocol
 
@@ -115,8 +117,13 @@ results that cannot be streamed. Repeated searches do not clear prior results.
 
 Searches and stream/file requests receive diagnostic correlation IDs. Logs
 include result IDs, peer and filename resolution, byte ranges, transfer reuse
-or slot availability, peer transfer status, and HTTP outcomes. Stream requests
-refer back to the most recent search-request IDs associated with that result.
+or slot availability, peer transfer status, and HTTP outcomes. Streaming
+milestones report elapsed time from HTTP request receipt through slot
+acquisition, `slsk-client.download()`, peer status/data, first cache write,
+cache readability, and the first body write queued to Node's HTTP response.
+That final milestone is not a measurement of delivery over the network to
+BitChord. Stream requests refer back to the most recent search-request IDs
+associated with that result.
 
 ## Soulseek client and transfer lifecycle
 
@@ -144,8 +151,13 @@ available to other consumers. Once the last consumer disconnects, an active
 transfer gets a configurable grace period (30 seconds by default, adjustable
 from 1 to 600 seconds in the launcher). If nobody reconnects, that transfer is
 canceled and releases its slot; its partial bytes are retained.
-Transfers also have a 15-minute timeout. A server shutdown cancels outstanding
-transfers and waits for them to release before destroying the client.
+Transfers also have a 15-minute overall timeout. By default, a new transfer is
+cancelled if no peer audio chunk arrives within 30 seconds; peer-connection
+inactivity also times out after 30 seconds. These deadlines are separately
+configurable with `BITSEEKWIN_FIRST_BYTE_TIMEOUT_MS` and
+`BITSEEKWIN_PEER_IDLE_TIMEOUT_MS` (1–300 seconds). A server shutdown cancels
+outstanding transfers and waits for them to release before destroying the
+client.
 
 ## Streaming, byte ranges, and partial data
 
@@ -224,6 +236,14 @@ ceiling and 128 MiB per-track cap. The password is not written to the launcher
 settings file. The launcher reads the server's combined output for status and
 diagnostics.
 
+The launcher can detect a private IPv4 address and advertise
+`http://<LAN-IP>:8080` for another device on the same network. This mode uses
+the randomized adjective/noun route phrase without the separate random token;
+the phrase remains the URL's route credential, with less entropy than the
+normal 128-bit token. Localhost and custom/Tailscale URLs retain the 128-bit
+token. The server still binds on all interfaces, so LAN access should be
+limited by Windows Firewall to Private networks.
+
 The browser dashboard shows setup controls, the generated source URL, and the
 activity log. It polls the launcher's loopback-only `/api/status` endpoint for
 launcher state and logs. It does not show a live-monitoring panel or operational
@@ -261,6 +281,12 @@ launcher stops BitSeekWin.
 
 ### Known compatibility gaps and limitations
 
+- **Android cleartext policy blocks the plain-HTTP LAN URL.** The current
+  BitChord Android manifest sets `android:usesCleartextTraffic="false"`.
+  BitSeekWin cannot override that client-side policy. BitChord would need a
+  user-approved, host-scoped LAN cleartext exception, or the connection must
+  use HTTPS trusted by Android (for example, Tailscale HTTPS on both devices).
+  Do not disable cleartext protection globally.
 - **Quality tiers are ignored.** BitChord documents sending `quality` on both
   search and stream requests. BitSeekWin currently reads only the search `q`
   parameter and always searches/returns FLAC lossless results, regardless of
@@ -276,13 +302,20 @@ launcher stops BitSeekWin.
 - Soulseek peers may be offline, queue or refuse transfers, disconnect, or
   provide data that differs from the search result. Actual playback and
   offset-resume behavior depends on the peer, network, library, and BitChord
-  client and needs live testing.
+  client and needs live testing. BitSeekWin does not automatically switch a
+  failed stream to another peer: cache entries are bound to peer/file/size,
+  and transparent switching would need to prove that alternate bytes represent
+  the same recording before continuing a range or partial transfer. BitChord
+  can select another returned result, or the user can retry after changing the
+  source result.
 - `stream_cache.bench.mjs` compares per-chunk writes with multiple batch
   thresholds, peer chunk sizes, flush delays, and one or two local transfers.
   It uses a synthetic local peer and measures the cache/HTTP path only; results
   do not predict Soulseek peer throughput or WAN performance. Run it with
   `node --expose-gc stream_cache.bench.mjs`; `BITSEEKWIN_BENCH_MIB` and
   `BITSEEKWIN_BENCH_REPEATS` control the synthetic file size and repetitions.
+  Set `BITSEEKWIN_BENCH_TARGETED=true` to compare per-chunk writes with the
+  selected 128 KiB batch across 64/128/256/512 KiB peer chunks.
 - The library's in-memory buffering and the 128 MiB/two-transfer limits mean
   peak memory can still be high. Disk caching does not remove this limitation.
 - The server-side manifest/stream/file handoff is covered by tests, but a

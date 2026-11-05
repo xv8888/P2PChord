@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
+import { performance } from "node:perf_hooks";
 import { FileAttribute } from "slsk-client";
 import {
   createAddonServer,
@@ -854,6 +855,140 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   assert.equal((await reader.read()).done, true);
 });
 
+test("stream timing logs trace the first byte through the HTTP response", async () => {
+  const id = await searchTrack();
+  const startedAt = performance.now();
+  const response = await fetch(`${base}/file/${id}`);
+  const reader = response.body.getReader();
+  const first = await reader.read();
+  const firstByteMs = performance.now() - startedAt;
+
+  assert.equal(Buffer.from(first.value).toString(), "0123");
+  assert.ok(firstByteMs >= transferDelay - 50, `first byte arrived in ${firstByteMs}ms`);
+  assert.ok(firstByteMs < 2000, `first byte arrived in ${firstByteMs}ms`);
+  for (const stage of [
+    "cache entry ready",
+    "has a transfer slot",
+    "download() invoked",
+    "First Soulseek data chunk",
+    "First cache write started",
+    "First cache write completed",
+    "first cache bytes became readable",
+    "first HTTP-readable audio chunk",
+    "first audio byte queued to HTTP response",
+  ]) {
+    assert.ok(logEntries.some(({ message }) => message.includes(stage)), stage);
+  }
+  assert.equal((await reader.read()).done, false);
+  assert.equal((await reader.read()).done, true);
+});
+
+test("a peer that never sends its first chunk is cancelled within the configured deadline", async () => {
+  await stopServer();
+  await startServer({ firstByteTimeout: 80, peerIdleTimeout: 500 });
+  const id = await searchTrack();
+  client.download = (options) => {
+    const download = new FakeDownload(options, [], 500);
+    downloads.push(download);
+    return download;
+  };
+
+  const startedAt = performance.now();
+  const response = await fetch(`${base}/file/${id}`);
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(response.status, 502);
+  assert.match((await response.json()).error, /failed before audio started/i);
+  assert.ok(elapsedMs >= 50 && elapsedMs < 1000, `failed after ${elapsedMs}ms`);
+  assert.ok(logEntries.some(({ message }) =>
+    message.includes("No peer audio bytes received within 80ms"),
+  ));
+  for (let attempt = 0; attempt < 30 && streamCache.activeStreams > 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(streamCache.activeStreams, 0);
+});
+
+test("a peer that stalls after its first chunk fails under the peer idle timeout", async () => {
+  await stopServer();
+  await startServer({ firstByteTimeout: 500, peerIdleTimeout: 80 });
+  const id = await searchTrack();
+  client.download = (options) => {
+    const download = new FakeDownload(
+      options,
+      [Buffer.from("0123"), Buffer.from("456789")],
+      100,
+    );
+    downloads.push(download);
+    let idleTimer;
+    download.once("data", () => {
+      idleTimer = setTimeout(
+        () => download.fail(new Error("peer inactivity timeout")),
+        options.timeout,
+      );
+    });
+    download.once("complete", () => clearTimeout(idleTimer));
+    download.once("failed", () => clearTimeout(idleTimer));
+    return download;
+  };
+
+  const response = await fetch(`${base}/file/${id}`);
+  assert.equal(response.status, 200);
+  const reader = response.body.getReader();
+  assert.equal(Buffer.from((await reader.read()).value).toString(), "0123");
+  await assert.rejects(reader.read());
+  for (let attempt = 0; attempt < 30 && streamCache.activeStreams > 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(streamCache.activeStreams, 0);
+  const snapshot = await streamCache.getMonitoringSnapshot();
+  assert.equal(
+    snapshot.transfers.find((item) => item.filename === track.file)?.status,
+    "failed",
+  );
+  assert.ok(logEntries.some(({ message }) =>
+    message.includes("peer inactivity timeout"),
+  ));
+});
+
+test("a peer disconnect during playback leaves resumable persisted bytes", async () => {
+  const id = await searchTrack();
+  const originalDownload = client.download.bind(client);
+  client.download = (options) => {
+    const download = new FakeDownload(
+      options,
+      [Buffer.from("0123"), Buffer.from("456789")],
+      250,
+    );
+    downloads.push(download);
+    download.once("data", () => {
+      setTimeout(
+        () => download.fail(new Error("peer disconnected during playback")),
+        50,
+      );
+    });
+    return download;
+  };
+
+  const response = await fetch(`${base}/file/${id}`);
+  const reader = response.body.getReader();
+  assert.equal(Buffer.from((await reader.read()).value).toString(), "0123");
+  await assert.rejects(reader.read());
+  for (let attempt = 0; attempt < 30 && streamCache.activeStreams > 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const snapshot = await streamCache.getMonitoringSnapshot();
+  const failedTransfer = snapshot.transfers.find(
+    (item) => item.filename === track.file,
+  );
+  assert.equal(failedTransfer?.status, "failed");
+  assert.equal(failedTransfer?.downloadedBytes, 4);
+
+  client.download = originalDownload;
+  const resumed = await fetch(`${base}/file/${id}`);
+  assert.equal(await resumed.text(), "0123456789");
+  assert.equal(downloads[1].options.offset, 4);
+});
+
 test("batched cache writes preserve bytes while delivering the first chunk immediately", async () => {
   const content = Buffer.alloc(96 * 1024);
   for (let index = 0; index < content.length; index++) {
@@ -914,6 +1049,7 @@ test("reconnecting during the grace period reuses the active Soulseek transfer",
 });
 
 test("disconnecting one HTTP stream closes its reader without affecting another consumer", async () => {
+  transferDelay = 1000;
   const id = await searchTrack();
   const originalReadRange = streamCache.readRange.bind(streamCache);
   let firstReaderClosed;
@@ -995,6 +1131,8 @@ test("disconnecting one track preserves shared consumers and expires abandoned t
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
   await streamCache.close();
+  trackADelay = 1000;
+  transferDelay = 1000;
   await startServer({ idleTransferTimeout: 25 });
   client.search = async ({ req }) => [{
     ...track,

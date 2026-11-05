@@ -10,6 +10,7 @@ from launcher import (
     SOURCE_WORDS,
     _page,
     build_bitseekwin_environment,
+    detect_lan_ip,
     find_node_runtime,
     generate_source_secret,
     make_handler,
@@ -19,6 +20,43 @@ from http.server import ThreadingHTTPServer
 
 
 class LauncherConfigurationTests(unittest.TestCase):
+    def test_detect_lan_ip_prefers_private_route_address(self):
+        route = type(
+            "Route",
+            (),
+            {
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *_args: None,
+                "connect": lambda self, _address: None,
+                "getsockname": lambda self: ("192.168.1.42", 0),
+            },
+        )()
+        with patch("launcher.socket.socket", return_value=route), patch(
+            "launcher.socket.getaddrinfo", return_value=[]
+        ):
+            self.assertEqual(detect_lan_ip(), "192.168.1.42")
+
+    def test_detect_lan_ip_filters_loopback_and_link_local_addresses(self):
+        entries = [
+            (None, None, None, None, ("127.0.0.1", 0)),
+            (None, None, None, None, ("169.254.4.3", 0)),
+            (None, None, None, None, ("10.0.0.8", 0)),
+        ]
+        route = type(
+            "Route",
+            (),
+            {
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *_args: None,
+                "connect": lambda self, _address: None,
+                "getsockname": lambda self: ("0.0.0.0", 0),
+            },
+        )()
+        with patch("launcher.socket.socket", return_value=route), patch(
+            "launcher.socket.getaddrinfo", return_value=entries
+        ):
+            self.assertEqual(detect_lan_ip(), "10.0.0.8")
+
     def test_normalizes_public_url(self):
         self.assertEqual(
             normalize_public_url(" https://device.example.ts.net/ "),
@@ -184,6 +222,37 @@ class LauncherConfigurationTests(unittest.TestCase):
             },
         )
 
+    def test_start_uses_detected_lan_address_and_word_only_secret_mode(self):
+        settings = {
+            "username": "user",
+            "password": "password",
+            "public_url": "http://127.0.0.1:8080",
+            "lan_access": True,
+        }
+        with patch("launcher.detect_lan_ip", return_value="192.168.1.42"), patch(
+            "launcher.find_node_runtime", return_value="node"
+        ), patch("launcher.threading.Thread") as worker_thread:
+            LauncherController().start(settings)
+
+        args = worker_thread.call_args.kwargs["args"]
+        self.assertEqual(args[3], "http://192.168.1.42:8080")
+        self.assertFalse(args[4])
+        self.assertTrue(args[8])
+
+    def test_start_rejects_lan_mode_without_a_private_address(self):
+        with patch("launcher.detect_lan_ip", return_value=None), patch(
+            "launcher.find_node_runtime", return_value="node"
+        ):
+            with self.assertRaisesRegex(ValueError, "No private LAN IPv4"):
+                LauncherController().start(
+                    {
+                        "username": "user",
+                        "password": "password",
+                        "public_url": "http://127.0.0.1:8080",
+                        "lan_access": True,
+                    }
+                )
+
     def test_source_secret_words_follow_selected_count_and_length(self):
         entropy = bytes(range(16))
         phrase_entropy = bytes((0, 0, 0, 0, 0, 3, 0, 0, 0, 6, 0, 0) + (0,) * 20)
@@ -195,6 +264,24 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertTrue(all(word in SOURCE_WORDS["adjectives"]["6"] for word in words[1:2]))
         self.assertIn(words[-1], SOURCE_WORDS["nouns"]["9"])
         self.assertEqual(parts[-1], "AAECAwQFBgcICQoLDA0ODw")
+
+    def test_lan_source_secret_omits_the_random_token_but_keeps_phrase_auth(self):
+        with patch(
+            "launcher.secrets.token_bytes",
+            side_effect=AssertionError("LAN mode should not generate a token"),
+        ):
+            phrase = generate_source_secret(
+                3,
+                6,
+                phrase_bytes=bytes(
+                    (0, 0, 0, 0, 0, 3, 0, 0, 0, 6, 0, 0) + (0,) * 20
+                ),
+                include_token=False,
+            )
+        words = phrase.split("-")
+        self.assertEqual(len(words), 3)
+        self.assertTrue(all(word.isalpha() for word in words))
+        self.assertIn(words[-1], SOURCE_WORDS["nouns"][str(len(words[-1]))])
 
     def test_source_secret_varies_each_word_within_three_letters(self):
         for word_count in range(2, 9):
@@ -312,7 +399,11 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('id="wordCount" type="range" min="2" max="8" value="3"', page)
         self.assertIn('id="wordLength" type="range" min="3" max="9" value="6"', page)
         self.assertIn("Adjectives come first, then one noun", page)
-        self.assertIn("128-bit access security", page)
+        self.assertIn("random 128-bit bearer token", page)
+        self.assertIn("another device on this LAN", page)
+        self.assertIn("192.168.1.42", _page(
+            "test-token", "https://device.example.ts.net", "192.168.1.42"
+        ).decode("utf-8"))
         self.assertIn("Target letters per word", page)
         self.assertIn('aria-label="Launcher sections"', page)
         for section in (
@@ -325,10 +416,13 @@ class LauncherConfigurationTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{section}"', page)
             self.assertIn(f'href="#{section}"', page)
+        self.assertLess(page.index('id="activity"'), page.index('id="connection"'))
         for control in (
             "username",
             "password",
             "publicUrl",
+            "lanAccess",
+            "useLan",
             "funnel",
             "allowDownloads",
             "sourceSelection",
@@ -349,6 +443,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{control}"', page)
         self.assertIn('id="allowDownloads" type="checkbox"', page)
+        self.assertIn('lan_access:$("lanAccess").checked', page)
         self.assertIn('allow_downloads:$("allowDownloads").checked', page)
         self.assertIn('id="sourceSelection"', page)
         self.assertIn('source_selection:$("sourceSelection").value', page)

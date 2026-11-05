@@ -69,6 +69,7 @@ def generate_source_secret(
     word_length: int = DEFAULT_SECRET_WORD_LENGTH,
     random_bytes: bytes | None = None,
     phrase_bytes: bytes | None = None,
+    include_token: bool = True,
 ) -> str:
     if (
         isinstance(word_count, bool)
@@ -88,9 +89,8 @@ def generate_source_secret(
             f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
             f"{MAX_SECRET_WORD_LENGTH}."
         )
-    entropy = random_bytes if random_bytes is not None else secrets.token_bytes(16)
-    if not isinstance(entropy, bytes) or len(entropy) != 16:
-        raise ValueError("Source URL token entropy must be exactly 16 bytes.")
+    if not isinstance(include_token, bool):
+        raise ValueError("Include token must be true or false.")
     phrase_entropy = (
         phrase_bytes if phrase_bytes is not None else secrets.token_bytes(32)
     )
@@ -118,6 +118,11 @@ def generate_source_secret(
             phrase_entropy[index * 4 + 2 : index * 4 + 4], "big"
         )
         words.append(word_list[word_entropy % len(word_list)])
+    if not include_token:
+        return "-".join(words)
+    entropy = random_bytes if random_bytes is not None else secrets.token_bytes(16)
+    if not isinstance(entropy, bytes) or len(entropy) != 16:
+        raise ValueError("Source URL token entropy must be exactly 16 bytes.")
     token = (
         base64.urlsafe_b64encode(entropy)
         .decode("ascii")
@@ -125,6 +130,42 @@ def generate_source_secret(
         .replace("-", "~")
     )
     return "-".join((*words, token))
+
+
+def detect_lan_ip() -> str | None:
+    candidates: list[str] = []
+
+    def add_candidate(value: str) -> None:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            return
+        if (
+            isinstance(address, ipaddress.IPv4Address)
+            and address.is_private
+            and not address.is_loopback
+            and not address.is_link_local
+            and not address.is_unspecified
+            and value not in candidates
+        ):
+            candidates.append(value)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(("192.0.2.1", 9))
+            add_candidate(route.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for result in socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM
+        ):
+            add_candidate(result[4][0])
+    except OSError:
+        pass
+
+    return candidates[0] if candidates else None
 
 
 def normalize_public_url(value: str) -> str:
@@ -342,6 +383,7 @@ class LauncherController:
         password = str(config.get("password", ""))
         public_text = str(config.get("public_url", ""))
         use_funnel = config.get("start_funnel") is True
+        lan_access = config.get("lan_access", False)
         allow_downloads = config.get("allow_downloads", False)
         source_selection = config.get("source_selection", DEFAULT_SOURCE_SELECTION)
         search_limit = _validate_integer_setting(
@@ -388,6 +430,8 @@ class LauncherController:
 
         if not username or not password:
             raise ValueError("Enter your Soulseek username and password.")
+        if not isinstance(lan_access, bool):
+            raise ValueError("LAN access must be true or false.")
         if not isinstance(allow_downloads, bool):
             raise ValueError("Allow downloads must be true or false.")
         if source_selection not in SOURCE_SELECTION_MODES:
@@ -413,7 +457,15 @@ class LauncherController:
                 f"{MAX_SECRET_WORD_LENGTH}."
             )
         node = find_node_runtime()
-        public_url = normalize_public_url(public_text)
+        if lan_access:
+            lan_ip = detect_lan_ip()
+            if not lan_ip:
+                raise ValueError("No private LAN IPv4 address was detected.")
+            if use_funnel:
+                raise ValueError("Turn off Tailscale Funnel when using the LAN address.")
+            public_url = f"http://{lan_ip}:{PORT}"
+        else:
+            public_url = normalize_public_url(public_text)
         if use_funnel and not public_url.startswith("https://"):
             raise ValueError("Tailscale Funnel requires an https:// public URL.")
         if use_funnel and not self.tailscale:
@@ -453,6 +505,7 @@ class LauncherController:
                 server_settings,
                 word_count,
                 word_length,
+                lan_access,
             ),
             daemon=True,
         ).start()
@@ -494,6 +547,7 @@ class LauncherController:
         server_settings: dict[str, bool | str | int],
         word_count: int,
         word_length: int,
+        lan_access: bool = False,
     ) -> None:
         server_process: subprocess.Popen | None = None
         try:
@@ -529,7 +583,9 @@ class LauncherController:
                 base_env,
                 username,
                 password,
-                generate_source_secret(word_count, word_length),
+                generate_source_secret(
+                    word_count, word_length, include_token=not lan_access
+                ),
                 public_url,
                 word_count,
                 word_length,
@@ -624,11 +680,12 @@ class LauncherController:
         )
 
 
-def _page(token: str, public_url: str) -> bytes:
+def _page(token: str, public_url: str, lan_ip: str | None = None) -> bytes:
     html = (
         _HTML.replace("__TOKEN_JSON__", json.dumps(token))
         .replace("__VERSION__", __version__)
         .replace("__PUBLIC_URL_JSON__", json.dumps(public_url))
+        .replace("__LAN_IP_JSON__", json.dumps(lan_ip or ""))
         .replace(
             "__FONT_URL__",
             json.dumps(f"/{token}/assets/inter-variable.woff2"),
@@ -804,6 +861,9 @@ button{cursor:pointer}
 .activity-head{display:flex;align-items:center;gap:10px}
 .activity-state{color:var(--text-secondary);font-size:var(--text-label)}
 .copy{margin-left:auto}
+.address-row{display:flex;gap:8px}
+.address-row input{min-width:0;flex:1}
+.address-row .button{flex:none}
 .url{min-height:39px;margin-top:14px;padding:10px 11px;border:1px solid var(--line);border-radius:7px;background:var(--inset-surface);color:var(--url-color);font-size:var(--text-caption);line-height:var(--leading-relaxed);overflow-wrap:anywhere}
 .url.empty{color:var(--subtle)}
 .console-meta{display:flex;justify-content:space-between;gap:12px;margin:17px 1px 7px;color:var(--subtle);font-size:var(--text-micro);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-micro)}
@@ -845,6 +905,7 @@ button{cursor:pointer}
   .toolbar-status{font-size:var(--text-caption)}
   .page-content{padding-right:12px;padding-left:12px}
   .section-card{padding:16px}
+  .address-row{align-items:stretch;flex-direction:column}
   .logs{height:200px}
   .log-line{grid-template-columns:48px 43px minmax(0,1fr);gap:5px}
 }
@@ -902,6 +963,13 @@ button{cursor:pointer}
       <h1 class="page-heading">Connect to Soulseek</h1>
       <p class="page-description">Sign in to start the BitSeekWin server and make your BitChord source available.</p>
 
+      <section class="section-card" id="activity" aria-labelledby="activityTitle">
+        <div class="activity-head"><div><h2 class="section-heading" id="activityTitle">Activity</h2><p class="section-description">Server events and the source URL for BitChord.</p></div><button class="button copy" id="copy" type="button" disabled>Copy source URL</button></div>
+        <div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div>
+        <div class="console-meta"><span>SOULSEEK / BITCHORD</span><span id="log-count">0 EVENTS</span></div>
+        <div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">Ready when you are.</div>
+      </section>
+
       <section class="section-card" id="connection" aria-labelledby="connectionTitle">
         <h2 class="section-heading" id="connectionTitle">Soulseek account</h2>
         <p class="section-description">Your credentials are used for this launch only.</p>
@@ -917,11 +985,12 @@ button{cursor:pointer}
         <h2 class="section-heading" id="sourceTitle">Source</h2>
         <p class="section-description">Set the address and selection behavior BitChord uses to reach your server.</p>
         <div class="fields-grid">
-          <div class="field full"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" aria-describedby="publicUrlHint publicUrlState" placeholder="https://device.tailnet.ts.net"><p class="hint" id="publicUrlHint">Enter the base address only. A valid address is saved on this device when startup is accepted.</p><p class="hint" id="publicUrlState" aria-live="polite"></p></div>
+          <div class="field full"><label for="publicUrl">Base address</label><div class="address-row"><input id="publicUrl" type="url" autocomplete="url" aria-describedby="publicUrlHint lanAddressHint publicUrlState" placeholder="https://device.tailnet.ts.net"><button class="button" id="useLan" type="button">Use LAN address</button></div><p class="hint" id="publicUrlHint">Enter the base address only. A valid address is saved on this device when startup is accepted.</p><p class="hint" id="lanAddressHint"></p><p class="hint" id="publicUrlState" aria-live="polite"></p></div>
+          <div class="field full"><label class="check"><input id="lanAccess" type="checkbox">Connect from another device on this LAN</label><p class="hint">Uses the detected private IP and a word-only adjective/noun access phrase. Keep the full source URL private. Android BitChord currently blocks plain HTTP; see the LAN setup note.</p></div>
           <div class="field full"><label class="check"><input id="funnel" type="checkbox">Start Tailscale Funnel on port 8080</label><p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p></div>
           <div class="field"><label class="slider-label" for="wordCount">Words in source URL <output id="wordCountValue" class="slider-value">3</output></label><input class="slider" id="wordCount" type="range" min="2" max="8" value="3"></div>
           <div class="field"><label class="slider-label" for="wordLength">Target letters per word <output id="wordLengthValue" class="slider-value">6</output></label><input class="slider" id="wordLength" type="range" min="3" max="9" value="6"></div>
-          <div class="field full"><p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. A separate random token provides 128-bit access security.</p><p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p></div>
+          <div class="field full"><p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. Non-LAN source URLs also include a separate random 128-bit bearer token.</p><p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p></div>
           <div class="field full"><label class="check"><input id="allowDownloads" type="checkbox">Allow downloads in BitChord</label><p class="hint">Off by default. When enabled, BitChord may offer downloads from this source.</p></div>
           <div class="field full"><label for="sourceSelection">Source selection</label><select id="sourceSelection"><option value="match">Best filename match (recommended)</option><option value="speed">Highest reported upload speed</option></select><p class="hint">Fastest-speed mode returns only the peer reporting the highest upload speed, even when another result may be a closer match. Peer speeds are self-reported.</p></div>
         </div>
@@ -956,17 +1025,11 @@ button{cursor:pointer}
         </div>
       </section>
 
-      <section class="section-card" id="activity" aria-labelledby="activityTitle">
-        <div class="activity-head"><div><h2 class="section-heading" id="activityTitle">Activity</h2><p class="section-description">Server events and the source URL for BitChord.</p></div><button class="button copy" id="copy" type="button" disabled>Copy source URL</button></div>
-        <div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div>
-        <div class="console-meta"><span>SOULSEEK / BITCHORD</span><span id="log-count">0 EVENTS</span></div>
-        <div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">Ready when you are.</div>
-      </section>
     </main>
   </div>
 </div>
 <script>
-const token=__TOKEN_JSON__, api="/"+token+"/api/";
+const token=__TOKEN_JSON__, api="/"+token+"/api/", lanIp=__LAN_IP_JSON__;
 const $=id=>document.getElementById(id);
 let sourceUrl="";
 function applyTheme(theme,persist=false){const dark=theme==="dark";document.documentElement.dataset.theme=dark?"dark":"light";$("themeToggle").textContent=dark?"Light mode":"Dark mode";$("themeToggle").setAttribute("aria-label",dark?"Switch to light mode":"Switch to dark mode");$("themeToggle").setAttribute("aria-pressed",String(dark));if(persist){try{localStorage.setItem("bitseekwin.theme",dark?"dark":"light");}catch(e){console.warn("Could not save the appearance preference.",e);}}}
@@ -976,6 +1039,12 @@ $("themeToggle").addEventListener("click",()=>applyTheme(document.documentElemen
 $("publicUrl").value=__PUBLIC_URL_JSON__;
 try{const savedPublicUrl=localStorage.getItem("bitseekwin.publicBaseUrl");if(savedPublicUrl&&normalizePublicUrl(savedPublicUrl))$("publicUrl").value=savedPublicUrl;}catch(e){$("publicUrlState").textContent="Saved address could not be loaded from this browser.";}
 $("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
+const lanBaseUrl=lanIp?"http://"+lanIp+":8080":"";
+$("lanAddressHint").textContent=lanIp?"Detected LAN address: "+lanBaseUrl+". Android BitChord does not currently allow this HTTP URL.":"No private LAN IPv4 address was detected.";
+$("useLan").disabled=!lanIp;
+function setLanAccess(enabled){$("lanAccess").checked=enabled;if(enabled){if(!lanBaseUrl){$("lanAccess").checked=false;return;} $("publicUrl").value=lanBaseUrl;$("publicUrl").disabled=true;$("funnel").checked=false;$("funnel").disabled=true;}else{$("publicUrl").disabled=false;$("funnel").disabled=false;}validatePublicUrl();}
+$("useLan").addEventListener("click",()=>setLanAccess(true));
+$("lanAccess").addEventListener("change",()=>setLanAccess($("lanAccess").checked));
 function normalizePublicUrl(value){const url=value.trim().replace(/\/+$/,"");if(!url||/[\u0000-\u0020]/.test(url))return null;let parsed;try{parsed=new URL(url);}catch(e){return null;}if(!["http:","https:"].includes(parsed.protocol)||!parsed.host||parsed.username||parsed.password||parsed.search||parsed.hash||!["","/"].includes(parsed.pathname))return null;return url;}
 function validatePublicUrl(){const input=$("publicUrl"),normalized=normalizePublicUrl(input.value);input.setCustomValidity(input.value.trim()&&!normalized?"Enter a valid base URL without credentials, path, query, or fragment.":"");return normalized;}
 $("publicUrl").addEventListener("input",()=>{validatePublicUrl();$("publicUrlState").textContent="";});
@@ -990,7 +1059,7 @@ $("start").addEventListener("click",async()=>{
   const numericSettings=["searchLimit","searchTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize"];
   const invalidSetting=numericSettings.map(id=>$(id)).find(input=>!input.checkValidity());
   if(invalidSetting){invalidSetting.reportValidity();return;}
-  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
+  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
   try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}
@@ -1074,7 +1143,7 @@ def make_handler(controller: LauncherController, token: str):
                     detect_tailscale_url(controller.tailscale)
                     or "http://127.0.0.1:8080"
                 )
-                body = _page(token, public_url)
+                body = _page(token, public_url, detect_lan_ip())
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

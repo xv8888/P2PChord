@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
+import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { FileAttribute, SlskClient } from "slsk-client";
@@ -74,6 +75,18 @@ const MAX_STREAM_BYTES = readIntegerEnvironmentValue(
   128 * 1024 * 1024,
 );
 const STREAM_TIMEOUT = 15 * 60 * 1000;
+const FIRST_BYTE_TIMEOUT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_FIRST_BYTE_TIMEOUT_MS",
+  30 * 1000,
+  1000,
+  5 * 60 * 1000,
+);
+const PEER_IDLE_TIMEOUT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_PEER_IDLE_TIMEOUT_MS",
+  30 * 1000,
+  1000,
+  5 * 60 * 1000,
+);
 const IDLE_TRANSFER_TIMEOUT = readIntegerEnvironmentValue(
   "BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS",
   30 * 1000,
@@ -400,6 +413,8 @@ export function createAddonServer({
   trackRetentionMs = TRACK_RETENTION_MS,
   maxActiveStreams = MAX_ACTIVE_STREAMS,
   maxStreamBytes = MAX_STREAM_BYTES,
+  firstByteTimeout = FIRST_BYTE_TIMEOUT,
+  peerIdleTimeout = PEER_IDLE_TIMEOUT,
   idleTransferTimeout = IDLE_TRANSFER_TIMEOUT,
   cacheDirectory = CACHE_DIRECTORY,
   cacheTtlMs = CACHE_TTL_MS,
@@ -443,6 +458,12 @@ export function createAddonServer({
     maxStreamBytes > 128 * 1024 * 1024
   ) {
     throw new RangeError("maxStreamBytes must be between 1 and 134217728 bytes.");
+  }
+  if (!Number.isSafeInteger(firstByteTimeout) || firstByteTimeout < 1) {
+    throw new RangeError("firstByteTimeout must be a positive whole number.");
+  }
+  if (!Number.isSafeInteger(peerIdleTimeout) || peerIdleTimeout < 1) {
+    throw new RangeError("peerIdleTimeout must be a positive whole number.");
   }
   if (!Number.isSafeInteger(idleTransferTimeout) || idleTransferTimeout < 1) {
     throw new RangeError("idleTransferTimeout must be a positive whole number.");
@@ -540,6 +561,8 @@ export function createAddonServer({
     maxActiveStreams,
     maxStreamBytes,
     streamTimeout: STREAM_TIMEOUT,
+    firstByteTimeout,
+    peerIdleTimeout,
     idleTransferTimeout,
     formatBytes,
     ...(writeBatchBytes !== undefined ? { writeBatchBytes } : {}),
@@ -547,6 +570,7 @@ export function createAddonServer({
   });
 
   async function handle(request, response) {
+    const requestStartedAt = performance.now();
     response.on("error", (error) => {
       console.error("HTTP response failed:", error.message);
     });
@@ -700,9 +724,11 @@ export function createAddonServer({
             left.track.id.localeCompare(right.track.id)
           );
         });
-        const found = candidates
-          .slice(0, sourceSelection === "speed" ? 1 : searchLimit)
-          .map(({ track }) => track);
+        const selectedCandidates = candidates.slice(
+          0,
+          sourceSelection === "speed" ? 1 : searchLimit,
+        );
+        const found = selectedCandidates.map(({ track }) => track);
         pruneTrackRecords();
         const newResultCount = found.filter((track) => !tracks.has(track.id)).length;
         if (tracks.size + newResultCount > maxTrackRecords) {
@@ -725,11 +751,18 @@ export function createAddonServer({
               sourceSelection === "speed" ? "fastest-speed" : "ranked"
             } ${resultLabel}. ${bestDescription}"${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""}.`,
           );
-          for (const track of found) {
-            rememberTrack(track, searchRequestId);
+          const selectedCandidateSet = new Set(selectedCandidates);
+          for (const candidate of candidates.slice(0, SEARCH_LIMIT_MAX)) {
+            const { track } = candidate;
+            const selected = selectedCandidateSet.has(candidate);
+            if (selected) rememberTrack(track, searchRequestId);
             log(
               "SEARCH",
-              `Search request ${searchRequestId}: result id=${track.id} file="${track.file}" peer=${track.user}.`,
+              `Search request ${searchRequestId}: result id=${track.id} file="${track.file}" peer=${track.user}; ` +
+                `selectedForBitChord=${selected} ` +
+                `slotsAvailable=${candidate.slots} reportedSpeed=${candidate.speed} ` +
+                `queueLength=${candidate.queueLength === Number.MAX_SAFE_INTEGER ? "unknown" : candidate.queueLength} ` +
+                `matchScore=${candidate.score.toFixed(3)}.`,
             );
           }
         } else {
@@ -801,7 +834,7 @@ export function createAddonServer({
       const rangeHeader = request.headers.range ?? "";
       log(
         "STREAM",
-        `File request ${requestId} received for result id=${resultId}; range="${rangeHeader || "full"}".`,
+        `File request ${requestId} received for result id=${resultId}; range="${rangeHeader || "full"}" (+0.0ms).`,
       );
       const resolved = resolveTrack(resultId, requestId, "File");
       if (!resolved) {
@@ -875,6 +908,10 @@ export function createAddonServer({
       try {
         entry = await streamCache.getEntry(track);
         await streamCache.touch(entry);
+        log(
+          "STREAM",
+          `File request ${requestId} cache entry ready (+${(performance.now() - requestStartedAt).toFixed(1)}ms).`,
+        );
       } catch (error) {
         if (entry) streamCache.removeConsumer(entry);
         log("ERROR", `File request ${requestId} could not open result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 500.`);
@@ -887,6 +924,7 @@ export function createAddonServer({
           await streamCache.ensureTransfer(entry, track, {
             requestId,
             searchRequestIds,
+            requestStartedAt,
           });
         } else if (entry.activeTransfer) {
           log(
@@ -928,7 +966,17 @@ export function createAddonServer({
       }
       const streamAbort = new AbortController();
       const range = Readable.from(
-        streamCache.readRange(entry, start, end, response, streamAbort.signal),
+        streamCache.readRange(
+          entry,
+          start,
+          end,
+          response,
+          streamAbort.signal,
+          () => log(
+            "STREAM",
+            `File request ${requestId} first cache bytes became readable (+${(performance.now() - requestStartedAt).toFixed(1)}ms).`,
+          ),
+        ),
       );
       range.on("error", (error) => {
         if (response.destroyed) return;
@@ -945,11 +993,38 @@ export function createAddonServer({
           sendError(response, 502, "Soulseek peer transfer failed before audio started");
         }
       });
+      let firstReadableAt = null;
       range.once("data", () => {
+        firstReadableAt = performance.now();
+        log(
+          "STREAM",
+          `File request ${requestId} first HTTP-readable audio chunk (+${(firstReadableAt - requestStartedAt).toFixed(1)}ms).`,
+        );
         if (!response.headersSent) {
           response.writeHead(partial ? 206 : 200, headers);
         }
       });
+      const responseWrite = response.write.bind(response);
+      let firstResponseBodyWrite = false;
+      response.write = (...args) => {
+        const result = responseWrite(...args);
+        const chunk = args[0];
+        if (
+          firstReadableAt !== null &&
+          !firstResponseBodyWrite &&
+          typeof chunk !== "undefined" &&
+          chunk !== null &&
+          typeof chunk.length === "number" &&
+          chunk.length > 0
+        ) {
+          firstResponseBodyWrite = true;
+          log(
+            "STREAM",
+            `File request ${requestId} first audio byte queued to HTTP response (+${(performance.now() - requestStartedAt).toFixed(1)}ms).`,
+          );
+        }
+        return result;
+      };
       response.on("close", () => {
         if (!response.writableEnded) {
           log("WARN", `BitChord disconnected while streaming "${track.title}".`);
@@ -962,7 +1037,8 @@ export function createAddonServer({
         "STREAM",
         `File request ${requestId} waiting for audio to start result id=${track.id}; ` +
           `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}; ` +
-          `range="${rangeHeader || "full"}"; transfer=${entry.complete ? "cached" : entry.activeTransfer ? "active" : "partial"}.`,
+          `range="${rangeHeader || "full"}"; transfer=${entry.complete ? "cached" : entry.activeTransfer ? "active" : "partial"}; ` +
+          `elapsed=+${(performance.now() - requestStartedAt).toFixed(1)}ms.`,
       );
       range.pipe(response);
       return;
@@ -1074,6 +1150,8 @@ async function main() {
       searchRecovery: SEARCH_RECOVERY,
       maxActiveStreams: MAX_ACTIVE_STREAMS,
       maxStreamBytes: MAX_STREAM_BYTES,
+      firstByteTimeout: FIRST_BYTE_TIMEOUT,
+      peerIdleTimeout: PEER_IDLE_TIMEOUT,
       idleTransferTimeout: IDLE_TRANSFER_TIMEOUT,
       cacheTtlMs: CACHE_TTL_MS,
       maxCacheBytes: MAX_CACHE_BYTES,

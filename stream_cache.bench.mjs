@@ -15,6 +15,7 @@ const BATCH_SIZES = [64, 128, 256, 512].map((size) => size * KIB);
 const BATCH_DELAY_MS = 1;
 const DATA_BYTES = Number(process.env.BITSEEKWIN_BENCH_MIB ?? 4) * MIB;
 const REPEATS = Number(process.env.BITSEEKWIN_BENCH_REPEATS ?? 3);
+const TARGETED = process.env.BITSEEKWIN_BENCH_TARGETED === "true";
 if (!Number.isSafeInteger(DATA_BYTES) || DATA_BYTES < MIB || DATA_BYTES > 128 * MIB) {
   throw new RangeError("BITSEEKWIN_BENCH_MIB must be a whole number from 1 to 128.");
 }
@@ -264,36 +265,53 @@ function formatRow(row) {
 }
 
 const cases = [];
-for (const chunkBytes of CHUNK_SIZES) {
-  cases.push({
-    chunkBytes,
-    batchBytes: 1,
-    delayMs: 0,
-    chunkIntervalMs: 0,
-  });
-  for (const batchBytes of BATCH_SIZES) {
+if (TARGETED) {
+  for (const chunkBytes of CHUNK_SIZES) {
     cases.push({
       chunkBytes,
-      batchBytes,
+      batchBytes: 1,
+      delayMs: 0,
+      chunkIntervalMs: 0,
+    });
+    cases.push({
+      chunkBytes,
+      batchBytes: 128 * KIB,
       delayMs: BATCH_DELAY_MS,
       chunkIntervalMs: 0,
     });
   }
-}
-cases.push({
-  chunkBytes: 64 * KIB,
-  batchBytes: 1,
-  delayMs: 0,
-  chunkIntervalMs: 1,
-});
-for (const delayMs of [1, 4, 8]) {
-  for (const batchBytes of [128, 256, 512].map((size) => size * KIB)) {
+} else {
+  for (const chunkBytes of CHUNK_SIZES) {
     cases.push({
-      chunkBytes: 64 * KIB,
-      batchBytes,
-      delayMs,
-      chunkIntervalMs: 1,
+      chunkBytes,
+      batchBytes: 1,
+      delayMs: 0,
+      chunkIntervalMs: 0,
     });
+    for (const batchBytes of BATCH_SIZES) {
+      cases.push({
+        chunkBytes,
+        batchBytes,
+        delayMs: BATCH_DELAY_MS,
+        chunkIntervalMs: 0,
+      });
+    }
+  }
+  cases.push({
+    chunkBytes: 64 * KIB,
+    batchBytes: 1,
+    delayMs: 0,
+    chunkIntervalMs: 1,
+  });
+  for (const delayMs of [1, 4, 8]) {
+    for (const batchBytes of [128, 256, 512].map((size) => size * KIB)) {
+      cases.push({
+        chunkBytes: 64 * KIB,
+        batchBytes,
+        delayMs,
+        chunkIntervalMs: 1,
+      });
+    }
   }
 }
 
