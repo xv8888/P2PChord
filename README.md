@@ -19,6 +19,8 @@ BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches Sou
 
 BitSeekWin implements BitChord's HTTP add-on flow with one authenticated Soulseek client per server process and independent, bounded track transfers. It streams FLAC data over HTTP ranges and uses a persistent disk cache for partial and completed transfers. The disk cache does not remove `slsk-client`'s in-memory buffering, and the current implementation ignores requested quality tiers. See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the protocol, lifecycle diagram, implementation details, compatibility gaps, and limitations.
 
+See [docs/COMPATIBILITY_AND_ROADMAP.md](./docs/COMPATIBILITY_AND_ROADMAP.md) for the inspected BitChord authentication compatibility findings and planned roadmap.
+
 See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
 > **Version `alpha-0.5.2`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
