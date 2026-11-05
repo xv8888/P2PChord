@@ -3,6 +3,50 @@ import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "nod
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
+const WRITE_BATCH_BYTES = 128 * 1024;
+const WRITE_BATCH_DELAY_MS = 1;
+const MAX_WRITEV_BUFFERS = 1024;
+
+export async function writeBuffersAt(
+  fileHandle,
+  buffers,
+  position,
+  byteLength,
+  onWrite,
+) {
+  let bytesWritten = 0;
+  while (bytesWritten < byteLength) {
+    let skippedBytes = bytesWritten;
+    const remaining = [];
+    for (const buffer of buffers) {
+      if (skippedBytes >= buffer.length) {
+        skippedBytes -= buffer.length;
+        continue;
+      }
+      remaining.push(
+        skippedBytes > 0 ? buffer.subarray(skippedBytes) : buffer,
+      );
+      skippedBytes = 0;
+    }
+    const writeBuffers = remaining.length > MAX_WRITEV_BUFFERS
+      ? remaining.slice(0, MAX_WRITEV_BUFFERS)
+      : remaining;
+    onWrite();
+    const result = writeBuffers.length === 1
+      ? await fileHandle.write(
+        writeBuffers[0],
+        0,
+        writeBuffers[0].length,
+        position + bytesWritten,
+      )
+      : await fileHandle.writev(writeBuffers, position + bytesWritten);
+    if (result.bytesWritten === 0) {
+      throw new Error("Could not write received bytes to the stream cache");
+    }
+    bytesWritten += result.bytesWritten;
+  }
+}
+
 export class StreamCache {
   constructor({
     client,
@@ -15,6 +59,8 @@ export class StreamCache {
     streamTimeout,
     idleTransferTimeout,
     formatBytes,
+    writeBatchBytes = WRITE_BATCH_BYTES,
+    writeBatchDelayMs = WRITE_BATCH_DELAY_MS,
   }) {
     this.client = client;
     this.logger = logger;
@@ -26,10 +72,19 @@ export class StreamCache {
     this.streamTimeout = streamTimeout;
     this.idleTransferTimeout = idleTransferTimeout;
     this.formatBytes = formatBytes;
+    this.writeBatchBytes = writeBatchBytes;
+    this.writeBatchDelayMs = writeBatchDelayMs;
+    if (!Number.isSafeInteger(writeBatchBytes) || writeBatchBytes < 1) {
+      throw new RangeError("writeBatchBytes must be a positive whole number.");
+    }
+    if (!Number.isSafeInteger(writeBatchDelayMs) || writeBatchDelayMs < 0) {
+      throw new RangeError("writeBatchDelayMs must be a non-negative whole number.");
+    }
     this.entries = new Map();
     this.entryInitializations = new Map();
     this.activePeerFiles = new Map();
     this.activeStreams = 0;
+    this.diskWriteOperations = 0;
     this.initialization = null;
     this.sweepQueue = Promise.resolve();
   }
@@ -317,6 +372,11 @@ export class StreamCache {
       fileHandle: null,
       writePosition: entry.receivedBytes,
       writeQueue: Promise.resolve(),
+      pendingChunks: [],
+      pendingBytes: 0,
+      pendingPosition: null,
+      writeFlushTimer: null,
+      firstChunkPending: true,
       writeError: null,
       finalizing: null,
       released: null,
@@ -476,33 +536,69 @@ export class StreamCache {
       transfer.cancel("Stream exceeded its size limit");
       return;
     }
+    if (transfer.pendingPosition === null) transfer.pendingPosition = position;
+    transfer.pendingChunks.push(chunk);
+    transfer.pendingBytes += chunk.length;
+
+    if (transfer.firstChunkPending ||
+        transfer.pendingBytes >= this.writeBatchBytes) {
+      transfer.firstChunkPending = false;
+      this.flushPendingWrites(transfer);
+    } else if (transfer.writeFlushTimer === null) {
+      transfer.writeFlushTimer = setTimeout(
+        () => this.flushPendingWrites(transfer),
+        this.writeBatchDelayMs,
+      );
+      transfer.writeFlushTimer.unref();
+    }
+  }
+
+  flushPendingWrites(transfer) {
+    clearTimeout(transfer.writeFlushTimer);
+    transfer.writeFlushTimer = null;
+    if (transfer.pendingChunks.length === 0) return;
+
+    const buffers = transfer.pendingChunks;
+    const position = transfer.pendingPosition;
+    const byteLength = transfer.pendingBytes;
+    transfer.pendingChunks = [];
+    transfer.pendingPosition = null;
+    transfer.pendingBytes = 0;
+
     transfer.writeQueue = transfer.writeQueue.then(async () => {
-      let bytesWritten = 0;
-      while (bytesWritten < chunk.length) {
-        const result = await transfer.fileHandle.write(
-          chunk,
-          bytesWritten,
-          chunk.length - bytesWritten,
-          position + bytesWritten,
-        );
-        if (result.bytesWritten === 0) {
-          throw new Error("Could not write received bytes to the stream cache");
-        }
-        bytesWritten += result.bytesWritten;
-      }
-      transfer.entry.receivedBytes = position + chunk.length;
-      if (transfer.entry.receivedBytes === chunk.length) {
+      if (transfer.writeError) return;
+      await writeBuffersAt(
+        transfer.fileHandle,
+        buffers,
+        position,
+        byteLength,
+        () => this.diskWriteOperations++,
+      );
+      transfer.entry.receivedBytes = position + byteLength;
+      if (position === 0) {
         this.log("STREAM", `First audio bytes received for "${transfer.track.title}".`);
       }
       this.notify(transfer.entry);
     }).catch((error) => {
       transfer.writeError = error;
+      this.log(
+        "ERROR",
+        `Could not persist Soulseek result id=${transfer.track.id} ` +
+          `for file request ${transfer.requestId ?? "unknown"} from ` +
+          `${transfer.track.user}\\${transfer.track.file}: ${error.message}.`,
+      );
+      transfer.pendingChunks = [];
+      transfer.pendingBytes = 0;
+      transfer.pendingPosition = null;
+      clearTimeout(transfer.writeFlushTimer);
+      transfer.writeFlushTimer = null;
       transfer.cancel("Could not write received bytes to the cache");
     });
   }
 
   async finishTransfer(transfer, error, succeeded) {
     if (transfer.finalizing) return transfer.finalizing;
+    this.flushPendingWrites(transfer);
     transfer.finalizing = (async () => {
       let finalError = null;
       try {
@@ -533,12 +629,16 @@ export class StreamCache {
         this.log("ERROR", `Could not finalize "${transfer.track.title}": ${finalizeError.message}`);
       } finally {
         transfer.entry.lastError = transfer.entry.complete ? null : finalError;
+        const transferFailed = Boolean(
+          transfer.writeError ||
+            (finalError && !transfer.controller.signal.aborted),
+        );
         transfer.entry.lastTransferStatus = transfer.entry.complete
           ? "completed"
-          : transfer.controller.signal.aborted
-            ? "cancelled"
-            : finalError
-              ? "failed"
+          : transferFailed
+            ? "failed"
+            : transfer.controller.signal.aborted
+              ? "cancelled"
               : "partial";
         if (transfer.fileHandle) {
           try {

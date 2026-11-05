@@ -7,8 +7,14 @@ BitSeekWin does not vendor the runtime packages below. `npm install` downloads t
 | `slsk-client` | 2.0.2 | Direct runtime dependency | MIT | [Source repository](https://github.com/f-hj/slsk-client) · [License](https://github.com/f-hj/slsk-client/blob/master/LICENSE) |
 | `debug` | 4.4.3 | Transitive runtime dependency of `slsk-client` | MIT | [Source repository](https://github.com/debug-js/debug) · [License](https://github.com/debug-js/debug/blob/master/LICENSE) |
 | `ms` | 2.1.3 | Transitive runtime dependency of `debug` | MIT | [Source repository](https://github.com/vercel/ms) · [License](https://github.com/vercel/ms/blob/main/LICENSE) |
+| Inter Variable | 4.1 | Bundled launcher UI font | SIL Open Font License 1.1 | [Source repository](https://github.com/rsms/inter/tree/66647c0bbbe41a850d79d9c76fb13add3378940f) · [License](./fonts/OFL.txt) |
 
-These are the runtime dependencies recorded in the lockfile. Their respective license terms apply to those packages. If you redistribute a build that includes them, retain their applicable notices and license texts.
+The packages above are the runtime dependencies recorded in the lockfile. Their respective license terms apply to those packages. If you redistribute a build that includes them, retain their applicable notices and license texts.
+
+The launcher bundles Inter Variable as `fonts/InterVariable.woff2`. Its complete
+SIL Open Font License 1.1 text is included in [`fonts/OFL.txt`](./fonts/OFL.txt).
+The font is served locally by the launcher; no system font installation or
+external font request is required.
 
 ## Interoperability and optional tools
 

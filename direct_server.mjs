@@ -41,14 +41,38 @@ const SECRET =
 const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`
 ).replace(/\/+$/, "");
-const SEARCH_TIMEOUT = 2000;
+const SEARCH_TIMEOUT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_SEARCH_TIMEOUT_MS",
+  2000,
+  500,
+  30000,
+);
 const LOGIN_TIMEOUT = 30000;
-const SEARCH_LIMIT = 50;
+const SEARCH_LIMIT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_SEARCH_LIMIT",
+  50,
+  1,
+  50,
+);
+const SEARCH_RECOVERY = readBooleanEnvironmentValue(
+  "BITSEEKWIN_SEARCH_RECOVERY",
+  true,
+);
 const MAX_TRACKS = 1000;
 const TRACK_RETENTION_MS = 20 * 60 * 1000;
 const MAX_TRACK_SEARCH_REQUESTS = 8;
-const MAX_ACTIVE_STREAMS = 2;
-const MAX_STREAM_BYTES = 128 * 1024 * 1024;
+const MAX_ACTIVE_STREAMS = readIntegerEnvironmentValue(
+  "BITSEEKWIN_MAX_ACTIVE_STREAMS",
+  2,
+  1,
+  2,
+);
+const MAX_STREAM_BYTES = readIntegerEnvironmentValue(
+  "BITSEEKWIN_MAX_STREAM_BYTES",
+  128 * 1024 * 1024,
+  1,
+  128 * 1024 * 1024,
+);
 const STREAM_TIMEOUT = 15 * 60 * 1000;
 const IDLE_TRANSFER_TIMEOUT = readIntegerEnvironmentValue(
   "BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS",
@@ -72,6 +96,12 @@ const CACHE_DIRECTORY = resolve(
   process.env.BITSEEKWIN_CACHE_DIRECTORY ??
     join(process.env.LOCALAPPDATA ?? join(homedir(), ".cache"), "BitSeekWin", "cache"),
 );
+const SOURCE_SELECTION = process.env.BITSEEKWIN_SOURCE_SELECTION ?? "match";
+const SOURCE_SELECTION_MODES = new Set(["match", "speed"]);
+const SEARCH_LIMIT_MAX = 50;
+if (!SOURCE_SELECTION_MODES.has(SOURCE_SELECTION)) {
+  throw new TypeError("BITSEEKWIN_SOURCE_SELECTION must be 'match' or 'speed'.");
+}
 
 function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
   const raw = process.env[name];
@@ -361,6 +391,10 @@ export function createAddonServer({
   slug = SLUG,
   publicBaseUrl = PUBLIC_BASE_URL,
   allowDownloads = ALLOW_DOWNLOADS,
+  sourceSelection = SOURCE_SELECTION,
+  searchLimit = SEARCH_LIMIT,
+  searchTimeout = SEARCH_TIMEOUT,
+  searchRecovery = SEARCH_RECOVERY,
   getConnectionStatus = () => "unknown",
   maxTrackRecords = MAX_TRACKS,
   trackRetentionMs = TRACK_RETENTION_MS,
@@ -370,9 +404,45 @@ export function createAddonServer({
   cacheDirectory = CACHE_DIRECTORY,
   cacheTtlMs = CACHE_TTL_MS,
   maxCacheBytes = MAX_CACHE_BYTES,
+  writeBatchBytes,
+  writeBatchDelayMs,
 }) {
   if (typeof allowDownloads !== "boolean") {
     throw new TypeError("allowDownloads must be true or false.");
+  }
+  if (!SOURCE_SELECTION_MODES.has(sourceSelection)) {
+    throw new TypeError("sourceSelection must be 'match' or 'speed'.");
+  }
+  if (
+    !Number.isSafeInteger(searchLimit) ||
+    searchLimit < 1 ||
+    searchLimit > SEARCH_LIMIT_MAX
+  ) {
+    throw new RangeError(`searchLimit must be between 1 and ${SEARCH_LIMIT_MAX}.`);
+  }
+  if (
+    !Number.isSafeInteger(searchTimeout) ||
+    searchTimeout < 500 ||
+    searchTimeout > 30000
+  ) {
+    throw new RangeError("searchTimeout must be between 500 and 30000 milliseconds.");
+  }
+  if (typeof searchRecovery !== "boolean") {
+    throw new TypeError("searchRecovery must be true or false.");
+  }
+  if (
+    !Number.isSafeInteger(maxActiveStreams) ||
+    maxActiveStreams < 1 ||
+    maxActiveStreams > 2
+  ) {
+    throw new RangeError("maxActiveStreams must be between 1 and 2.");
+  }
+  if (
+    !Number.isSafeInteger(maxStreamBytes) ||
+    maxStreamBytes < 1 ||
+    maxStreamBytes > 128 * 1024 * 1024
+  ) {
+    throw new RangeError("maxStreamBytes must be between 1 and 134217728 bytes.");
   }
   if (!Number.isSafeInteger(idleTransferTimeout) || idleTransferTimeout < 1) {
     throw new RangeError("idleTransferTimeout must be a positive whole number.");
@@ -382,6 +452,18 @@ export function createAddonServer({
   }
   if (!Number.isSafeInteger(maxCacheBytes) || maxCacheBytes < 1) {
     throw new RangeError("maxCacheBytes must be a positive whole number.");
+  }
+  if (
+    writeBatchBytes !== undefined &&
+    (!Number.isSafeInteger(writeBatchBytes) || writeBatchBytes < 1)
+  ) {
+    throw new RangeError("writeBatchBytes must be a positive whole number.");
+  }
+  if (
+    writeBatchDelayMs !== undefined &&
+    (!Number.isSafeInteger(writeBatchDelayMs) || writeBatchDelayMs < 0)
+  ) {
+    throw new RangeError("writeBatchDelayMs must be a non-negative whole number.");
   }
   if (!Number.isSafeInteger(maxTrackRecords) || maxTrackRecords < 1) {
     throw new RangeError("maxTrackRecords must be a positive whole number.");
@@ -460,6 +542,8 @@ export function createAddonServer({
     streamTimeout: STREAM_TIMEOUT,
     idleTransferTimeout,
     formatBytes,
+    ...(writeBatchBytes !== undefined ? { writeBatchBytes } : {}),
+    ...(writeBatchDelayMs !== undefined ? { writeBatchDelayMs } : {}),
   });
 
   async function handle(request, response) {
@@ -555,8 +639,8 @@ export function createAddonServer({
       }
       try {
         log("SEARCH", `Search request ${searchRequestId}: searching Soulseek for "${query}".`);
-        let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
-        if (results.length === 0) {
+        let results = await client.search({ req: query, timeout: searchTimeout });
+        if (searchRecovery && results.length === 0) {
           const recoveryQuery = searchRecoveryQuery(query);
           if (recoveryQuery) {
             log(
@@ -565,7 +649,7 @@ export function createAddonServer({
             );
             results = await client.search({
               req: recoveryQuery,
-              timeout: SEARCH_TIMEOUT,
+              timeout: searchTimeout,
             });
           }
         }
@@ -603,14 +687,22 @@ export function createAddonServer({
               : Number.MAX_SAFE_INTEGER,
           });
         }
-        candidates.sort((left, right) =>
-          right.score - left.score ||
-          Number(right.slots) - Number(left.slots) ||
-          right.speed - left.speed ||
-          left.queueLength - right.queueLength ||
-          left.track.id.localeCompare(right.track.id)
-        );
-        const found = candidates.slice(0, SEARCH_LIMIT).map(({ track }) => track);
+        candidates.sort((left, right) => {
+          const speedOrder = right.speed - left.speed;
+          const matchOrder = right.score - left.score;
+          const slotOrder = Number(right.slots) - Number(left.slots);
+          const preferenceOrder = sourceSelection === "speed"
+            ? speedOrder || matchOrder || slotOrder
+            : matchOrder || slotOrder || speedOrder;
+          return (
+            preferenceOrder ||
+            left.queueLength - right.queueLength ||
+            left.track.id.localeCompare(right.track.id)
+          );
+        });
+        const found = candidates
+          .slice(0, sourceSelection === "speed" ? 1 : searchLimit)
+          .map(({ track }) => track);
         pruneTrackRecords();
         const newResultCount = found.filter((track) => !tracks.has(track.id)).length;
         if (tracks.size + newResultCount > maxTrackRecords) {
@@ -623,9 +715,15 @@ export function createAddonServer({
           return;
         }
         if (found.length) {
+          const bestDescription = sourceSelection === "speed"
+            ? `selected the fastest reported uploader "${found[0].user}" at reported speed ${candidates[0].speed}: `
+            : `best match: `;
+          const resultLabel = found.length === 1 ? "candidate" : "candidates";
           log(
             "SEARCH",
-            `Search request ${searchRequestId}: found ${candidates.length} FLAC matches; returning ${found.length} ranked candidates. Best: "${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""} (${Math.round(candidates[0].score * 100)}% name match).`,
+            `Search request ${searchRequestId}: found ${candidates.length} FLAC matches; returning ${found.length} ${
+              sourceSelection === "speed" ? "fastest-speed" : "ranked"
+            } ${resultLabel}. ${bestDescription}"${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""}.`,
           );
           for (const track of found) {
             rememberTrack(track, searchRequestId);
@@ -970,6 +1068,15 @@ async function main() {
     ({ server, streamCache } = createAddonServer({
       client,
       allowDownloads: ALLOW_DOWNLOADS,
+      sourceSelection: SOURCE_SELECTION,
+      searchLimit: SEARCH_LIMIT,
+      searchTimeout: SEARCH_TIMEOUT,
+      searchRecovery: SEARCH_RECOVERY,
+      maxActiveStreams: MAX_ACTIVE_STREAMS,
+      maxStreamBytes: MAX_STREAM_BYTES,
+      idleTransferTimeout: IDLE_TRANSFER_TIMEOUT,
+      cacheTtlMs: CACHE_TTL_MS,
+      maxCacheBytes: MAX_CACHE_BYTES,
       getConnectionStatus: () => connectionStatus,
     }));
     await new Promise((resolve, reject) => {

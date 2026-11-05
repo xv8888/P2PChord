@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -13,6 +13,7 @@ import {
   matchScore,
   normalizeSearchQuery,
 } from "./direct_server.mjs";
+import { writeBuffersAt } from "./stream_cache.mjs";
 
 const sourceWords = JSON.parse(
   readFileSync(new URL("./source_words.json", import.meta.url), "utf8"),
@@ -270,7 +271,7 @@ async function searchTracks(query = "kick") {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "alpha-0.5.0");
+  assert.equal(manifest.version, "alpha-0.5.2");
   assert.match(manifest.description, /directly from Soulseek peers/);
   assert.equal(manifest.allowDownloads, false);
   const response = await fetch(`${base}/search?q=kick`);
@@ -319,36 +320,46 @@ test("monitoring reports live connection, transfer and cache state without imply
   assert.equal(downloads[0].options.signal.aborted, false);
 });
 
-test("downloads can be explicitly enabled in the addon manifest", async () => {
-  const enabled = createAddonServer({
-    client,
-    secret: "test-secret",
-    slug: "bitseekwin",
-    publicBaseUrl: "https://music.example.test",
-    allowDownloads: true,
-  });
-  await new Promise((resolve) => enabled.server.listen(0, "127.0.0.1", resolve));
-  try {
-    const response = await fetch(
-      `http://127.0.0.1:${enabled.server.address().port}/bitseekwin/test-secret/manifest.json`,
-    );
-    const manifest = await response.json();
-    assert.equal(manifest.allowDownloads, true);
-  } finally {
-    enabled.server.closeAllConnections();
-    await new Promise((resolve) => enabled.server.close(resolve));
-  }
+test("manifest-enabled BitChord download handoff reaches the file URL", async () => {
+  await stopServer();
+  await startServer({ allowDownloads: true });
+
+  const manifest = await (await fetch(`${base}/manifest.json`)).json();
+  assert.equal(manifest.allowDownloads, true);
+
+  const id = await searchTrack();
+  const descriptor = await (await fetch(`${base}/stream/${id}`)).json();
+  assert.equal(descriptor.format, "flac");
+
+  const mediaUrl = new URL(descriptor.url);
+  assert.equal(mediaUrl.pathname, new URL(`${base}/file/${id}`).pathname);
+  const response = await fetch(`${new URL(base).origin}${mediaUrl.pathname}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "audio/flac");
+  assert.equal(await response.text(), "0123456789");
 });
 
-test("search ranks the closest FLAC candidates first", async () => {
+test("match-first search ranks the closest FLAC candidates first", async () => {
   client.search = async () => [
-    { ...track, file: "Album\\Kick Song Remix.flac" },
     {
       ...track,
+      user: "remix-owner",
+      file: "Album\\Kick Song Remix.flac",
+      speed: 1500,
+    },
+    {
+      ...track,
+      user: "matching-owner",
       file: "Album\\Kick Song.flac",
+      speed: 1000,
       attribs: { [FileAttribute.Duration]: 214 },
     },
-    { ...track, file: "Album\\Kick Song.flac", user: "second-owner" },
+    {
+      ...track,
+      user: "second-owner",
+      file: "Album\\Kick Song.flac",
+      speed: 900,
+    },
   ];
   const response = await fetch(`${base}/search?q=kick%20song`);
   const body = await response.json();
@@ -366,6 +377,180 @@ test("search ranks the closest FLAC candidates first", async () => {
   );
   assert.ok(logEntries.some(({ message }) =>
     /returning 3 ranked candidates/.test(message),
+  ));
+});
+
+test("fastest-speed selection streams only from the highest reported-speed peer", async () => {
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  await streamCache.close();
+  await startServer({ sourceSelection: "speed" });
+  client.search = async () => [
+    {
+      ...track,
+      user: "fast-owner",
+      file: "Album\\Kick Song Remix.flac",
+      speed: 9000,
+    },
+    {
+      ...track,
+      user: "matching-owner",
+      file: "Album\\Kick Song.flac",
+      speed: 1000,
+    },
+  ];
+
+  const response = await fetch(`${base}/search?q=kick%20song`);
+  const body = await response.json();
+  assert.equal(body.tracks.length, 1);
+  assert.equal(body.tracks[0].title, "Kick Song Remix");
+  assert.ok(logEntries.some(({ message }) =>
+    message.includes('selected the fastest reported uploader "fast-owner" at reported speed 9000'),
+  ));
+  await fetch(`${base}/stream/${body.tracks[0].id}`);
+  const fileResponse = await fetch(`${base}/file/${body.tracks[0].id}`);
+  assert.equal(fileResponse.status, 200);
+  assert.equal(downloads[0].options.user, "fast-owner");
+  await fileResponse.text();
+});
+
+test("source selection rejects unsupported modes", () => {
+  assert.throws(
+    () => createAddonServer({ client, sourceSelection: "unknown" }),
+    /sourceSelection must be 'match' or 'speed'/,
+  );
+});
+
+test("search limits, timeout, and optional spelling recovery are configurable", async () => {
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  await streamCache.close();
+  await startServer({
+    searchLimit: 1,
+    searchTimeout: 6000,
+    searchRecovery: false,
+  });
+  const searchCalls = [];
+  client.search = async ({ req, timeout }) => {
+    searchCalls.push({ req, timeout });
+    if (req === "kick") {
+      return [
+        { ...track, file: "Album\\Kick One.flac", speed: 500 },
+        { ...track, user: "second-owner", file: "Album\\Kick Two.flac", speed: 100 },
+      ];
+    }
+    return [];
+  };
+
+  const matches = await fetch(`${base}/search?q=kick`);
+  assert.equal((await matches.json()).tracks.length, 1);
+  const empty = await fetch(`${base}/search?q=bnd%20dmon`);
+  assert.equal((await empty.json()).tracks.length, 0);
+  assert.deepEqual(searchCalls, [
+    { req: "kick", timeout: 6000 },
+    { req: "bnd dmon", timeout: 6000 },
+  ]);
+});
+
+test("transfer slot and track-size settings cannot exceed current safety caps", () => {
+  assert.throws(
+    () => createAddonServer({ client, maxActiveStreams: 3 }),
+    /maxActiveStreams must be between 1 and 2/,
+  );
+  assert.throws(
+    () => createAddonServer({ client, maxStreamBytes: 129 * 1024 * 1024 }),
+    /maxStreamBytes must be between 1 and 134217728 bytes/,
+  );
+});
+
+test("stream write batching settings reject invalid values", () => {
+  assert.throws(
+    () => createAddonServer({ client, writeBatchBytes: 0 }),
+    /writeBatchBytes must be a positive whole number/,
+  );
+  assert.throws(
+    () => createAddonServer({ client, writeBatchDelayMs: -1 }),
+    /writeBatchDelayMs must be a non-negative whole number/,
+  );
+});
+
+test("partial writev results resume at the exact next byte", async () => {
+  const path = join(cacheDirectory, "partial-writev-test.bin");
+  const fileHandle = await open(path, "w+");
+  const prototype = Object.getPrototypeOf(fileHandle);
+  const originalWritev = prototype.writev;
+  let writeCalls = 0;
+  let largestWritev = 0;
+  prototype.writev = async function (buffers, position) {
+    writeCalls++;
+    largestWritev = Math.max(largestWritev, buffers.length);
+    if (writeCalls === 1) {
+      return originalWritev.call(
+        this,
+        [buffers[0], buffers[1].subarray(0, 2)],
+        position,
+      );
+    }
+    return originalWritev.call(this, buffers, position);
+  };
+
+  try {
+    const chunks = [
+      Buffer.from("abc"),
+      Buffer.from("defgh"),
+      Buffer.from("ijk"),
+    ];
+    await writeBuffersAt(fileHandle, chunks, 0, 11, () => {});
+    const result = Buffer.alloc(11);
+    const { bytesRead } = await fileHandle.read(result, 0, result.length, 0);
+    assert.equal(bytesRead, 11);
+    assert.equal(result.toString(), "abcdefghijk");
+    assert.equal(writeCalls, 2);
+
+    const manyChunks = Array.from({ length: 1100 }, () => Buffer.from("x"));
+    await writeBuffersAt(fileHandle, manyChunks, 11, manyChunks.length, () => {});
+    assert.equal(largestWritev, 1024);
+    const manyResult = Buffer.alloc(manyChunks.length);
+    const manyRead = await fileHandle.read(
+      manyResult,
+      0,
+      manyResult.length,
+      11,
+    );
+    assert.equal(manyRead.bytesRead, manyChunks.length);
+    assert.deepEqual(manyResult, Buffer.alloc(manyChunks.length, "x"));
+  } finally {
+    prototype.writev = originalWritev;
+    await fileHandle.close();
+  }
+});
+
+test("cache write failures fail the transfer and never promote partial data", async () => {
+  const id = await searchTrack();
+  const probe = await open(join(cacheDirectory, "write-failure-probe.bin"), "w+");
+  const prototype = Object.getPrototypeOf(probe);
+  const originalWrite = prototype.write;
+  await probe.close();
+  prototype.write = async () => {
+    throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+  };
+
+  try {
+    const response = await fetch(`${base}/file/${id}`);
+    assert.equal(response.status, 502);
+    await response.arrayBuffer();
+  } finally {
+    prototype.write = originalWrite;
+  }
+
+  const snapshot = await (await fetch(`${base}/monitoring`)).json();
+  assert.equal(snapshot.slots.active, 0);
+  assert.equal(snapshot.cache.completedFiles, 0);
+  assert.equal(snapshot.transfers[0].status, "failed");
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "ERROR" &&
+      message.includes("Could not persist Soulseek result") &&
+      message.includes("disk full"),
   ));
 });
 
@@ -669,6 +854,30 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   assert.equal((await reader.read()).done, true);
 });
 
+test("batched cache writes preserve bytes while delivering the first chunk immediately", async () => {
+  const content = Buffer.alloc(96 * 1024);
+  for (let index = 0; index < content.length; index++) {
+    content[index] = index % 251;
+  }
+  const chunks = Array.from({ length: 96 }, (_, index) =>
+    content.subarray(index * 1024, (index + 1) * 1024),
+  );
+  client.search = async () => [{ ...track, size: content.length }];
+  client.download = (options) => {
+    const download = new FakeDownload(options, chunks, 0);
+    downloads.push(download);
+    return download;
+  };
+  await stopServer();
+  await startServer({ writeBatchBytes: 16 * 1024, writeBatchDelayMs: 8 });
+
+  const id = await searchTrack();
+  const response = await fetch(`${base}/file/${id}`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), content);
+  assert.ok(streamCache.diskWriteOperations < chunks.length);
+});
+
 test("searching for another track leaves the active transfer delivering bytes", async () => {
   client.search = async ({ req }) => [{
     ...track,
@@ -924,6 +1133,63 @@ test("partial data survives cancellation and resumes from its exact offset after
   assert.equal(downloads.length, 2);
   assert.equal(downloads[1].options.offset, 4);
   assert.ok(logEntries.some(({ message }) => message.includes("Resuming")));
+});
+
+test("batched writes resume from the last fully persisted offset", async () => {
+  const content = Buffer.alloc(48 * 1024);
+  for (let index = 0; index < content.length; index++) {
+    content[index] = index % 251;
+  }
+  const chunkSize = 4 * 1024;
+  client.search = async () => [{ ...track, size: content.length }];
+  client.download = (options) => {
+    const start = options.offset;
+    const end = downloads.length === 0 ? 4 * chunkSize : content.length;
+    const chunks = [];
+    for (let position = start; position < end; position += chunkSize) {
+      chunks.push(content.subarray(position, Math.min(position + chunkSize, end)));
+    }
+    const download = new FakeDownload(options, chunks, 0);
+    downloads.push(download);
+    return download;
+  };
+  await stopServer();
+  await startServer({
+    writeBatchBytes: 8 * 1024,
+    writeBatchDelayMs: 8,
+  });
+
+  const id = await searchTrack();
+  const firstResponse = await fetch(`${base}/file/${id}`);
+  const reader = firstResponse.body.getReader();
+  const firstChunk = await reader.read();
+  assert.equal(firstChunk.done, false);
+  const firstBytes = Buffer.from(firstChunk.value);
+  assert.ok(firstBytes.length > 0);
+  assert.deepEqual(firstBytes, content.subarray(0, firstBytes.length));
+  await reader.cancel();
+  for (let attempt = 0; attempt < 100 && streamCache.activeStreams > 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.equal(downloads[0].isSettled, true);
+  assert.equal(streamCache.activeStreams, 0);
+  assert.equal(
+    logEntries.some(({ level, message }) =>
+      level === "ERROR" && message.includes("Could not persist Soulseek result"),
+    ),
+    false,
+  );
+  const partialName = (await readdir(cacheDirectory)).find((name) =>
+    name.endsWith(".part"),
+  );
+  const partialBytes = (await stat(join(cacheDirectory, partialName))).size;
+  assert.ok(partialBytes > 0 && partialBytes < content.length);
+
+  const resumed = await fetch(`${base}/file/${id}`);
+  assert.equal(resumed.status, 200);
+  assert.deepEqual(Buffer.from(await resumed.arrayBuffer()), content);
+  assert.equal(downloads[1].options.offset, partialBytes);
 });
 
 test("cache eviction never removes a file while its HTTP consumer is active", async () => {

@@ -62,6 +62,15 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["BITSEEKWIN_WORD_COUNT"], "3")
         self.assertEqual(env["BITSEEKWIN_WORD_LENGTH"], "6")
         self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "false")
+        self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "match")
+        self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "50")
+        self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "2000")
+        self.assertEqual(env["BITSEEKWIN_SEARCH_RECOVERY"], "true")
+        self.assertEqual(env["BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS"], "30000")
+        self.assertEqual(env["BITSEEKWIN_CACHE_TTL_MS"], "1800000")
+        self.assertEqual(env["BITSEEKWIN_CACHE_MAX_BYTES"], str(2 * 1024 * 1024 * 1024))
+        self.assertEqual(env["BITSEEKWIN_MAX_ACTIVE_STREAMS"], "2")
+        self.assertEqual(env["BITSEEKWIN_MAX_STREAM_BYTES"], str(128 * 1024 * 1024))
         self.assertEqual(env["KEEP"], "yes")
         self.assertNotIn("SLSKD_API_KEY", env)
         self.assertNotIn("SLSKD_SLSK_PASSWORD", env)
@@ -81,6 +90,99 @@ class LauncherConfigurationTests(unittest.TestCase):
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 allow_downloads="true",
             )
+
+    def test_source_selection_is_configurable_and_validated(self):
+        env = build_bitseekwin_environment(
+            {},
+            "user",
+            "password",
+            "secret",
+            "http://127.0.0.1:8080",
+            source_selection="speed",
+        )
+        self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "speed")
+        with self.assertRaisesRegex(ValueError, "Source selection"):
+            build_bitseekwin_environment(
+                {}, "user", "password", "secret", "http://127.0.0.1:8080",
+                source_selection="unrecognized",
+            )
+
+    def test_search_and_fetch_options_map_to_server_environment(self):
+        env = build_bitseekwin_environment(
+            {},
+            "user",
+            "password",
+            "secret",
+            "http://127.0.0.1:8080",
+            search_limit=12,
+            search_timeout_ms=5000,
+            search_recovery=False,
+            idle_transfer_timeout_seconds=45,
+            cache_ttl_minutes=90,
+            cache_max_size_mb=512,
+            max_active_streams=1,
+            max_stream_size_mb=64,
+        )
+        self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "12")
+        self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "5000")
+        self.assertEqual(env["BITSEEKWIN_SEARCH_RECOVERY"], "false")
+        self.assertEqual(env["BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS"], "45000")
+        self.assertEqual(env["BITSEEKWIN_CACHE_TTL_MS"], "5400000")
+        self.assertEqual(env["BITSEEKWIN_CACHE_MAX_BYTES"], str(512 * 1024 * 1024))
+        self.assertEqual(env["BITSEEKWIN_MAX_ACTIVE_STREAMS"], "1")
+        self.assertEqual(env["BITSEEKWIN_MAX_STREAM_BYTES"], str(64 * 1024 * 1024))
+
+    def test_search_and_fetch_options_reject_values_outside_supported_limits(self):
+        for option, value in (
+            ("search_limit", 51),
+            ("search_timeout_ms", 499),
+            ("idle_transfer_timeout_seconds", 601),
+            ("cache_ttl_minutes", 0),
+            ("cache_max_size_mb", 15),
+            ("max_active_streams", 3),
+            ("max_stream_size_mb", 129),
+        ):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                build_bitseekwin_environment(
+                    {}, "user", "password", "secret", "http://127.0.0.1:8080",
+                    **{option: value},
+                )
+        with self.assertRaisesRegex(ValueError, "Search recovery"):
+            build_bitseekwin_environment(
+                {}, "user", "password", "secret", "http://127.0.0.1:8080",
+                search_recovery="false",
+            )
+
+    def test_start_passes_search_and_transfer_settings_together(self):
+        settings = {
+            "username": "user",
+            "password": "password",
+            "public_url": "http://127.0.0.1:8080",
+            "allow_downloads": True,
+            "source_selection": "speed",
+            "search_limit": 12,
+            "search_timeout_ms": 5000,
+            "search_recovery": False,
+            "idle_transfer_timeout_seconds": 45,
+            "cache_ttl_minutes": 90,
+            "cache_max_size_mb": 512,
+            "max_active_streams": 1,
+            "max_stream_size_mb": 64,
+        }
+        with patch("launcher.find_node_runtime", return_value="node"), patch(
+            "launcher.threading.Thread"
+        ) as worker_thread:
+            LauncherController().start(settings)
+
+        worker_settings = worker_thread.call_args.kwargs["args"][5]
+        self.assertEqual(
+            worker_settings,
+            {
+                key: value
+                for key, value in settings.items()
+                if key not in {"username", "password", "public_url"}
+            },
+        )
 
     def test_source_secret_words_follow_selected_count_and_length(self):
         entropy = bytes(range(16))
@@ -173,7 +275,38 @@ class LauncherConfigurationTests(unittest.TestCase):
                 }
             )
 
-    def test_dashboard_uses_browser_ui_and_describes_source_security(self):
+    def test_start_rejects_invalid_source_selection(self):
+        with self.assertRaisesRegex(ValueError, "Source selection"):
+            LauncherController().start(
+                {
+                    "username": "user",
+                    "password": "password",
+                    "public_url": "http://127.0.0.1:8080",
+                    "source_selection": "unrecognized",
+                }
+            )
+
+    def test_start_rejects_out_of_range_search_and_transfer_settings(self):
+        for setting, value in (
+            ("search_limit", 51),
+            ("search_timeout_ms", 499),
+            ("idle_transfer_timeout_seconds", 601),
+            ("cache_ttl_minutes", 0),
+            ("cache_max_size_mb", 15),
+            ("max_active_streams", 3),
+            ("max_stream_size_mb", 129),
+        ):
+            with self.subTest(setting=setting), self.assertRaises(ValueError):
+                LauncherController().start(
+                    {
+                        "username": "user",
+                        "password": "password",
+                        "public_url": "http://127.0.0.1:8080",
+                        setting: value,
+                    }
+                )
+
+    def test_dashboard_preserves_controls_in_responsive_music_app_layout(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
         self.assertIn('id="wordCount" type="range" min="2" max="8" value="3"', page)
@@ -181,15 +314,84 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn("Adjectives come first, then one noun", page)
         self.assertIn("128-bit access security", page)
         self.assertIn("Target letters per word", page)
-        self.assertIn('<details class="source-settings">', page)
-        self.assertIn("<summary>Source URL settings</summary>", page)
+        self.assertIn('aria-label="Launcher sections"', page)
+        for section in (
+            "connection",
+            "source-settings",
+            "search-settings",
+            "transfer-settings",
+            "cache-settings",
+            "activity",
+        ):
+            self.assertIn(f'id="{section}"', page)
+            self.assertIn(f'href="#{section}"', page)
+        for control in (
+            "username",
+            "password",
+            "publicUrl",
+            "funnel",
+            "allowDownloads",
+            "sourceSelection",
+            "searchLimit",
+            "searchTimeout",
+            "searchRecovery",
+            "reconnectGrace",
+            "transferSlots",
+            "maxTrackSize",
+            "cacheTtl",
+            "cacheMaxSize",
+            "start",
+            "stop",
+            "copy",
+            "exit",
+            "themeToggle",
+            "logs",
+        ):
+            self.assertIn(f'id="{control}"', page)
         self.assertIn('id="allowDownloads" type="checkbox"', page)
         self.assertIn('allow_downloads:$("allowDownloads").checked', page)
+        self.assertIn('id="sourceSelection"', page)
+        self.assertIn('source_selection:$("sourceSelection").value', page)
+        self.assertIn('id="searchLimit" type="number" min="1" max="50"', page)
+        self.assertIn('id="searchTimeout" type="number" min="1" max="30"', page)
+        self.assertIn('id="searchRecovery" type="checkbox" checked', page)
+        self.assertIn('id="reconnectGrace" type="number" min="1" max="600"', page)
+        self.assertIn('id="cacheTtl" type="number" min="1" max="10080"', page)
+        self.assertIn('id="cacheMaxSize" type="number" min="16" max="32768"', page)
+        self.assertIn('id="transferSlots"', page)
+        self.assertIn('<option value="2" selected>2 transfers (maximum)</option>', page)
+        self.assertIn('id="maxTrackSize" type="number" min="1" max="128"', page)
+        self.assertIn('search_timeout_ms:Number($("searchTimeout").value)*1000', page)
+        self.assertIn('max_active_streams:Number($("transferSlots").value)', page)
+        self.assertIn("if(invalidSetting){invalidSetting.reportValidity();return;}", page)
         self.assertNotIn('id="allowDownloads" type="checkbox" checked', page)
         self.assertIn('<span class="brand-bit">Bit</span>', page)
         self.assertIn('<span class="brand-seek">Seek</span>', page)
-        self.assertIn('<span class="brand-win">win</span>', page)
-        self.assertIn("zoom:1.5", page)
+        self.assertIn('<span class="brand-win">Win</span>', page)
+        self.assertIn("--text-brand-primary:1.08em", page)
+        self.assertIn("--text-brand-win:.48em", page)
+        self.assertIn(".brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}", page)
+        self.assertIn('font-family:var(--font-ui)', page)
+        self.assertIn('font-weight:100 900', page)
+        self.assertIn("--text-display:28px", page)
+        self.assertIn("--weight-semibold:600", page)
+        self.assertIn('<html lang="en" data-theme="dark">', page)
+        self.assertIn('aria-label="Switch to light mode" aria-pressed="true"', page)
+        self.assertIn('let savedTheme="dark"', page)
+        self.assertIn('localStorage.getItem("bitseekwin.theme")', page)
+        self.assertIn('localStorage.setItem("bitseekwin.theme"', page)
+        self.assertIn("applyTheme(savedTheme)", page)
+        self.assertIn(':root[data-theme="light"]', page)
+        self.assertIn('addEventListener("click",()=>applyTheme(', page)
+        self.assertIn('src:url("/test-token/assets/inter-variable.woff2") format("woff2")', page)
+        self.assertNotIn("Segoe UI", page)
+        self.assertIn(".slider::-webkit-slider-runnable-track", page)
+        self.assertIn(".slider::-webkit-slider-thumb", page)
+        self.assertIn(".slider::-moz-range-progress", page)
+        self.assertIn('function updateSlider(slider)', page)
+        self.assertIn('slider.addEventListener("input",()=>{updateSlider(slider);updatePhrasePreview();});', page)
+        self.assertIn("@media(max-width:720px)", page)
+        self.assertNotIn("zoom:1.5", page)
         self.assertIn("Math.max(3,length-3)", page)
         self.assertIn("Word lengths: \"+low+\"–\"+high+\" letters.", page)
         self.assertNotIn("sourceWords", page)
@@ -231,11 +433,25 @@ class LauncherConfigurationTests(unittest.TestCase):
         thread.start()
         base = f"http://127.0.0.1:{httpd.server_port}"
         try:
-            with urlopen(f"{base}/{token}", timeout=3) as response:
+            with patch("launcher.detect_tailscale_url", return_value=""):
+                with urlopen(f"{base}/{token}", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    page = response.read()
+                    self.assertIn(b"BitSeekWin", page)
+                    self.assertIn(
+                        "font-src 'self'", response.headers["Content-Security-Policy"]
+                    )
+            with urlopen(
+                f"{base}/{token}/assets/inter-variable.woff2", timeout=3
+            ) as response:
                 self.assertEqual(response.status, 200)
-                self.assertIn(b"BitSeekWin", response.read())
+                self.assertEqual(response.headers["Content-Type"], "font/woff2")
+                self.assertEqual(response.read(4), b"wOF2")
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{base}/wrong-token", timeout=3)
+            self.assertEqual(error.exception.code, 403)
+            with self.assertRaises(HTTPError) as error:
+                urlopen(f"{base}/wrong-token/assets/inter-variable.woff2", timeout=3)
             self.assertEqual(error.exception.code, 403)
             request = Request(
                 f"{base}/{token}/api/start",

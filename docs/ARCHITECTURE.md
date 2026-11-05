@@ -43,7 +43,12 @@ The official protocol uses three JSON-over-HTTP GET endpoints:
    - Advertise `resources: ["search", "stream"]` for this endpoint-based flow.
    - `allowDownloads` is optional in BitChord and defaults to allowed when
      omitted. BitSeekWin explicitly reports a boolean, defaulting to `false`;
-     the launcher has the same default.
+     the launcher has the same default. BitChord deliberately omits an add-on
+     from download-source selection when this value is false, while playback
+     can still use it. Enabling the launcher option or setting
+     `BITSEEKWIN_ALLOW_DOWNLOADS=true` makes BitChord eligible to use the
+     existing stream URL for a download; refresh or re-add the source after
+     changing the manifest setting.
    - Optional `settings` can define a quality picker using
      `{ "key": "quality", "type": "select", "options": [...] }`; BitChord sends
      the selected option on search and stream requests. The official protocol
@@ -59,9 +64,11 @@ The official protocol uses three JSON-over-HTTP GET endpoints:
      Search responses should be focused and fast; the official protocol does
      not define a result-count parameter.
    - BitSeekWin returns the standard `tracks`, `albums`, `artists`, and
-     `playlists` arrays. It filters to safe `.flac` Soulseek results, ranks
-     candidates by filename match, and returns at most 50 tracks. It reports
-     an empty set of arrays for an empty query or no usable match.
+     `playlists` arrays. It filters to safe `.flac` Soulseek results and, by
+     default, ranks candidates by filename match and returns at most 50 tracks.
+     The launcher can instead select a fastest-speed mode that returns only
+     the peer reporting the highest speed. It reports an empty set of arrays
+     for an empty query or no usable match.
 
 3. **Stream — `GET /stream/{id}`**
    - Return JSON with an absolute, directly playable media or manifest `url`.
@@ -81,14 +88,23 @@ routes.
 ## Search and track identity
 
 The server normalizes query punctuation and common Latin diacritics before
-searching Soulseek. It makes one missing-vowel recovery search only when an
-initial search returns no results and the query contains a likely compressed
-consonant cluster. Search requests time out after two seconds.
+searching Soulseek. When enabled, it makes one missing-vowel recovery search
+only when an initial search returns no results and the query contains a likely
+compressed consonant cluster. The launcher exposes this retry as a checkbox.
+Each Soulseek query has a configurable timeout, defaulting to two seconds.
+The launcher exposes integer seconds from 1 to 30; the server also accepts
+direct settings from 500 to 30,000 milliseconds.
 
 Only safe, positive-size FLAC results with a peer username are considered.
 Candidate titles and artist names are inferred from filenames and the query;
-full file tags are not read. Results are ordered by filename match, available
-peer slots, reported speed, queue length, and stable ID. A track ID is a
+full file tags are not read. The launcher defaults to match-first selection:
+results are ordered by filename match, available peer slots, reported speed,
+queue length, and stable ID, and up to 50 are returned for BitChord to select.
+The launcher can lower the result limit to 1.
+The launcher can be set to fastest-speed mode, which returns only the result
+from the peer reporting the highest upload speed across all matching FLAC
+results. The speed is self-reported, not measured by BitSeekWin; fastest-speed
+mode can return a less relevant result than a slower match. A track ID is a
 truncated SHA-256 digest of peer username, remote filename, and size. Track
 records remain resolvable for 20 minutes after their latest search, stream, or
 file request, covering BitChord's documented 10-minute search and 5-minute stream
@@ -114,17 +130,20 @@ peer socket.
 Each cache entry has its own transfer state: peer/file identity, received-byte
 position, partial-file path, active download, HTTP consumer count, errors, and
 cleanup timers. Searching for another track does not cancel a transfer.
-Different tracks may download concurrently, with a hard default maximum of
-two active transfers. Searches and completed cache reads do not consume those
-download slots. A simultaneous transfer for the same peer/path with
-conflicting size metadata is rejected rather than replacing the library's
-download for that peer/path.
+Different tracks may download concurrently, with a default of two active
+transfers. The launcher can lower this to one, and neither the launcher nor
+the server accepts a limit above two. Searches and completed cache reads do
+not consume those download slots. The launcher can lower the per-track stream
+size limit from its 128 MiB default, but cannot raise it. A simultaneous
+transfer for the same peer/path with conflicting size metadata is rejected
+rather than replacing the library's download for that peer/path.
 
 An HTTP request adds a consumer for its track. If a response closes, its
 readable is destroyed and only that consumer is removed. The transfer remains
 available to other consumers. Once the last consumer disconnects, an active
-transfer gets a 30-second default grace period. If nobody reconnects, that
-transfer is canceled and releases its slot; its partial bytes are retained.
+transfer gets a configurable grace period (30 seconds by default, adjustable
+from 1 to 600 seconds in the launcher). If nobody reconnects, that transfer is
+canceled and releases its slot; its partial bytes are retained.
 Transfers also have a 15-minute timeout. A server shutdown cancels outstanding
 transfers and waits for them to release before destroying the client.
 
@@ -136,6 +155,15 @@ That generator reads available bytes from disk in bounded chunks and waits for
 more bytes when the requested region has not arrived yet. Multiple HTTP range
 requests for the same track read the same transfer's contiguous bytes; a new
 track has a separate entry and download.
+
+Received chunks are written to the cache in order through one serialized
+write queue per file. The first chunk is flushed immediately; subsequent
+chunks are grouped up to 128 KiB or flushed after at most 1 ms. Batches use
+`FileHandle.writev()` when there are multiple chunks and continue at the exact
+byte offset if the OS reports a partial write. The cache's readable byte
+position advances only after the batch is written, so HTTP readers never see
+unpersisted bytes. `Readable.pipe(response)` maintains HTTP backpressure
+independently of disk batching.
 
 `HEAD` reports known file metadata without opening a Soulseek transfer. Invalid
 or unsatisfiable ranges receive 416. Responses use `audio/flac` and
@@ -163,20 +191,24 @@ Windows and `~/.cache/BitSeekWin/cache` elsewhere.
 
 Completed files and partial files have metadata persisted beside them and
 survive process restarts. Defaults are a 30-minute expiration since last
-access and a 2 GiB maximum. Inactive entries are removed by expiry or
-least-recently-used eviction; entries with active HTTP consumers or transfers
+access and a 2 GiB maximum. The launcher can adjust both values for the
+current launch only (TTL: 1–10,080 minutes; size: 16–32,768 MiB). Inactive
+entries are removed by expiry or least-recently-used eviction; entries with
+active HTTP consumers or transfers
 are protected. The directory, TTL, and maximum size can be changed through
 `BITSEEKWIN_CACHE_DIRECTORY`, `BITSEEKWIN_CACHE_TTL_MS`, and
-`BITSEEKWIN_CACHE_MAX_BYTES`. The idle transfer grace period can be changed
-with `BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS`.
+`BITSEEKWIN_CACHE_MAX_BYTES`. The launcher exposes the TTL, size, and idle
+transfer grace period; all launcher settings are per launch and default to
+the current behavior when not provided.
 
 ## Memory and size limits
 
 Disk-backed streaming and caching do **not** make Soulseek downloads
 memory-free. In the installed `slsk-client` 2.0.2 implementation, each download
 retains received chunks in memory and concatenates them when the download
-completes. BitSeekWin rejects files larger than 128 MiB and allows at most two
-active transfers, but two near-limit downloads can still consume substantial
+completes. BitSeekWin rejects files larger than its configurable per-track
+limit (128 MiB by default, not configurable above 128 MiB) and allows one or
+two active transfers, but two near-limit downloads can still consume substantial
 memory, including extra peak use during concatenation. The disk cache is for
 stream delivery and reuse; it does not replace the library's buffers.
 
@@ -184,9 +216,12 @@ stream delivery and reuse; it does not replace the library's buffers.
 
 The Python launcher starts `direct_server.mjs` as a child Node process. It
 passes the Soulseek username and password, the generated source secret, public
-URL, port, word settings, and download-permission choice through the child
-process environment. The password is not written to the launcher settings
-file. The launcher reads the server's combined output for status and
+URL, word settings, source-selection mode, search controls, cache limits, and
+transfer limits through the child process environment. These are validated
+for each launch and are not persisted by the launcher. Defaults preserve the
+existing search, cache, and transfer behavior, including the two-transfer
+ceiling and 128 MiB per-track cap. The password is not written to the launcher
+settings file. The launcher reads the server's combined output for status and
 diagnostics.
 
 The browser dashboard shows setup controls, the generated source URL, and the
@@ -220,7 +255,9 @@ launcher stops BitSeekWin.
 - FLAC candidate filtering and ranking, direct HTTP audio streaming, range
   requests, partial-file offset reuse, and persistent completed-file caching.
 - Cache expiry and LRU size management with active-entry protection.
-- Download permission advertised in the manifest, off by default.
+- Download permission advertised in the manifest, off by default. When enabled,
+  BitChord's direct-download request follows the regular `/stream/{id}` URL to
+  `/file/{id}`; no separate server-side download subsystem is needed.
 
 ### Known compatibility gaps and limitations
 
@@ -240,8 +277,19 @@ launcher stops BitSeekWin.
   provide data that differs from the search result. Actual playback and
   offset-resume behavior depends on the peer, network, library, and BitChord
   client and needs live testing.
+- `stream_cache.bench.mjs` compares per-chunk writes with multiple batch
+  thresholds, peer chunk sizes, flush delays, and one or two local transfers.
+  It uses a synthetic local peer and measures the cache/HTTP path only; results
+  do not predict Soulseek peer throughput or WAN performance. Run it with
+  `node --expose-gc stream_cache.bench.mjs`; `BITSEEKWIN_BENCH_MIB` and
+  `BITSEEKWIN_BENCH_REPEATS` control the synthetic file size and repetitions.
 - The library's in-memory buffering and the 128 MiB/two-transfer limits mean
   peak memory can still be high. Disk caching does not remove this limitation.
+- The server-side manifest/stream/file handoff is covered by tests, but a
+  download in the actual BitChord app has not been validated end to end. That
+  requires running the app with a reachable BitSeekWin instance and a peer
+  that serves the selected file; any app-version-specific download behavior
+  would need to be diagnosed there.
 - On Windows, stopping the child through the launcher may bypass Node's
   graceful shutdown handlers; partial files remain on disk, but active
   transfers may not be drained before process termination.
