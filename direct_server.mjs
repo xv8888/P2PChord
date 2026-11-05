@@ -1,11 +1,12 @@
-import { createHash, timingSafeEqual, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { readFile, rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { FileAttribute, SlskClient } from "slsk-client";
+import { StreamCache } from "./stream_cache.mjs";
 
 const APP_NAME = "BitSeekWin - BitChord-Soulseek Integration";
 const VERSION = (await readFile(new URL("./version.txt", import.meta.url), "utf8"))
@@ -44,11 +45,33 @@ const SEARCH_TIMEOUT = 2000;
 const LOGIN_TIMEOUT = 30000;
 const SEARCH_LIMIT = 50;
 const MAX_TRACKS = 1000;
+const TRACK_RETENTION_MS = 20 * 60 * 1000;
+const MAX_TRACK_SEARCH_REQUESTS = 8;
 const MAX_ACTIVE_STREAMS = 2;
 const MAX_STREAM_BYTES = 128 * 1024 * 1024;
 const STREAM_TIMEOUT = 15 * 60 * 1000;
-const IDLE_TRANSFER_TIMEOUT = 30 * 1000;
-const TEMP_DIRECTORY = join(tmpdir(), "BitSeekWin");
+const IDLE_TRANSFER_TIMEOUT = readIntegerEnvironmentValue(
+  "BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS",
+  30 * 1000,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const CACHE_TTL_MS = readIntegerEnvironmentValue(
+  "BITSEEKWIN_CACHE_TTL_MS",
+  30 * 60 * 1000,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const MAX_CACHE_BYTES = readIntegerEnvironmentValue(
+  "BITSEEKWIN_CACHE_MAX_BYTES",
+  2 * 1024 * 1024 * 1024,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const CACHE_DIRECTORY = resolve(
+  process.env.BITSEEKWIN_CACHE_DIRECTORY ??
+    join(process.env.LOCALAPPDATA ?? join(homedir(), ".cache"), "BitSeekWin", "cache"),
+);
 
 function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
   const raw = process.env[name];
@@ -338,9 +361,15 @@ export function createAddonServer({
   slug = SLUG,
   publicBaseUrl = PUBLIC_BASE_URL,
   allowDownloads = ALLOW_DOWNLOADS,
+  getConnectionStatus = () => "unknown",
+  maxTrackRecords = MAX_TRACKS,
+  trackRetentionMs = TRACK_RETENTION_MS,
   maxActiveStreams = MAX_ACTIVE_STREAMS,
   maxStreamBytes = MAX_STREAM_BYTES,
   idleTransferTimeout = IDLE_TRANSFER_TIMEOUT,
+  cacheDirectory = CACHE_DIRECTORY,
+  cacheTtlMs = CACHE_TTL_MS,
+  maxCacheBytes = MAX_CACHE_BYTES,
 }) {
   if (typeof allowDownloads !== "boolean") {
     throw new TypeError("allowDownloads must be true or false.");
@@ -348,201 +377,90 @@ export function createAddonServer({
   if (!Number.isSafeInteger(idleTransferTimeout) || idleTransferTimeout < 1) {
     throw new RangeError("idleTransferTimeout must be a positive whole number.");
   }
+  if (!Number.isSafeInteger(cacheTtlMs) || cacheTtlMs < 1) {
+    throw new RangeError("cacheTtlMs must be a positive whole number.");
+  }
+  if (!Number.isSafeInteger(maxCacheBytes) || maxCacheBytes < 1) {
+    throw new RangeError("maxCacheBytes must be a positive whole number.");
+  }
+  if (!Number.isSafeInteger(maxTrackRecords) || maxTrackRecords < 1) {
+    throw new RangeError("maxTrackRecords must be a positive whole number.");
+  }
+  if (!Number.isSafeInteger(trackRetentionMs) || trackRetentionMs < 1) {
+    throw new RangeError("trackRetentionMs must be a positive whole number.");
+  }
   const tracks = new Map();
-  const peerTransfers = new Map();
-  let activeStreams = 0;
+  const trackState = new Map();
 
   function log(level, message) {
     logger(level, message);
   }
 
-  function notifyTransfer(state) {
-    const resolve = state.resolveChange;
-    state.changed = new Promise((next) => {
-      state.resolveChange = next;
-    });
-    resolve();
+  function pruneTrackRecords(now = Date.now()) {
+    for (const [id, state] of trackState) {
+      if (now - state.lastUsedAt >= trackRetentionMs) {
+        const track = tracks.get(id);
+        if (track && streamCache.hasActiveTrackUse(track)) {
+          state.lastUsedAt = now;
+          continue;
+        }
+        tracks.delete(id);
+        trackState.delete(id);
+        log("INFO", `Expired stream result id=${id} after ${trackRetentionMs}ms without use.`);
+      }
+    }
   }
 
-  function createPeerTransfer(track, transferKey) {
-    const state = {
-      trackSize: track.size,
-      chunks: [],
-      chunkEnds: [],
-      receivedBytes: 0,
-      finished: false,
-      error: null,
-      changed: null,
-      resolveChange: null,
-      cancelled: false,
-      cancel: null,
-      released: null,
-      resolveReleased: null,
-      consumers: 0,
-      idleTimer: null,
+  function rememberTrack(track, searchRequestId, now = Date.now()) {
+    const state = trackState.get(track.id) ?? {
+      lastUsedAt: now,
+      searchRequestIds: [],
     };
-    state.changed = new Promise((resolve) => {
-      state.resolveChange = resolve;
-    });
-    state.released = new Promise((resolve) => {
-      state.resolveReleased = resolve;
-    });
+    state.lastUsedAt = now;
+    state.searchRequestIds.push(searchRequestId);
+    if (state.searchRequestIds.length > MAX_TRACK_SEARCH_REQUESTS) {
+      state.searchRequestIds.shift();
+    }
+    tracks.set(track.id, track);
+    trackState.set(track.id, state);
+  }
 
-    activeStreams++;
-    log("STREAM", `Opening one Soulseek transfer for "${track.title}" from ${track.user}.`);
-    const abortController = new AbortController();
-    const timer = setTimeout(
-      () => state.cancel("Soulseek transfer timed out"),
-      STREAM_TIMEOUT,
+  function resolveTrack(id, requestId, action) {
+    const track = tracks.get(id);
+    const state = trackState.get(id);
+    const now = Date.now();
+    const expired = state && now - state.lastUsedAt >= trackRetentionMs;
+    if (!track || !state || (expired && !streamCache.hasActiveTrackUse(track))) {
+      tracks.delete(id);
+      trackState.delete(id);
+      log(
+        "WARN",
+        `${action} request ${requestId}: result id=${id} resolvable=false (unknown or expired).`,
+      );
+      return null;
+    }
+    state.lastUsedAt = now;
+    log(
+      "INFO",
+      `${action} request ${requestId}: result id=${id} resolvable=true; ` +
+        `searchRequests=${state.searchRequestIds.join(",")}; ` +
+        `file="${track.file}" peer=${track.user}.`,
     );
-    timer.unref();
-    const tempPath = join(TEMP_DIRECTORY, `${randomUUID()}.flac`);
-    let download;
-    let released = false;
-    const finish = (error = null) => {
-      if (state.finished) return;
-      state.finished = true;
-      state.error = error;
-      notifyTransfer(state);
-    };
-    const release = () => {
-      if (released) return;
-      released = true;
-      clearTimeout(timer);
-      clearTimeout(state.idleTimer);
-      activeStreams--;
-      if (peerTransfers.get(transferKey) === state) {
-        peerTransfers.delete(transferKey);
-      }
-      log("STREAM", `Stream slot released (${activeStreams} active).`);
-      state.resolveReleased();
-    };
-    state.cancel = (reason) => {
-      if (state.finished) return;
-      state.cancelled = true;
-      const error = new Error(reason);
-      log("STREAM", `"${track.title}" stopped: ${reason}.`);
-      abortController.abort(error);
-      finish(error);
-    };
-
-    try {
-      download = client.download({
-        ...track,
-        path: tempPath,
-        offset: 0,
-        timeout: STREAM_TIMEOUT,
-        signal: abortController.signal,
-      });
-    } catch (error) {
-      release();
-      throw error;
-    }
-
-    state.download = download;
-    peerTransfers.set(transferKey, state);
-    download.on("status", (status) => {
-      const label = {
-        requested: "Waiting for peer response",
-        queued: "Queued by peer",
-        connected: "Connected to peer",
-        downloading: "Receiving audio bytes",
-        interrupted: "Transfer interrupted; retrying",
-        complete: "Peer transfer complete",
-        failed: "Peer transfer failed",
-        cancelled: "Transfer cancelled",
-      }[status] ?? status;
-      log("STREAM", `"${track.title}": ${label}.`);
-    });
-    download.on("queue", (place) => {
-      log("STREAM", `"${track.title}" is queue position ${place} at ${track.user}.`);
-    });
-    let lastProgressBytes = 0;
-    download.on("progress", (progress = {}) => {
-      if (progress.receivedBytes - lastProgressBytes < 1024 * 1024) return;
-      lastProgressBytes = progress.receivedBytes;
-      const percentage = Number.isFinite(progress.progress)
-        ? ` (${Math.round(progress.progress * 100)}%)`
-        : "";
-      log(
-        "STREAM",
-        `"${track.title}": ${formatBytes(progress.receivedBytes)} received${percentage}.`,
-      );
-    });
-    download.on("data", (chunk) => {
-      state.chunks.push(chunk);
-      state.receivedBytes += chunk.length;
-      state.chunkEnds.push(state.receivedBytes);
-      if (state.receivedBytes === chunk.length) {
-        log("STREAM", `First audio bytes received for "${track.title}".`);
-      }
-      notifyTransfer(state);
-      if (state.receivedBytes > maxStreamBytes && !download.isSettled) {
-        log("WARN", `"${track.title}" exceeded the stream-size limit.`);
-        abortController.abort(new Error("Stream exceeded its size limit"));
-      }
-    });
-    download.on("complete", (result = {}) => {
-      log(
-        "STREAM",
-        `"${track.title}" finished: ${formatBytes(result.receivedBytes ?? track.size)} received.`,
-      );
-      finish();
-    });
-    download.on("failed", (error) => {
-      if (state.cancelled) {
-        finish(error);
-        return;
-      }
-      log("ERROR", `"${track.title}" failed: ${error.message}`);
-      finish(error);
-    });
-    download.then(
-      () => rm(tempPath, { force: true }).catch((error) => {
-        console.error("Could not remove temporary stream file:", error.message);
-      }),
-      (error) => {
-        finish(error);
-        return rm(tempPath, { force: true }).catch((cleanupError) => {
-          console.error("Could not remove temporary stream file:", cleanupError.message);
-        });
-      },
-    ).finally(release).catch(() => {});
-    return state;
+    return { track, searchRequestIds: [...state.searchRequestIds] };
   }
 
-  async function* readTransferRange(state, start, end, response) {
-    let position = start;
-    let chunkIndex = 0;
-    while (position <= end) {
-      if (response.destroyed) return;
-      while (
-        position >= state.receivedBytes &&
-        !state.finished &&
-        !response.destroyed
-      ) {
-        await state.changed;
-      }
-      if (response.destroyed) return;
-      if (position >= state.receivedBytes) {
-        throw state.error ?? new Error("Soulseek transfer ended before the requested range arrived");
-      }
-      while (
-        chunkIndex < state.chunkEnds.length &&
-        state.chunkEnds[chunkIndex] <= position
-      ) {
-        chunkIndex++;
-      }
-      const chunk = state.chunks[chunkIndex];
-      if (!chunk) {
-        throw new Error("Soulseek transfer bytes are unavailable");
-      }
-      const chunkStart = chunkIndex === 0 ? 0 : state.chunkEnds[chunkIndex - 1];
-      const sliceEnd = Math.min(end + 1, state.chunkEnds[chunkIndex]);
-      yield chunk.subarray(position - chunkStart, sliceEnd - chunkStart);
-      position = sliceEnd;
-    }
-  }
+  const streamCache = new StreamCache({
+    client,
+    logger: log,
+    directory: cacheDirectory,
+    ttlMs: cacheTtlMs,
+    maxBytes: maxCacheBytes,
+    maxActiveStreams,
+    maxStreamBytes,
+    streamTimeout: STREAM_TIMEOUT,
+    idleTransferTimeout,
+    formatBytes,
+  });
 
   async function handle(request, response) {
     response.on("error", (error) => {
@@ -589,6 +507,19 @@ export function createAddonServer({
     }
     const route = segments.slice(2);
 
+    if (route.length === 1 && route[0] === "monitoring" && request.method === "GET") {
+      try {
+        sendJson(response, 200, {
+          connection: getConnectionStatus(),
+          ...(await streamCache.getMonitoringSnapshot()),
+        });
+      } catch (error) {
+        log("ERROR", `Could not read monitoring status: ${error.message}`);
+        sendError(response, 500, "Could not read monitoring status");
+      }
+      return;
+    }
+
     if (route.length === 1 && route[0] === "manifest.json") {
       sendJson(
         response,
@@ -610,8 +541,10 @@ export function createAddonServer({
     }
 
     if (route.length === 1 && route[0] === "search" && request.method === "GET") {
+      const searchRequestId = randomUUID();
       const query = normalizeSearchQuery(url.searchParams.get("q") ?? "");
       if (!query) {
+        log("SEARCH", `Search request ${searchRequestId} received an empty query; HTTP 200 with no results.`);
         sendJson(response, 200, {
           tracks: [],
           albums: [],
@@ -621,14 +554,14 @@ export function createAddonServer({
         return;
       }
       try {
-        log("SEARCH", `Searching Soulseek for "${query}".`);
+        log("SEARCH", `Search request ${searchRequestId}: searching Soulseek for "${query}".`);
         let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
         if (results.length === 0) {
           const recoveryQuery = searchRecoveryQuery(query);
           if (recoveryQuery) {
             log(
               "SEARCH",
-              `No exact results; retrying with likely missing vowels as "${recoveryQuery}".`,
+              `Search request ${searchRequestId}: no exact results; retrying with likely missing vowels as "${recoveryQuery}".`,
             );
             results = await client.search({
               req: recoveryQuery,
@@ -678,21 +611,36 @@ export function createAddonServer({
           left.track.id.localeCompare(right.track.id)
         );
         const found = candidates.slice(0, SEARCH_LIMIT).map(({ track }) => track);
+        pruneTrackRecords();
+        const newResultCount = found.filter((track) => !tracks.has(track.id)).length;
+        if (tracks.size + newResultCount > maxTrackRecords) {
+          log(
+            "ERROR",
+            `Search request ${searchRequestId} could not retain ${newResultCount} new results; ` +
+              `result registry is full (${tracks.size}/${maxTrackRecords}); HTTP 503.`,
+          );
+          sendError(response, 503, "Track result registry is full; retry after existing results expire");
+          return;
+        }
         if (found.length) {
           log(
             "SEARCH",
-            `Found ${candidates.length} FLAC matches; returning ${found.length} ranked candidates. Best: "${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""} (${Math.round(candidates[0].score * 100)}% name match).`,
+            `Search request ${searchRequestId}: found ${candidates.length} FLAC matches; returning ${found.length} ranked candidates. Best: "${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""} (${Math.round(candidates[0].score * 100)}% name match).`,
           );
           for (const track of found) {
-            tracks.delete(track.id);
-            tracks.set(track.id, track);
-            while (tracks.size > MAX_TRACKS) {
-              tracks.delete(tracks.keys().next().value);
-            }
+            rememberTrack(track, searchRequestId);
+            log(
+              "SEARCH",
+              `Search request ${searchRequestId}: result id=${track.id} file="${track.file}" peer=${track.user}.`,
+            );
           }
         } else {
-          log("SEARCH", `No FLAC matches found for "${query}".`);
+          log("SEARCH", `Search request ${searchRequestId}: no FLAC matches found for "${query}".`);
         }
+        log(
+          "SEARCH",
+          `Search request ${searchRequestId} completed with ${found.length} results; HTTP 200.`,
+        );
         sendJson(response, 200, {
           tracks: found.map((track) => ({
             id: track.id,
@@ -708,7 +656,7 @@ export function createAddonServer({
           playlists: [],
         });
       } catch (error) {
-        log("ERROR", `Search failed for "${query}": ${error.message}`);
+        log("ERROR", `Search request ${searchRequestId} failed for "${query}": ${error.message}; HTTP 502.`);
         console.error("Soulseek search failed:", error.message);
         sendError(response, 502, "Soulseek search failed");
       }
@@ -720,14 +668,24 @@ export function createAddonServer({
       route[0] === "stream" &&
       request.method === "GET"
     ) {
-      const track = tracks.get(route[1]);
-      if (!track) {
-        sendError(response, 404, "Track not found; search again");
+      const requestId = randomUUID();
+      const resultId = route[1];
+      log("STREAM", `Stream descriptor request ${requestId} received for result id=${resultId}.`);
+      const resolved = resolveTrack(resultId, requestId, "Stream descriptor");
+      if (!resolved) {
+        log("WARN", `Stream descriptor request ${requestId} failed: result id=${resultId} was not resolvable; HTTP 404.`);
+        sendError(response, 404, "Track not found or expired; search again");
         return;
       }
+      const { track, searchRequestIds } = resolved;
       log("STREAM", `BitChord requested the stream URL for "${track.title}".`);
+      log(
+        "STREAM",
+        `Stream descriptor request ${requestId} resolved result id=${track.id}; ` +
+          `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}; HTTP 200.`,
+      );
       sendJson(response, 200, {
-        url: `${publicBaseUrl}/${slug}/${secret}/file/${track.id}`,
+        url: `${publicBaseUrl}/${slug}/${secret}/file/${encodeURIComponent(track.id)}`,
         format: "flac",
         quality: "lossless",
         audioQuality: "LOSSLESS",
@@ -740,13 +698,22 @@ export function createAddonServer({
     }
 
     if (route.length === 2 && route[0] === "file") {
-      const track = tracks.get(route[1]);
-      if (!track) {
-        sendError(response, 404, "Track not found; search again");
+      const requestId = randomUUID();
+      const resultId = route[1];
+      const rangeHeader = request.headers.range ?? "";
+      log(
+        "STREAM",
+        `File request ${requestId} received for result id=${resultId}; range="${rangeHeader || "full"}".`,
+      );
+      const resolved = resolveTrack(resultId, requestId, "File");
+      if (!resolved) {
+        log("WARN", `File request ${requestId} failed: result id=${resultId} was not resolvable; HTTP 404.`);
+        sendError(response, 404, "Track not found or expired; search again");
         return;
       }
+      const { track, searchRequestIds } = resolved;
       if (track.size > maxStreamBytes) {
-        log("WARN", `Rejected "${track.title}": file exceeds the stream-size limit.`);
+        log("WARN", `File request ${requestId} rejected result id=${track.id} file="${track.file}" peer=${track.user}; size limit exceeded; HTTP 413.`);
         sendError(response, 413, "File exceeds the in-memory stream size limit");
         return;
       }
@@ -756,6 +723,10 @@ export function createAddonServer({
       try {
         [start, end] = parseRange(request.headers.range, track.size);
       } catch {
+        log(
+          "WARN",
+          `File request ${requestId} rejected result id=${track.id}; invalid or unsatisfiable range="${rangeHeader}"; HTTP 416.`,
+        );
         response.writeHead(416, {
           "Access-Control-Allow-Origin": "*",
           "Content-Range": `bytes */${track.size}`,
@@ -767,6 +738,7 @@ export function createAddonServer({
 
       const length = end - start + 1;
       const partial = Boolean(request.headers.range);
+      const openEndedRange = /^bytes=\d+-$/.test(request.headers.range ?? "");
       const headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Expose-Headers":
@@ -775,7 +747,6 @@ export function createAddonServer({
         "Content-Type": "audio/flac",
         "Cache-Control": "no-store, no-transform",
       };
-      const openEndedRange = /^bytes=\d+-$/.test(request.headers.range ?? "");
       if (request.method === "HEAD" || (partial && !openEndedRange)) {
         headers["Content-Length"] = length;
       }
@@ -787,73 +758,114 @@ export function createAddonServer({
           : `bytes ${start}-${end}/*`;
       }
       if (request.method === "HEAD") {
+        log(
+          "STREAM",
+          `File request ${requestId} resolved result id=${track.id}; ` +
+            `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}; ` +
+            `range="${rangeHeader || "full"}"; HTTP ${partial ? 206 : 200} (HEAD).`,
+        );
         response.writeHead(partial ? 206 : 200, headers);
         response.end();
         return;
       }
 
-      const transferKey = `${track.user}\0${track.file}`;
       log(
         "STREAM",
         `BitChord requested "${track.title}" from ${track.user} (${track.size} bytes${request.headers.range ? `, ${request.headers.range}` : ""}).`,
       );
-      let transfer = peerTransfers.get(transferKey);
-      if (transfer && transfer.trackSize !== track.size) {
-        sendError(response, 409, "A different version of this peer file is already streaming");
-        return;
-      }
-      if (!transfer && activeStreams >= maxActiveStreams) {
-        log("WARN", `Rejected "${track.title}": stream limit reached.`);
-        sendError(response, 503, "Too many active Soulseek streams");
-        return;
-      }
+      let entry;
       try {
-        if (!transfer) {
-          transfer = createPeerTransfer(track, transferKey);
-        } else {
-          log(
-            "STREAM",
-            `Serving "${track.title}" from the active Soulseek transfer (${formatBytes(transfer.receivedBytes)} buffered).`,
-          );
-        }
+        entry = await streamCache.getEntry(track);
+        await streamCache.touch(entry);
       } catch (error) {
-        console.error("Could not start Soulseek stream:", error.message);
-        log("ERROR", `Could not start "${track.title}": ${error.message}`);
-        if (!response.headersSent) sendError(response, 502, "Could not start Soulseek stream");
+        if (entry) streamCache.removeConsumer(entry);
+        log("ERROR", `File request ${requestId} could not open result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 500.`);
+        sendError(response, 500, "Could not open stream cache");
         return;
       }
 
-      transfer.consumers++;
-      clearTimeout(transfer.idleTimer);
-      transfer.idleTimer = null;
-      const range = Readable.from(readTransferRange(transfer, start, end, response));
+      try {
+        if (!entry.complete && entry.receivedBytes <= end) {
+          await streamCache.ensureTransfer(entry, track, {
+            requestId,
+            searchRequestIds,
+          });
+        } else if (entry.activeTransfer) {
+          log(
+            "STREAM",
+            `File request ${requestId} reuses existing transfer for result id=${track.id}; ` +
+              `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}.`,
+          );
+        } else {
+          log(
+            "STREAM",
+            `File request ${requestId} uses ${entry.complete ? "completed cache" : "partial cache"} ` +
+              `for result id=${track.id}; file="${track.file}" peer=${track.user}.`,
+          );
+        }
+        await streamCache.sweep();
+      } catch (error) {
+        streamCache.removeConsumer(entry);
+        if (error.message === "Too many active Soulseek streams") {
+          log(
+            "WARN",
+            `File request ${requestId} could not start result id=${track.id} file="${track.file}" peer=${track.user}; ` +
+              `transfer slots unavailable; HTTP 503.`,
+          );
+          sendError(response, 503, error.message);
+        } else if (error.statusCode === 409) {
+          log("WARN", `File request ${requestId} rejected result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 409.`);
+          sendError(response, 409, error.message);
+        } else {
+          log("ERROR", `File request ${requestId} could not start result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 502.`);
+          sendError(response, 502, "Could not start Soulseek stream");
+        }
+        return;
+      }
+
+      if (partial) {
+        headers["Content-Range"] = entry.complete
+          ? `bytes ${start}-${end}/${track.size}`
+          : `bytes ${start}-${end}/*`;
+      }
+      const streamAbort = new AbortController();
+      const range = Readable.from(
+        streamCache.readRange(entry, start, end, response, streamAbort.signal),
+      );
       range.on("error", (error) => {
         if (response.destroyed) return;
-        if (transfer.cancelled) {
-          response.destroy();
-          return;
-        }
-        log("ERROR", `Audio stream for "${track.title}" failed: ${error.message}`);
+        log(
+          "ERROR",
+          `File request ${requestId} streaming result id=${track.id} file="${track.file}" ` +
+            `peer=${track.user} failed${response.headersSent ? ` after HTTP ${response.statusCode} began` : " before audio started"}: ${error.message}` +
+            `${response.headersSent ? "." : "; HTTP 502."}`,
+        );
         console.error("Soulseek stream failed:", error.message);
-        response.destroy(error);
+        if (response.headersSent) {
+          response.destroy(error);
+        } else {
+          sendError(response, 502, "Soulseek peer transfer failed before audio started");
+        }
+      });
+      range.once("data", () => {
+        if (!response.headersSent) {
+          response.writeHead(partial ? 206 : 200, headers);
+        }
       });
       response.on("close", () => {
         if (!response.writableEnded) {
           log("WARN", `BitChord disconnected while streaming "${track.title}".`);
-          notifyTransfer(transfer);
         }
-        transfer.consumers--;
-        if (transfer.consumers === 0 && !transfer.finished) {
-          transfer.idleTimer = setTimeout(() => {
-            if (transfer.consumers === 0 && !transfer.finished) {
-              transfer.cancel("No active HTTP consumers");
-            }
-          }, idleTransferTimeout);
-          transfer.idleTimer.unref();
-        }
+        range.destroy();
+        streamAbort.abort();
+        streamCache.removeConsumer(entry);
       });
-      response.writeHead(partial ? 206 : 200, headers);
-      response.flushHeaders();
+      log(
+        "STREAM",
+        `File request ${requestId} waiting for audio to start result id=${track.id}; ` +
+          `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}; ` +
+          `range="${rangeHeader || "full"}"; transfer=${entry.complete ? "cached" : entry.activeTransfer ? "active" : "partial"}.`,
+      );
       range.pipe(response);
       return;
     }
@@ -869,7 +881,7 @@ export function createAddonServer({
       else response.destroy(error);
     });
   });
-  return { server, tracks };
+  return { server, tracks, streamCache };
 }
 
 function defaultLogger(level, message) {
@@ -903,29 +915,63 @@ async function main() {
     uploads: false,
   });
   let server;
+  let streamCache;
+  let connectionStatus = "connecting";
+  let stopping = false;
+  const shutdown = (exitCode = 0) => {
+    if (stopping) return;
+    stopping = true;
+    let serverClosed = Promise.resolve(null);
+    if (server?.listening) {
+      server.closeAllConnections();
+      serverClosed = new Promise((resolve) => {
+        server.close((error) => {
+          if (error) {
+            defaultLogger("ERROR", `Could not close HTTP server: ${error.message}`);
+          }
+          resolve(error ?? null);
+        });
+      });
+    }
+    const cacheClosed = (streamCache?.close() ?? Promise.resolve()).then(
+      () => null,
+      (error) => {
+        defaultLogger("ERROR", `Could not stop stream cache cleanly: ${error.message}`);
+        return error;
+      },
+    );
+    void Promise.all([serverClosed, cacheClosed]).then(([serverError, cacheError]) => {
+      client.destroy();
+      process.exit(serverError || cacheError ? 1 : exitCode);
+    });
+  };
   client.on("server-error", (error) => {
+    connectionStatus = "error";
     defaultLogger("ERROR", `Soulseek server error: ${error.message}`);
   });
   client.on("server-disconnect", ({ reconnecting }) => {
+    connectionStatus = reconnecting ? "connecting" : "disconnected";
     defaultLogger("WARN", `Soulseek disconnected; reconnecting=${reconnecting}.`);
   });
-  client.on("server-reconnect", () => defaultLogger("INFO", "Soulseek reconnected."));
+  client.on("server-reconnect", () => {
+    connectionStatus = "connected";
+    defaultLogger("INFO", "Soulseek reconnected.");
+  });
   client.on("relogged", () => {
+    connectionStatus = "error";
     defaultLogger("ERROR", "Soulseek session was replaced by another login.");
-    client.destroy();
-    const stopServer = () => {
-      server.closeAllConnections();
-      server.close(() => process.exit(1));
-    };
-    if (server?.listening) stopServer();
-    else if (server) server.once("listening", stopServer);
-    else process.exitCode = 1;
+    shutdown(1);
   });
 
   try {
     await client.login(username, password);
+    connectionStatus = "connected";
     defaultLogger("INFO", "Connected to Soulseek.");
-    ({ server } = createAddonServer({ client, allowDownloads: ALLOW_DOWNLOADS }));
+    ({ server, streamCache } = createAddonServer({
+      client,
+      allowDownloads: ALLOW_DOWNLOADS,
+      getConnectionStatus: () => connectionStatus,
+    }));
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, "0.0.0.0", resolve);
@@ -941,16 +987,6 @@ async function main() {
     throw error;
   }
 
-  let stopping = false;
-  const shutdown = () => {
-    if (stopping) return;
-    stopping = true;
-    client.destroy();
-    server.closeAllConnections();
-    server.close(() => {
-      process.exit(0);
-    });
-  };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }

@@ -15,7 +15,11 @@ BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches Sou
 3. BitChord compares candidate titles and reported durations to the requested track, then asks BitSeekWin to stream its selected match.
 4. BitSeekWin forwards received FLAC bytes to BitChord as they arrive. Whether playback starts before the full peer transfer completes also depends on BitChord's buffering and source-switching behavior.
 
-> **Version `alpha-0.4.3`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
+## Architecture overview
+
+BitSeekWin implements BitChord's HTTP add-on flow with one authenticated Soulseek client per server process and independent, bounded track transfers. It streams FLAC data over HTTP ranges and uses a persistent disk cache for partial and completed transfers. The disk cache does not remove `slsk-client`'s in-memory buffering, and the current implementation ignores requested quality tiers. See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the protocol, lifecycle diagram, implementation details, compatibility gaps, and limitations.
+
+> **Version `alpha-0.5.0`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
 
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 
@@ -153,6 +157,10 @@ For regular streaming, Caddy avoids tunnel bandwidth caps, but availability stil
 | `BITSEEKWIN_WORD_COUNT` | No | `3` | Number of readable URL words for direct/manual server launches (2–8); the last word is a noun. |
 | `BITSEEKWIN_WORD_LENGTH` | No | `6` | Target number of letters per readable URL word for direct/manual server launches (3–9); each word varies by up to 3 letters, clamped to 3–9. |
 | `BITSEEKWIN_ALLOW_DOWNLOADS` | No | `false` | Set to `true` to advertise download support to BitChord for this add-on. The launcher exposes the same option and leaves it off by default. |
+| `BITSEEKWIN_CACHE_DIRECTORY` | No | `%LOCALAPPDATA%\BitSeekWin\cache` on Windows; `~/.cache/BitSeekWin/cache` elsewhere | Directory for persistent FLAC cache data. |
+| `BITSEEKWIN_CACHE_TTL_MS` | No | `1800000` (30 minutes) | Time since last access before an inactive cached file expires. |
+| `BITSEEKWIN_CACHE_MAX_BYTES` | No | `2147483648` (2 GiB) | Maximum cache size; inactive entries are evicted least-recently-used first. |
+| `BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS` | No | `30000` | Grace period after the last HTTP consumer disconnects before cancelling that track's Soulseek transfer. Partial bytes remain cached for a future offset-resume. |
 | `BITSEEKWIN_SLUG` | No | `bitseekwin` | URL path for this add-on. |
 | `PORT` | No | `8080` | Local port for the add-on server. |
 
@@ -174,8 +182,10 @@ When BitChord requests the file URL, BitSeekWin requests the file from its Souls
 - Search terms are normalized for Soulseek by folding common Latin diacritics and treating punctuation (including slashes) as word separators. If a search finds nothing and the incoming query contains a strongly compressed consonant cluster, BitSeekWin makes at most one likely-vowel-restoration retry (for example `bnd dmon` → `bend demon`) to avoid flooding Soulseek with spelling variants.
 - Search rows identify the format as `flac` and quality as `LOSSLESS`; stream responses also declare the FLAC codec, container, and `audio/flac` MIME type.
 - Downloads are disabled by default. Enable **Allow downloads in BitChord** in the launcher (or set `BITSEEKWIN_ALLOW_DOWNLOADS=true` for a manual launch) to advertise download support. Only download files you are authorized to access.
-- BitSeekWin serves bytes received directly from a Soulseek peer without waiting for the peer transfer to finish. Live partial responses omit the complete-file size (`Content-Range: .../*`) so progressive players do not treat it as a reason to seek to the still-arriving tail; bounded ranges retain their exact response length, and `HEAD` reports the known file size. Whether BitChord begins playback before the peer transfer completes still depends on the player and its buffering/source-switching path. To support BitChord's follow-up byte-range requests, one peer transfer stays open and shares its incoming bytes with each HTTP range request for that file. Distinct tracks use independent peer transfers, so searching for or starting another track does not interrupt an existing one. The client library also buffers active files in memory and temporarily writes completed copies before BitSeekWin removes them. To limit memory use, files over 128 MiB are rejected and at most two peer transfers run at once.
-- If all HTTP consumers disconnect from an unfinished transfer, BitSeekWin keeps it available for 30 seconds in case BitChord reconnects for another range, then cancels that abandoned transfer to release its slot. Transfers also have a 15-minute timeout. These limits apply per transfer and do not cancel other tracks.
+- BitSeekWin streams incoming bytes from disk as they arrive. Live partial responses omit the complete-file size (`Content-Range: .../*`); bounded ranges retain their exact response length, and `HEAD` reports the known file size. Whether BitChord begins playback before the peer transfer completes still depends on the player and its buffering/source-switching path. Each peer/file/size has an independent transfer session, and ranges for the same file share its contiguous byte data. Searches never cancel downloads.
+- Disk-backed streaming and caching do not eliminate `slsk-client`'s in-memory buffering: the installed library retains received chunks in memory and concatenates them when each download completes. BitSeekWin limits files to 128 MiB per track and runs at most two Soulseek transfers at once, so concurrent downloads can still use substantial memory, with additional peak usage during completion.
+- Completed FLACs are verified against the search result size, then atomically moved from a `.part` file into the persistent cache. Repeat requests and ranges are served from the completed cache, including after a BitSeekWin restart. The cache defaults to 30 minutes since last access and 2 GiB, with LRU eviction; files actively being served or downloaded are not evicted. The `BITSEEKWIN_CACHE_*` settings configure its path, TTL, and size.
+- The installed `slsk-client` supports resuming at a byte offset. If all HTTP consumers disconnect, BitSeekWin keeps that track's active transfer for the configured grace period (30 seconds by default), then releases its slot while retaining the partial file. A later request resumes from the contiguous cached byte count. Transfers also have a 15-minute timeout. At most two Soulseek transfers run at once; the shared authenticated Soulseek client remains connected for the lifetime of the server.
 - BitSeekWin uses BitChord's **HTTP add-on API**, not its JavaScript module API.
 - The source URL has a configurable adjective-and-noun phrase followed by a separate bearer token with 128 bits of randomness; keep the complete URL private. The phrase is descriptive only and does not provide authentication. Soulseek credentials are used by the local client and are never sent to BitChord.
 

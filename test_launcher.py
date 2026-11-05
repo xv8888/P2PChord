@@ -201,6 +201,20 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertNotIn("__TOKEN_JSON__", page)
         self.assertNotIn("tkinter", page.casefold())
 
+    def test_dashboard_omits_monitoring_panel_and_status_footer(self):
+        page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
+        self.assertNotIn("Live monitoring", page)
+        self.assertNotIn('class="monitoring"', page)
+        self.assertNotIn('aria-label="Operational status"', page)
+        self.assertNotIn("barConnection", page)
+        self.assertNotIn('+"/monitoring"', page)
+
+    def test_dashboard_persists_and_validates_source_address(self):
+        page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
+        self.assertIn('localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl)', page)
+        self.assertIn('localStorage.getItem("bitseekwin.publicBaseUrl")', page)
+        self.assertIn("function validatePublicUrl()", page)
+
     def test_ez_start_launches_the_browser_launcher(self):
         script = Path(__file__).with_name("ez-start.bat").read_text(encoding="utf-8")
         self.assertIn('cd /d "%~dp0"', script)

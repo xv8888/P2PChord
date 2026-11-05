@@ -531,7 +531,8 @@ main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 .field{margin-top:14px}
 .field label,.slider-label{display:flex;justify-content:space-between;margin-bottom:7px;color:#c5cacf;font-size:12px;font-weight:600;letter-spacing:0;text-transform:none}
 .field input:not([type=range]){width:100%;min-width:0;background:var(--field);border:1px solid var(--line);border-radius:5px;padding:10px 11px;color:#e8e9eb;outline:none;font-size:13px}
-.field input:focus{border-color:var(--accent)}
+.field input:focus{border-color:var(--accent);box-shadow:0 0 0 2px #70c8a033}
+.field input:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid #80c8e8;outline-offset:2px}
 .field input::placeholder{color:#747b81}
 .slider{width:100%;accent-color:var(--accent)}
 .slider-value{color:#e8e9eb;font-variant-numeric:tabular-nums}
@@ -589,7 +590,7 @@ details.source-settings[open] summary::after{content:"−"}
 <details class="source-settings">
 <summary>Source URL settings</summary>
 <div class="source-settings-content">
-<div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" placeholder="https://device.tailnet.ts.net"></div>
+<div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" aria-describedby="publicUrlHint publicUrlState" placeholder="https://device.tailnet.ts.net"><p class="hint" id="publicUrlHint">Enter the base address only. A valid address is saved on this device when startup is accepted.</p><p class="hint" id="publicUrlState" aria-live="polite"></p></div>
 <label class="check"><input id="funnel" type="checkbox"> Start Tailscale Funnel on port 8080</label>
 <p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p>
 <div class="field">
@@ -617,15 +618,20 @@ const token=__TOKEN_JSON__, api="/"+token+"/api/";
 const $=id=>document.getElementById(id);
 let sourceUrl="";
 $("publicUrl").value=__PUBLIC_URL_JSON__;
+try{const savedPublicUrl=localStorage.getItem("bitseekwin.publicBaseUrl");if(savedPublicUrl&&normalizePublicUrl(savedPublicUrl))$("publicUrl").value=savedPublicUrl;}catch(e){$("publicUrlState").textContent="Saved address could not be loaded from this browser.";}
 $("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
+function normalizePublicUrl(value){const url=value.trim().replace(/\/+$/,"");if(!url||/[\u0000-\u0020]/.test(url))return null;let parsed;try{parsed=new URL(url);}catch(e){return null;}if(!["http:","https:"].includes(parsed.protocol)||!parsed.host||parsed.username||parsed.password||parsed.search||parsed.hash||!["","/"].includes(parsed.pathname))return null;return url;}
+function validatePublicUrl(){const input=$("publicUrl"),normalized=normalizePublicUrl(input.value);input.setCustomValidity(input.value.trim()&&!normalized?"Enter a valid base URL without credentials, path, query, or fragment.":"");return normalized;}
+$("publicUrl").addEventListener("input",()=>{validatePublicUrl();$("publicUrlState").textContent="";});
 for(const id of ["wordCount","wordLength"])$(id).addEventListener("input",updatePhrasePreview);
 function updatePhrasePreview(){const count=Number($("wordCount").value),length=Number($("wordLength").value);const low=Math.max(3,length-3),high=Math.min(9,length+3);$("wordCountValue").textContent=count;$("wordLengthValue").textContent=length;$("phrasePreview").textContent="Word lengths: "+low+"–"+high+" letters.";}
 updatePhrasePreview();
 update();
 $("start").addEventListener("click",async()=>{
-  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
+  const publicUrl=validatePublicUrl();if(!publicUrl){$("publicUrl").reportValidity();return;}
+  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
-  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
+  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}
   await update();
 });
