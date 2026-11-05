@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, test } from "node:test";
 import { FileAttribute } from "slsk-client";
@@ -59,6 +60,43 @@ class FakeDownload extends EventEmitter {
     const error = new Error(reason);
     this.stream.destroy(error);
     this.emit("status", "cancelled");
+    this.emit("failed", error);
+    this.reject(error);
+    return true;
+  }
+
+  then(...args) {
+    return this.promise.then(...args);
+  }
+
+  catch(...args) {
+    return this.promise.catch(...args);
+  }
+
+  finally(...args) {
+    return this.promise.finally(...args);
+  }
+}
+
+class PendingDownload extends EventEmitter {
+  constructor(options) {
+    super();
+    this.options = options;
+    this.isSettled = false;
+    this.promise = new Promise((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+    });
+    this.promise.catch(() => {});
+    this.onAbort = () => this.cancel(options.signal.reason?.message ?? "aborted");
+    options.signal.addEventListener("abort", this.onAbort, { once: true });
+  }
+
+  cancel(reason) {
+    if (this.isSettled) return false;
+    this.isSettled = true;
+    this.options.signal.removeEventListener("abort", this.onAbort);
+    const error = new Error(reason);
     this.emit("failed", error);
     this.reject(error);
     return true;
@@ -197,16 +235,25 @@ beforeEach(async () => {
       return download;
     },
   };
+  await startAddonServer();
+});
+
+async function startAddonServer(options = {}) {
+  if (server) {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
   ({ server } = createAddonServer({
     client,
     secret: "test-secret",
     slug: "bitseekwin",
     publicBaseUrl: "https://music.example.test",
     logger: (level, message) => logEntries.push({ level, message }),
+    ...options,
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
-});
+}
 
 afterEach(async () => {
   server.closeAllConnections();
@@ -219,6 +266,23 @@ async function searchTrack() {
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
   return body.tracks[0].id;
+}
+
+function getHttpResponse(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { headers }, resolve);
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function waitForLog(message) {
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline) {
+    if (logEntries.some((entry) => entry.message.includes(message))) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.fail(`Timed out waiting for log message: ${message}`);
 }
 
 test("manifest and search expose only safe FLAC results", async () => {
@@ -283,6 +347,17 @@ test("search ranks the closest FLAC candidates first", async () => {
       matchScore("kick song", "Kick Song Remix.flac"),
   );
   assert.match(logEntries.at(-1).message, /returning 3 ranked candidates/);
+});
+
+test("track metadata keeps artist-title suffixes such as Live", async () => {
+  client.search = async () => [
+    { ...track, file: "Artist - Title - Live.flac" },
+  ];
+  const response = await fetch(`${base}/search?q=artist%20title%20live`);
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.tracks[0].title, "Title - Live");
+  assert.equal(body.tracks[0].artist, "Artist");
 });
 
 test("unicode search queries are folded before searching Soulseek", async () => {
@@ -387,6 +462,7 @@ test("audio bytes arrive before the peer transfer completes", async () => {
 });
 
 test("a new search cancels the active track before starting the next transfer", async () => {
+  // BitChord can search mid-play; every non-empty search currently cancels active transfers.
   const firstId = await searchTrack();
   const firstResponse = await fetch(`${base}/file/${firstId}`);
   const firstReader = firstResponse.body.getReader();
@@ -405,7 +481,7 @@ test("a new search cancels the active track before starting the next transfer", 
   assert.equal(downloads.length, 2);
   assert.equal(await secondResponse.text(), "0123456789");
   assert.ok(logEntries.some(({ level, message }) =>
-    level === "STREAM" && message.includes("stopped because a new search arrived"),
+    level === "STREAM" && message.includes("stopped: Superseded by a new search"),
   ));
   assert.equal(
     logEntries.some(({ level, message }) =>
@@ -502,6 +578,87 @@ test("successive range requests share one active peer transfer", async () => {
   );
 });
 
+test("a range request after completion reuses the retained peer transfer", async () => {
+  const id = await searchTrack();
+  const firstResponse = await fetch(`${base}/file/${id}`, {
+    headers: { Range: "bytes=0-3" },
+  });
+  assert.equal(firstResponse.status, 206);
+  assert.equal(await firstResponse.text(), "0123");
+  await downloads[0].promise;
+  await waitForLog("Stream slot released (0 active)");
+
+  const secondResponse = await fetch(`${base}/file/${id}`, {
+    headers: { Range: "bytes=4-9" },
+  });
+  assert.equal(secondResponse.status, 206);
+  assert.equal(await secondResponse.text(), "456789");
+  assert.equal(downloads.length, 1);
+});
+
+test("an idle transfer is cancelled after 30 seconds and releases its slot", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  await startAddonServer({ maxActiveStreams: 1 });
+  client.search = async () => [
+    track,
+    { ...track, file: "Other Song.flac" },
+  ];
+  client.download = (options) => {
+    const download = new PendingDownload(options);
+    downloads.push(download);
+    return download;
+  };
+  const result = await (await fetch(`${base}/search?q=two`)).json();
+  const first = await getHttpResponse(
+    `${base}/file/${result.tracks[0].id}`,
+    { Range: "bytes=0-3" },
+  );
+  const firstEnd = new Promise((resolve) => first.once("end", resolve));
+  first.resume();
+  downloads[0].emit("data", Buffer.from("0123"));
+  await firstEnd;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(downloads[0].isSettled, true);
+
+  const second = await fetch(`${base}/file/${result.tracks[1].id}`);
+  assert.equal(second.status, 200);
+  assert.equal(downloads.length, 2);
+  await second.body.cancel();
+  await fetch(`${base}/search?q=stop`);
+});
+
+test("a reader reconnecting within 30 seconds keeps the peer transfer alive", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  client.download = (options) => {
+    const download = new PendingDownload(options);
+    downloads.push(download);
+    return download;
+  };
+  const id = await searchTrack();
+  const first = await getHttpResponse(
+    `${base}/file/${id}`,
+    { Range: "bytes=0-3" },
+  );
+  const firstEnd = new Promise((resolve) => first.once("end", resolve));
+  first.resume();
+  downloads[0].emit("data", Buffer.from("0123"));
+  await firstEnd;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const reconnected = await getHttpResponse(`${base}/file/${id}`);
+  assert.equal(reconnected.statusCode, 200);
+  t.mock.timers.tick(30_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].isSettled, false);
+
+  reconnected.destroy();
+  await fetch(`${base}/search?q=stop`);
+});
+
 test("HEAD reports file metadata without opening a peer transfer", async () => {
   const id = await searchTrack();
   const response = await fetch(`${base}/file/${id}`, { method: "HEAD" });
@@ -526,21 +683,9 @@ test("unknown routes and unsatisfiable ranges are rejected", async () => {
   assert.equal(response.status, 416);
 });
 
-test("files above the configured in-memory limit are rejected", async () => {
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
-  ({ server } = createAddonServer({
-    client,
-    secret: "test-secret",
-    slug: "bitseekwin",
-    publicBaseUrl: "https://music.example.test",
-    maxStreamBytes: 5,
-  }));
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
+test("oversized files are absent from search results", async () => {
+  await startAddonServer({ maxStreamBytes: 5 });
   const search = await (await fetch(`${base}/search?q=kick`)).json();
-  const id = search.tracks[0].id;
-  const response = await fetch(`${base}/file/${id}`);
-  assert.equal(response.status, 413);
+  assert.deepEqual(search.tracks, []);
   assert.equal(downloads.length, 0);
 });

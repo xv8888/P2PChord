@@ -201,6 +201,60 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertNotIn("__TOKEN_JSON__", page)
         self.assertNotIn("tkinter", page.casefold())
 
+    def test_dashboard_script_values_escape_less_than_characters(self):
+        page = _page("</script>", "https://device.example/</script>").decode(
+            "utf-8"
+        )
+        self.assertIn('"\\u003c/script>"', page)
+        self.assertIn('"https://device.example/\\u003c/script>"', page)
+        self.assertNotIn('const token = "</script>"', page)
+
+    def test_output_redacts_only_long_passwords(self):
+        controller = LauncherController()
+        process = type(
+            "OutputProcess",
+            (),
+            {"stdout": ["username password\n", "short abc\n"]},
+        )()
+        controller._read_output(
+            "BitSeekWin", process, ("password", "abc")
+        )
+        self.assertIn("username [redacted]", controller.snapshot()["logs"][0])
+        self.assertIn("short abc", controller.snapshot()["logs"][1])
+
+    def test_stop_turns_off_started_funnel(self):
+        controller = LauncherController()
+        controller.tailscale = "tailscale.exe"
+        controller.funnel_started = True
+        with patch(
+            "launcher.subprocess.run",
+            return_value=type("Result", (), {"returncode": 0})(),
+        ) as run:
+            controller.stop()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["tailscale.exe", "funnel", "--bg", "8080", "off"],
+        )
+        self.assertFalse(controller.funnel_started)
+        self.assertIn("Tailscale Funnel stopped.", controller.snapshot()["logs"])
+
+    def test_stop_logs_funnel_shutdown_failures_without_raising(self):
+        controller = LauncherController()
+        controller.tailscale = "tailscale.exe"
+        controller.funnel_started = True
+        with patch(
+            "launcher.subprocess.run",
+            return_value=type(
+                "Result", (), {"returncode": 1, "stderr": "unavailable", "stdout": ""}
+            )(),
+        ):
+            controller.stop()
+        self.assertTrue(controller.funnel_started)
+        self.assertTrue(
+            any("Could not turn off Tailscale Funnel: unavailable" in line
+                for line in controller.snapshot()["logs"])
+        )
+
     def test_ez_start_launches_the_browser_launcher(self):
         script = Path(__file__).with_name("ez-start.bat").read_text(encoding="utf-8")
         self.assertIn('cd /d "%~dp0"', script)
