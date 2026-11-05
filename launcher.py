@@ -1,4 +1,5 @@
 import base64
+import hmac
 import ipaddress
 import json
 import os
@@ -33,7 +34,12 @@ SOURCE_WORDS = json.loads(
 )
 
 
-def _validate_source_word_settings(word_count: int, word_length: int) -> None:
+def generate_source_secret(
+    word_count: int = DEFAULT_SECRET_WORD_COUNT,
+    word_length: int = DEFAULT_SECRET_WORD_LENGTH,
+    random_bytes: bytes | None = None,
+    phrase_bytes: bytes | None = None,
+) -> str:
     if (
         isinstance(word_count, bool)
         or not isinstance(word_count, int)
@@ -52,15 +58,6 @@ def _validate_source_word_settings(word_count: int, word_length: int) -> None:
             f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
             f"{MAX_SECRET_WORD_LENGTH}."
         )
-
-
-def generate_source_secret(
-    word_count: int = DEFAULT_SECRET_WORD_COUNT,
-    word_length: int = DEFAULT_SECRET_WORD_LENGTH,
-    random_bytes: bytes | None = None,
-    phrase_bytes: bytes | None = None,
-) -> str:
-    _validate_source_word_settings(word_count, word_length)
     entropy = random_bytes if random_bytes is not None else secrets.token_bytes(16)
     if not isinstance(entropy, bytes) or len(entropy) != 16:
         raise ValueError("Source URL token entropy must be exactly 16 bytes.")
@@ -132,7 +129,6 @@ def build_bitseekwin_environment(
 ) -> dict[str, str]:
     if not isinstance(allow_downloads, bool):
         raise ValueError("Allow downloads must be true or false.")
-    _validate_source_word_settings(word_count, word_length)
     env = base.copy()
     for key in ("SLSKD_API_KEY", "SLSKD_SLSK_USERNAME", "SLSKD_SLSK_PASSWORD"):
         env.pop(key, None)
@@ -235,7 +231,6 @@ class LauncherController:
         self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.stop_requested = threading.Event()
         self.tailscale = find_tailscale()
-        self.funnel_started = False
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -280,7 +275,24 @@ class LauncherController:
             raise ValueError("Enter your Soulseek username and password.")
         if not isinstance(allow_downloads, bool):
             raise ValueError("Allow downloads must be true or false.")
-        _validate_source_word_settings(word_count, word_length)
+        if (
+            isinstance(word_count, bool)
+            or not isinstance(word_count, int)
+            or not MIN_SECRET_WORD_COUNT <= word_count <= MAX_SECRET_WORD_COUNT
+        ):
+            raise ValueError(
+                f"Word count must be between {MIN_SECRET_WORD_COUNT} and "
+                f"{MAX_SECRET_WORD_COUNT}."
+            )
+        if (
+            isinstance(word_length, bool)
+            or not isinstance(word_length, int)
+            or not MIN_SECRET_WORD_LENGTH <= word_length <= MAX_SECRET_WORD_LENGTH
+        ):
+            raise ValueError(
+                f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
+                f"{MAX_SECRET_WORD_LENGTH}."
+            )
         node = find_node_runtime()
         public_url = normalize_public_url(public_text)
         if use_funnel and not public_url.startswith("https://"):
@@ -337,7 +349,7 @@ class LauncherController:
                 with self.lock:
                     self.source_url = source_url
             for secret in sensitive:
-                if len(secret) >= 4:
+                if secret:
                     message = message.replace(secret, "[redacted]")
             self.log(f"[{name}] {message}")
 
@@ -362,7 +374,7 @@ class LauncherController:
                     )
                 self.log("Installing the direct Soulseek client dependency…")
                 install = subprocess.run(
-                    [npm, "ci", "--no-audit", "--no-fund"],
+                    [npm, "install", "--no-audit", "--no-fund"],
                     cwd=str(PROJECT_DIR),
                     capture_output=True,
                     text=True,
@@ -372,7 +384,7 @@ class LauncherController:
                 if install.returncode:
                     detail = (install.stderr or install.stdout).strip()
                     raise RuntimeError(
-                        f"npm ci failed: {detail[-2000:] or 'unknown error'}"
+                        f"npm install failed: {detail[-2000:] or 'unknown error'}"
                     )
             if self._port_in_use(PORT):
                 raise RuntimeError(
@@ -407,7 +419,6 @@ class LauncherController:
                         or result.stdout.strip()
                         or "Tailscale Funnel failed."
                     )
-                self.funnel_started = True
                 self.log("Tailscale Funnel configured for local port 8080.")
 
             if self.stop_requested.is_set():
@@ -418,7 +429,6 @@ class LauncherController:
                 env=server_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -430,7 +440,7 @@ class LauncherController:
                 raise RuntimeError("Startup was cancelled.")
             threading.Thread(
                 target=self._read_output,
-                args=("BitSeekWin", server_process, (password,)),
+                args=("BitSeekWin", server_process, (username, password)),
                 daemon=True,
             ).start()
             self.log("Connecting directly to Soulseek…")
@@ -458,7 +468,6 @@ class LauncherController:
             self.log(f"Startup failed: {exc}")
             self.stop_requested.set()
             _terminate_process(server_process)
-            self._stop_funnel()
             with self.lock:
                 if self.server_process is server_process:
                     self.server_process = None
@@ -479,41 +488,16 @@ class LauncherController:
             self.source_url = ""
         self.log("Stopping BitSeekWin and the Soulseek connection…")
         _terminate_process(server_process)
-        self._stop_funnel()
-        self.log("BitSeekWin stopped.")
-
-    def _stop_funnel(self) -> None:
-        if not self.funnel_started:
-            return
-        try:
-            result = subprocess.run(
-                [self.tailscale, "funnel", "--bg", str(PORT), "off"],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if result.returncode:
-                detail = result.stderr.strip() or result.stdout.strip()
-                self.log(
-                    f"Could not turn off Tailscale Funnel: {detail or 'command failed.'}"
-                )
-                return
-            self.funnel_started = False
-            self.log("Tailscale Funnel stopped.")
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.log(f"Could not turn off Tailscale Funnel: {exc}")
+        self.log(
+            "BitSeekWin stopped. Tailscale Funnel, if enabled, remains configured in Tailscale."
+        )
 
 
 def _page(token: str, public_url: str) -> bytes:
     html = (
-        _HTML.replace(
-            "__TOKEN_JSON__", json.dumps(token).replace("<", "\\u003c")
-        )
+        _HTML.replace("__TOKEN_JSON__", json.dumps(token))
         .replace("__VERSION__", __version__)
-        .replace(
-            "__PUBLIC_URL_JSON__", json.dumps(public_url).replace("<", "\\u003c")
-        )
+        .replace("__PUBLIC_URL_JSON__", json.dumps(public_url))
     )
     return html.encode("utf-8")
 
@@ -532,6 +516,7 @@ body{margin:0;min-height:100vh;background:#111315;zoom:1.5}
 button,input{font:inherit}
 button{cursor:pointer}
 .app{min-height:100vh}
+aside,.topline,.hero,.section-title{display:none}
 main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 .simple-header{margin-bottom:22px}
 .simple-header h1{font-size:23px;letter-spacing:-.8px;margin:0 0 5px;line-height:1}
@@ -542,6 +527,7 @@ main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 .cards{display:block}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;margin-bottom:14px}
 .card-title{font-size:13px;letter-spacing:0;margin-bottom:12px}
+.step{display:none}
 .field{margin-top:14px}
 .field label,.slider-label{display:flex;justify-content:space-between;margin-bottom:7px;color:#c5cacf;font-size:12px;font-weight:600;letter-spacing:0;text-transform:none}
 .field input:not([type=range]){width:100%;min-width:0;background:var(--field);border:1px solid var(--line);border-radius:5px;padding:10px 11px;color:#e8e9eb;outline:none;font-size:13px}
@@ -570,6 +556,7 @@ details.source-settings[open] summary::after{content:"−"}
 .activity-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:31px}
 .console-title{margin-right:4px}
 .console-title strong{font-size:13px}
+.console-kicker{display:none}
 .dot{width:8px;height:8px;border-radius:50%;background:#777480}
 .dot.success{background:var(--green)}
 .dot.error{background:#ff617b}
@@ -596,7 +583,7 @@ details.source-settings[open] summary::after{content:"−"}
 <main>
 <header class="simple-header"><h1><span class="brand-bit">Bit</span><span class="brand-seek">Seek</span><span class="brand-win">win</span></h1><p>Connect Soulseek to BitChord · Build __VERSION__</p></header>
 <section class="cards">
-<article class="card"><div class="card-title">DIRECT SOULSEEK CONNECTION</div>
+<article class="card"><div class="card-title"><span class="step">01</span> DIRECT SOULSEEK CONNECTION</div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
 <div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
 <details class="source-settings">
@@ -644,7 +631,7 @@ $("start").addEventListener("click",async()=>{
 });
 $("stop").addEventListener("click",async()=>{try{await fetch(api+"stop",{method:"POST"});}catch(e){}await update();});
 $("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipboard.writeText(sourceUrl);$("state").textContent="URL copied";}});
-$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and disconnect from Soulseek?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='exit-page'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
+$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and disconnect from Soulseek?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main><section class='hero'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></section></main>";});
 async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});renderStatus(await r.json());}catch(e){}}
 function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;renderLogs(s.logs||[],s.detail||"");$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
 function renderLogs(entries,fallback){const box=$("logs"),follow=box.scrollHeight-box.scrollTop-box.clientHeight<24,lines=entries.length?entries:[fallback||"Waiting for activity…"];box.replaceChildren();for(const line of lines){const row=document.createElement("div"),time=document.createElement("span"),kind=document.createElement("span"),message=document.createElement("span"),match=/^(?:\[[^\]]+\]\s*)?\[(\d{2}:\d{2}:\d{2})\]\s+\[(SEARCH|STREAM|WARN|ERROR|INFO)\]\s*(.*)$/i.exec(line);const level=match?match[2].toLowerCase():"info";row.className="log-line "+level;time.className="log-time";time.textContent=match?match[1]:"";kind.className="log-kind";kind.textContent=level.toUpperCase();message.className="log-message";message.textContent=match?match[3]:line;row.append(time,kind,message);box.append(row);}$("log-count").textContent=entries.length+" EVENT"+(entries.length===1?"":"S");if(follow)box.scrollTop=box.scrollHeight;}
@@ -686,6 +673,7 @@ def make_handler(controller: LauncherController, token: str):
             return (
                 self._is_local()
                 and (path == prefix or path.startswith(prefix + "/"))
+                and hmac.compare_digest(path[: len(prefix)], prefix)
             )
 
         def _send_json(self, value: dict, status: int = 200) -> None:

@@ -34,7 +34,6 @@ const SECRET_WORD_LENGTH = readIntegerEnvironmentValue(
 );
 const SLUG = process.env.BITSEEKWIN_SLUG ?? "bitseekwin";
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
-const HOST = process.env.BITSEEKWIN_HOST ?? "127.0.0.1";
 const SECRET =
   process.env.BITCHORD_SECRET ??
   generateSourceSecret(randomBytes(16), SECRET_WORD_COUNT, SECRET_WORD_LENGTH);
@@ -48,9 +47,6 @@ const MAX_TRACKS = 1000;
 const MAX_ACTIVE_STREAMS = 2;
 const MAX_STREAM_BYTES = 128 * 1024 * 1024;
 const STREAM_TIMEOUT = 15 * 60 * 1000;
-const IDLE_READER_TIMEOUT = 30 * 1000;
-const COMPLETED_TRANSFER_TTL = 2 * 60 * 1000;
-const RELEASE_WAIT_TIMEOUT = 5 * 1000;
 const TEMP_DIRECTORY = join(tmpdir(), "BitSeekWin");
 
 function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
@@ -141,12 +137,15 @@ export function normalizeSearchQuery(value) {
 }
 
 function insertMissingVowels(word) {
+  const vowels = ["e", "a", "i", "o", "u"];
   for (let index = 0; index < word.length - 1; index++) {
     if (!/[bcdfghjklmnpqrstvwxyz]/i.test(word[index]) ||
         !/[bcdfghjklmnpqrstvwxyz]/i.test(word[index + 1])) {
       continue;
     }
-    return `${word.slice(0, index + 1)}e${word.slice(index + 1)}`;
+    for (const vowel of vowels) {
+      return `${word.slice(0, index + 1)}${vowel}${word.slice(index + 1)}`;
+    }
   }
   return null;
 }
@@ -228,11 +227,10 @@ function trackMetadata(query, filename) {
     .replaceAll("_", " ")
     .replace(/^\s*(?:\d{1,3}[\s._-]+)+/, "")
     .trim();
-  const parts = basename.split(/\s+[-–—]\s+/).map((part) => part.trim());
-  if (parts.length < 2 || !parts[0] || !parts[1]) {
+  const parts = basename.split(/\s+[-–—]\s+/, 2).map((part) => part.trim());
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
     return { title: basename, artist: "" };
   }
-  if (parts.length > 2) parts.splice(1, parts.length - 1, parts.slice(1).join(" - "));
 
   const queryCounts = countTokens(normalizeName(query).split(" "));
   const overlap = (value) => {
@@ -347,7 +345,6 @@ export function createAddonServer({
   }
   const tracks = new Map();
   const peerTransfers = new Map();
-  const completedTransfers = new Map();
   let activeStreams = 0;
 
   function log(level, message) {
@@ -367,25 +364,7 @@ export function createAddonServer({
     for (const transfer of active) {
       transfer.cancel(reason);
     }
-    let timedOut = false;
-    let timeout;
-    try {
-      await Promise.race([
-        Promise.all(active.map((transfer) => transfer.released)),
-        new Promise((resolve) => {
-          timeout = setTimeout(() => {
-            timedOut = true;
-            resolve();
-          }, RELEASE_WAIT_TIMEOUT);
-          timeout.unref();
-        }),
-      ]);
-    } finally {
-      clearTimeout(timeout);
-    }
-    if (timedOut) {
-      log("WARN", "Timed out waiting for cancelled Soulseek transfers to release.");
-    }
+    await Promise.all(active.map((transfer) => transfer.released));
   }
 
   function createPeerTransfer(track, transferKey) {
@@ -402,8 +381,6 @@ export function createAddonServer({
       cancel: null,
       released: null,
       resolveReleased: null,
-      readers: 0,
-      idleTimer: null,
     };
     state.changed = new Promise((resolve) => {
       state.resolveChange = resolve;
@@ -433,28 +410,9 @@ export function createAddonServer({
       if (released) return;
       released = true;
       clearTimeout(timer);
-      clearTimeout(state.idleTimer);
-      state.idleTimer = null;
       activeStreams--;
       if (peerTransfers.get(transferKey) === state) {
         peerTransfers.delete(transferKey);
-      }
-      if (
-        state.finished &&
-        !state.error &&
-        !state.cancelled &&
-        state.receivedBytes === state.trackSize
-      ) {
-        for (const entry of completedTransfers.values()) clearTimeout(entry.timer);
-        completedTransfers.clear();
-        const entry = { state, timer: null };
-        entry.timer = setTimeout(() => {
-          if (completedTransfers.get(transferKey) === entry) {
-            completedTransfers.delete(transferKey);
-          }
-        }, COMPLETED_TRANSFER_TTL);
-        entry.timer.unref();
-        completedTransfers.set(transferKey, entry);
       }
       log("STREAM", `Stream slot released (${activeStreams} active).`);
       state.resolveReleased();
@@ -463,7 +421,7 @@ export function createAddonServer({
       if (state.finished) return;
       state.cancelled = true;
       const error = new Error(reason);
-      log("STREAM", `"${track.title}" stopped: ${reason}`);
+      log("STREAM", `"${track.title}" stopped because a new search arrived.`);
       abortController.abort(error);
       finish(error);
     };
@@ -540,12 +498,9 @@ export function createAddonServer({
       finish(error);
     });
     download.then(
-      () => {
-        finish();
-        return rm(tempPath, { force: true }).catch((error) => {
-          console.error("Could not remove temporary stream file:", error.message);
-        });
-      },
+      () => rm(tempPath, { force: true }).catch((error) => {
+        console.error("Could not remove temporary stream file:", error.message);
+      }),
       (error) => {
         finish(error);
         return rm(tempPath, { force: true }).catch((cleanupError) => {
@@ -554,25 +509,6 @@ export function createAddonServer({
       },
     ).finally(release).catch(() => {});
     return state;
-  }
-
-  function attachReader(state) {
-    state.readers++;
-    clearTimeout(state.idleTimer);
-    state.idleTimer = null;
-  }
-
-  function detachReader(state) {
-    state.readers = Math.max(0, state.readers - 1);
-    if (state.readers === 0 && !state.finished && !state.idleTimer) {
-      state.idleTimer = setTimeout(() => {
-        state.idleTimer = null;
-        if (state.readers === 0 && !state.finished) {
-          state.cancel("No readers remain");
-        }
-      }, IDLE_READER_TIMEOUT);
-      state.idleTimer.unref();
-    }
   }
 
   async function* readTransferRange(state, start, end, response) {
@@ -685,7 +621,6 @@ export function createAddonServer({
         return;
       }
       try {
-        // BitChord can search mid-play; current behavior cancels active streams on every non-empty search.
         await stopActivePeerTransfers("Superseded by a new search");
         log("SEARCH", `Searching Soulseek for "${query}".`);
         let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
@@ -709,8 +644,7 @@ export function createAddonServer({
             !result.user ||
             !isSafeFlac(result.file) ||
             !Number.isSafeInteger(result.size) ||
-            result.size <= 0 ||
-            result.size > maxStreamBytes
+            result.size <= 0
           ) {
             continue;
           }
@@ -864,8 +798,7 @@ export function createAddonServer({
         "STREAM",
         `BitChord requested "${track.title}" from ${track.user} (${track.size} bytes${request.headers.range ? `, ${request.headers.range}` : ""}).`,
       );
-      let transfer = peerTransfers.get(transferKey) ??
-        completedTransfers.get(transferKey)?.state;
+      let transfer = peerTransfers.get(transferKey);
       if (transfer && transfer.trackSize !== track.size) {
         sendError(response, 409, "A different version of this peer file is already streaming");
         return;
@@ -881,10 +814,9 @@ export function createAddonServer({
         } else {
           log(
             "STREAM",
-            `Serving "${track.title}" from an existing Soulseek transfer (${formatBytes(transfer.receivedBytes)} buffered).`,
+            `Serving "${track.title}" from the active Soulseek transfer (${formatBytes(transfer.receivedBytes)} buffered).`,
           );
         }
-        attachReader(transfer);
       } catch (error) {
         console.error("Could not start Soulseek stream:", error.message);
         log("ERROR", `Could not start "${track.title}": ${error.message}`);
@@ -904,7 +836,6 @@ export function createAddonServer({
         response.destroy(error);
       });
       response.on("close", () => {
-        detachReader(transfer);
         if (!response.writableEnded) {
           log("WARN", `BitChord disconnected while streaming "${track.title}".`);
           notifyTransfer(transfer);
@@ -986,14 +917,14 @@ async function main() {
     ({ server } = createAddonServer({ client, allowDownloads: ALLOW_DOWNLOADS }));
     await new Promise((resolve, reject) => {
       server.once("error", reject);
-      server.listen(PORT, HOST, resolve);
+      server.listen(PORT, "0.0.0.0", resolve);
     });
     defaultLogger("INFO", `${APP_NAME} v${VERSION}.`);
     defaultLogger(
       "INFO",
       `Add this source in BitChord: ${PUBLIC_BASE_URL}/${SLUG}/${SECRET}`,
     );
-    defaultLogger("INFO", `Listening on ${HOST}:${PORT}; direct streaming enabled.`);
+    defaultLogger("INFO", `Listening on port ${PORT}; direct streaming enabled.`);
   } catch (error) {
     client.destroy();
     throw error;
@@ -1011,8 +942,6 @@ async function main() {
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
-  process.stdin.on("end", shutdown);
-  process.stdin.resume();
 }
 
 if (
