@@ -524,6 +524,13 @@ main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 .slider-value{color:#e8e9eb;font-variant-numeric:tabular-nums}
 .hint{font-size:11px;color:var(--subtle);line-height:1.5;margin:8px 0 0}
 .phrase-preview{font:12px Consolas,monospace;color:#c6d6ce;overflow-wrap:anywhere}
+details.source-settings{margin-top:16px;border:1px solid var(--line);border-radius:6px;background:#151719}
+details.source-settings summary{padding:10px 12px;color:#c5cacf;font-size:12px;font-weight:600;cursor:pointer;list-style:none}
+details.source-settings summary::-webkit-details-marker{display:none}
+details.source-settings summary::after{content:"+";float:right;color:var(--accent);font-size:15px;line-height:12px}
+details.source-settings[open] summary::after{content:"−"}
+.source-settings-content{padding:0 12px 12px}
+.source-settings-content .field:first-child{margin-top:4px}
 .check{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12px;color:#c5cacf}
 .check input{accent-color:var(--accent);width:14px;height:14px}
 .button{border:1px solid var(--line);border-radius:5px;padding:9px 12px;background:#24282b;color:#e8e9eb;font-size:12px;white-space:nowrap}
@@ -566,6 +573,9 @@ main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 <article class="card"><div class="card-title"><span class="step">01</span> DIRECT SOULSEEK CONNECTION</div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
 <div class="field"><label for="password">Soulseek password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
+<details class="source-settings">
+<summary>Source URL settings</summary>
+<div class="source-settings-content">
 <div class="field"><label for="publicUrl">Public address</label><input id="publicUrl" type="url" autocomplete="url" placeholder="https://device.tailnet.ts.net"></div>
 <label class="check"><input id="funnel" type="checkbox"> Start Tailscale Funnel on port 8080</label>
 <p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p>
@@ -579,6 +589,8 @@ main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 </div>
 <p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. A separate random token provides 128-bit access security.</p>
 <p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p>
+</div>
+</details>
 <div class="actions"><button class="button primary" id="start">▶ &nbsp; Start listening</button><button class="button" id="stop" disabled>Stop</button></div>
 </article>
 </section>

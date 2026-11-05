@@ -153,6 +153,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn("Adjectives come first, then one noun", page)
         self.assertIn("128-bit access security", page)
         self.assertIn("Target letters per word", page)
+        self.assertIn('<details class="source-settings">', page)
+        self.assertIn("<summary>Source URL settings</summary>", page)
         self.assertIn("Math.max(3,length-3)", page)
         self.assertIn("Word lengths: \"+low+\"–\"+high+\" letters.", page)
         self.assertNotIn("sourceWords", page)

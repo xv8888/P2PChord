@@ -103,10 +103,77 @@ function trackId(result) {
     .slice(0, 24);
 }
 
-function normalizeName(value) {
+function foldDiacritics(value) {
   return value
     .normalize("NFKD")
     .replace(/\p{Diacritic}/gu, "")
+    .replace(/[Ææ]/gu, (character) => character === "Æ" ? "AE" : "ae")
+    .replace(/[Œœ]/gu, (character) => character === "Œ" ? "OE" : "oe")
+    .replace(/[ßẞ]/gu, "ss")
+    .replace(/[Øø]/gu, (character) => character === "Ø" ? "O" : "o")
+    .replace(/[Łł]/gu, (character) => character === "Ł" ? "L" : "l")
+    .replace(/[ĐđÐð]/gu, (character) => /[ĐÐ]/u.test(character) ? "D" : "d")
+    .replace(/[Þþ]/gu, (character) => character === "Þ" ? "TH" : "th");
+}
+
+export function normalizeSearchQuery(value) {
+  return foldDiacritics(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function insertMissingVowels(word) {
+  const vowels = ["e", "a", "i", "o", "u"];
+  const variants = [];
+  for (let index = 0; index < word.length - 1; index++) {
+    if (!/[bcdfghjklmnpqrstvwxyz]/i.test(word[index]) ||
+        !/[bcdfghjklmnpqrstvwxyz]/i.test(word[index + 1])) {
+      continue;
+    }
+    for (const vowel of vowels) {
+      const variant = `${word.slice(0, index + 1)}${vowel}${word.slice(index + 1)}`;
+      if (!variants.includes(variant)) variants.push(variant);
+    }
+  }
+  return variants;
+}
+
+function searchRecoveryQueries(query, limit = 24) {
+  const words = query.split(" ");
+  const options = words.map((word) => [
+    word,
+    ...insertMissingVowels(word),
+  ]);
+  if (options.every((variants) => variants.length === 1)) return [];
+
+  const combinations = [];
+  function collect(index, current, changed) {
+    if (combinations.length >= limit * 4) return;
+    if (index === options.length) {
+      if (changed > 0) combinations.push({ query: current.join(" "), changed });
+      return;
+    }
+    for (let variantIndex = 0; variantIndex < options[index].length; variantIndex++) {
+      current.push(options[index][variantIndex]);
+      collect(index + 1, current, changed + Number(variantIndex > 0));
+      current.pop();
+    }
+  }
+  collect(0, [], 0);
+
+  const bestGuess = words.map((word, index) => options[index][1] ?? word).join(" ");
+  return [
+    bestGuess,
+    ...combinations
+      .filter(({ query: candidate }) => candidate !== bestGuess)
+      .sort((left, right) => left.changed - right.changed)
+      .map(({ query: candidate }) => candidate),
+  ].slice(0, limit);
+}
+
+function normalizeName(value) {
+  return foldDiacritics(value)
     .toLowerCase()
     .replace(/\.flac$/i, "")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
@@ -295,6 +362,14 @@ export function createAddonServer({
     resolve();
   }
 
+  async function stopActivePeerTransfers(reason) {
+    const active = [...peerTransfers.values()];
+    for (const transfer of active) {
+      transfer.cancel(reason);
+    }
+    await Promise.all(active.map((transfer) => transfer.released));
+  }
+
   function createPeerTransfer(track, transferKey) {
     const state = {
       trackSize: track.size,
@@ -305,9 +380,16 @@ export function createAddonServer({
       error: null,
       changed: null,
       resolveChange: null,
+      cancelled: false,
+      cancel: null,
+      released: null,
+      resolveReleased: null,
     };
     state.changed = new Promise((resolve) => {
       state.resolveChange = resolve;
+    });
+    state.released = new Promise((resolve) => {
+      state.resolveReleased = resolve;
     });
 
     activeStreams++;
@@ -336,6 +418,15 @@ export function createAddonServer({
         peerTransfers.delete(transferKey);
       }
       log("STREAM", `Stream slot released (${activeStreams} active).`);
+      state.resolveReleased();
+    };
+    state.cancel = (reason) => {
+      if (state.finished) return;
+      state.cancelled = true;
+      const error = new Error(reason);
+      log("STREAM", `"${track.title}" stopped because a new search arrived.`);
+      abortController.abort(error);
+      finish(error);
     };
 
     try {
@@ -402,6 +493,10 @@ export function createAddonServer({
       finish();
     });
     download.on("failed", (error) => {
+      if (state.cancelled) {
+        finish(error);
+        return;
+      }
       log("ERROR", `"${track.title}" failed: ${error.message}`);
       finish(error);
     });
@@ -518,7 +613,7 @@ export function createAddonServer({
     }
 
     if (route.length === 1 && route[0] === "search" && request.method === "GET") {
-      const query = (url.searchParams.get("q") ?? "").trim();
+      const query = normalizeSearchQuery(url.searchParams.get("q") ?? "");
       if (!query) {
         sendJson(response, 200, {
           tracks: [],
@@ -529,8 +624,37 @@ export function createAddonServer({
         return;
       }
       try {
+        await stopActivePeerTransfers("Superseded by a new search");
         log("SEARCH", `Searching Soulseek for "${query}".`);
-        const results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
+        let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
+        if (results.length === 0) {
+          const recoveryQueries = searchRecoveryQueries(query);
+          if (recoveryQueries.length) {
+            log(
+              "SEARCH",
+              `No exact results; retrying with likely missing vowels in "${query}".`,
+            );
+            const recovered = await Promise.all(
+              recoveryQueries.map(async (candidate) => ({
+                query: candidate,
+                results: await client.search({
+                  req: candidate,
+                  timeout: SEARCH_TIMEOUT,
+                }),
+              })),
+            );
+            results = recovered.flatMap(({ results: matches }) => matches);
+            const matchedQueries = recovered
+              .filter(({ results: matches }) => matches.length > 0)
+              .map(({ query: candidate }) => candidate);
+            if (matchedQueries.length) {
+              log(
+                "SEARCH",
+                `Spelling recovery returned results for: ${matchedQueries.slice(0, 3).join("; ")}.`,
+              );
+            }
+          }
+        }
         const candidates = [];
         const seen = new Set();
         for (const result of results) {
@@ -668,10 +792,19 @@ export function createAddonServer({
           "Content-Length, Content-Range, Accept-Ranges",
         "Accept-Ranges": "bytes",
         "Content-Type": "audio/flac",
-        "Content-Length": length,
-        "Cache-Control": "no-store",
+        "Cache-Control": "no-store, no-transform",
       };
-      if (partial) headers["Content-Range"] = `bytes ${start}-${end}/${track.size}`;
+      const openEndedRange = /^bytes=\d+-$/.test(request.headers.range ?? "");
+      if (request.method === "HEAD" || (partial && !openEndedRange)) {
+        headers["Content-Length"] = length;
+      }
+      if (partial) {
+        // Do not advertise the complete length while bytes are still arriving:
+        // progressive FLAC readers may otherwise seek to the tail before play.
+        headers["Content-Range"] = request.method === "HEAD"
+          ? `bytes ${start}-${end}/${track.size}`
+          : `bytes ${start}-${end}/*`;
+      }
       if (request.method === "HEAD") {
         response.writeHead(partial ? 206 : 200, headers);
         response.end();
@@ -712,6 +845,10 @@ export function createAddonServer({
       const range = Readable.from(readTransferRange(transfer, start, end, response));
       range.on("error", (error) => {
         if (response.destroyed) return;
+        if (transfer.cancelled) {
+          response.destroy();
+          return;
+        }
         log("ERROR", `Audio stream for "${track.title}" failed: ${error.message}`);
         console.error("Soulseek stream failed:", error.message);
         response.destroy(error);
@@ -723,6 +860,7 @@ export function createAddonServer({
         }
       });
       response.writeHead(partial ? 206 : 200, headers);
+      response.flushHeaders();
       range.pipe(response);
       return;
     }

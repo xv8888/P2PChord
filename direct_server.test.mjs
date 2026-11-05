@@ -8,6 +8,7 @@ import {
   createAddonServer,
   generateSourceSecret,
   matchScore,
+  normalizeSearchQuery,
 } from "./direct_server.mjs";
 
 const sourceWords = JSON.parse(
@@ -19,12 +20,17 @@ class FakeDownload extends EventEmitter {
     super();
     this.options = options;
     this.stream = new PassThrough();
+    this.stream.on("error", () => {});
     this.isSettled = false;
     this.promise = new Promise((resolve, reject) => {
       this.resolve = resolve;
       this.reject = reject;
     });
     this.promise.catch(() => {});
+    this.onAbort = () =>
+      this.cancel(options.signal.reason?.message ?? "aborted");
+    if (options.signal.aborted) queueMicrotask(this.onAbort);
+    else options.signal.addEventListener("abort", this.onAbort, { once: true });
     let elapsed = 0;
     for (const chunk of chunks) {
       elapsed += delay;
@@ -38,6 +44,7 @@ class FakeDownload extends EventEmitter {
     setTimeout(() => {
       if (this.isSettled) return;
       this.isSettled = true;
+      options.signal.removeEventListener("abort", this.onAbort);
       this.stream.end();
       this.resolve({ receivedBytes: options.offset + chunks.reduce((n, c) => n + c.length, 0) });
       this.emit("status", "complete");
@@ -48,6 +55,7 @@ class FakeDownload extends EventEmitter {
   cancel(reason) {
     if (this.isSettled) return false;
     this.isSettled = true;
+    this.options.signal.removeEventListener("abort", this.onAbort);
     const error = new Error(reason);
     this.stream.destroy(error);
     this.emit("status", "cancelled");
@@ -255,6 +263,40 @@ test("search ranks the closest FLAC candidates first", async () => {
   assert.match(logEntries.at(-1).message, /returning 3 ranked candidates/);
 });
 
+test("unicode search queries are folded before searching Soulseek", async () => {
+  const response = await fetch(
+    `${base}/search?q=${encodeURIComponent("Bad bënd / DëMON by yeat")}`,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(client.lastSearch.req, "bad bend demon by yeat");
+  assert.equal(normalizeSearchQuery("Æther, cœur & straße"), "aether coeur strasse");
+  assert.equal(matchScore("DëMON", "Demon.flac"), 1);
+});
+
+test("search retries likely missing vowels after an accent-stripped query misses", async () => {
+  const queries = [];
+  client.search = async ({ req, timeout }) => {
+    queries.push(req);
+    assert.equal(timeout, 2000);
+    if (req === "bad bend demon yeat") {
+      return [{ ...track, file: "Bad Bend Demon.flac" }];
+    }
+    return [];
+  };
+  const response = await fetch(
+    `${base}/search?q=${encodeURIComponent("bad bnd dmon yeat")}`,
+  );
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.ok(queries.includes("bad bnd dmon yeat"));
+  assert.ok(queries.includes("bad bend demon yeat"));
+  assert.equal(body.tracks.length, 1);
+  assert.equal(body.tracks[0].title, "Bad Bend Demon");
+  assert.ok(logEntries.some(({ message }) =>
+    message.includes("Spelling recovery returned results"),
+  ));
+});
+
 test("track-numbered artist-title filenames expose matchable metadata", async () => {
   client.search = async () => [
     { ...track, file: "Nettspend - nite nite.flac", attribs: { 1: 134 } },
@@ -300,6 +342,7 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   const id = await searchTrack();
   const response = await fetch(`${base}/file/${id}`);
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-length"), null);
   const reader = response.body.getReader();
   const first = await reader.read();
   assert.equal(Buffer.from(first.value).toString(), "0123");
@@ -307,6 +350,35 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   const second = await reader.read();
   assert.equal(Buffer.from(second.value).toString(), "456789");
   assert.equal((await reader.read()).done, true);
+});
+
+test("a new search cancels the active track before starting the next transfer", async () => {
+  const firstId = await searchTrack();
+  const firstResponse = await fetch(`${base}/file/${firstId}`);
+  const firstReader = firstResponse.body.getReader();
+  assert.equal(Buffer.from((await firstReader.read()).value).toString(), "0123");
+  assert.equal(downloads[0].isSettled, false);
+
+  const searchResponse = await fetch(`${base}/search?q=next%20track`);
+  assert.equal(searchResponse.status, 200);
+  assert.equal(downloads[0].isSettled, true);
+  assert.equal(downloads[0].options.signal.aborted, true);
+  await assert.rejects(firstReader.read());
+
+  const secondId = await searchTrack();
+  const secondResponse = await fetch(`${base}/file/${secondId}`);
+  assert.equal(secondResponse.status, 200);
+  assert.equal(downloads.length, 2);
+  assert.equal(await secondResponse.text(), "0123456789");
+  assert.ok(logEntries.some(({ level, message }) =>
+    level === "STREAM" && message.includes("stopped because a new search arrived"),
+  ));
+  assert.equal(
+    logEntries.some(({ level, message }) =>
+      level === "ERROR" && message.includes("Superseded by a new search"),
+    ),
+    false,
+  );
 });
 
 test("search and stream lifecycle events are logged for the launcher", async () => {
@@ -345,9 +417,28 @@ test("range requests are served from the beginning of a peer transfer", async ()
     headers: { Range: "bytes=2-5" },
   });
   assert.equal(response.status, 206);
-  assert.equal(response.headers.get("content-range"), "bytes 2-5/10");
+  assert.equal(response.headers.get("content-length"), "4");
+  assert.equal(response.headers.get("content-range"), "bytes 2-5/*");
   assert.equal(await response.text(), "2345");
   assert.equal(downloads[0].options.offset, 0);
+});
+
+test("open-ended range requests stream without declaring the full length", async () => {
+  const id = await searchTrack();
+  const response = await fetch(`${base}/file/${id}`, {
+    headers: { Range: "bytes=0-" },
+  });
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get("content-length"), null);
+  assert.equal(response.headers.get("content-range"), "bytes 0-9/*");
+  const reader = response.body.getReader();
+  assert.equal(Buffer.from((await reader.read()).value).toString(), "0123");
+  assert.equal(downloads[0].isSettled, false);
+  assert.equal(
+    Buffer.from((await reader.read()).value).toString(),
+    "456789",
+  );
+  assert.equal((await reader.read()).done, true);
 });
 
 test("successive range requests share one active peer transfer", async () => {
@@ -366,7 +457,7 @@ test("successive range requests share one active peer transfer", async () => {
     headers: { Range: "bytes=2-5" },
   });
   assert.equal(secondResponse.status, 206);
-  assert.equal(secondResponse.headers.get("content-range"), "bytes 2-5/10");
+  assert.equal(secondResponse.headers.get("content-range"), "bytes 2-5/*");
   assert.equal(await secondResponse.text(), "2345");
   assert.equal(downloads.length, 1);
   assert.equal(downloads[0].options.offset, 0);
@@ -381,7 +472,14 @@ test("HEAD reports file metadata without opening a peer transfer", async () => {
   const id = await searchTrack();
   const response = await fetch(`${base}/file/${id}`, { method: "HEAD" });
   assert.equal(response.headers.get("content-length"), "10");
+  assert.equal(response.headers.get("content-range"), null);
   assert.equal(response.headers.get("accept-ranges"), "bytes");
+  const rangeResponse = await fetch(`${base}/file/${id}`, {
+    method: "HEAD",
+    headers: { Range: "bytes=2-5" },
+  });
+  assert.equal(rangeResponse.headers.get("content-length"), "4");
+  assert.equal(rangeResponse.headers.get("content-range"), "bytes 2-5/10");
   assert.equal(downloads.length, 0);
 });
 

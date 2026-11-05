@@ -13,7 +13,7 @@ BitSeekWin is a Windows-friendly BitChord HTTP add-on prototype. It searches Sou
 1. BitChord sends a music search to BitSeekWin.
 2. BitSeekWin searches Soulseek directly and returns up to 50 safe FLAC candidates ranked by filename match.
 3. BitChord compares candidate titles and reported durations to the requested track, then asks BitSeekWin to stream its selected match.
-4. Incoming FLAC bytes are sent to BitChord immediately; playback does not wait for the transfer to finish.
+4. BitSeekWin forwards received FLAC bytes to BitChord as they arrive. Whether playback starts before the full peer transfer completes also depends on BitChord's buffering and source-switching behavior.
 
 > **Version `alpha-0.4.2`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
 
@@ -48,7 +48,7 @@ python .\launcher.py
 1. Enter your Soulseek username and password. The password field is masked.
 2. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`.
 3. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
-4. Optionally adjust **Words in source URL** and **Target letters per word**. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
+4. Optionally open **Source URL settings** to adjust the public address, Funnel, and source URL word settings. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
 5. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
 The launcher starts BitSeekWin, logs in to Soulseek, and displays the BitChord source URL in its status panel. The live activity console shows searches, peer transfer status, and streaming progress. If it shows repeated searches but no stream activity, BitChord is still checking candidates and has not accepted a FLAC match yet. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. Credentials are sent only to the local launcher and child-process environment; they are not saved to a settings file. Stop with **Stop**, or use **Exit launcher** to disconnect and close the dashboard.
@@ -168,8 +168,10 @@ When BitChord requests the file URL, BitSeekWin requests the file from its Souls
 ## What to expect
 
 - Search results include up to 50 safe FLAC files, ranked by filename match so BitChord can choose among versions and releases using its own title and duration matching. Track numbers are removed from filenames, artist-title filenames expose their artist when the search query supports that split, and duration is included when the Soulseek peer reports it. Peer usernames are not presented as artist credits; full music tags are not read from search results.
+- Search terms are normalized for Soulseek by folding common Latin diacritics and treating punctuation (including slashes) as word separators. If a search still returns no results and the incoming query appears to have lost vowels from accented letters, BitSeekWin retries a bounded set of likely spellings (for example `bnd dmon` → `bend demon`).
 - Search rows identify the format as `flac` and quality as `LOSSLESS`; stream responses also declare the FLAC codec, container, and `audio/flac` MIME type.
-- BitSeekWin starts playback from bytes received directly from a Soulseek peer; it does not wait for the transfer to finish or maintain a reusable download cache. To support BitChord's follow-up byte-range requests without replacing an active Soulseek transfer, one peer transfer stays open and its incoming bytes are shared with each HTTP range request. The client library also buffers the active file in memory and temporarily writes a completed copy before BitSeekWin removes it. To limit memory use, files over 128 MiB are rejected and at most two peer transfers run at once.
+- BitSeekWin serves bytes received directly from a Soulseek peer without waiting for the peer transfer to finish. Live partial responses omit the complete-file size (`Content-Range: .../*`) so progressive players do not treat it as a reason to seek to the still-arriving tail; bounded ranges retain their exact response length, and `HEAD` reports the known file size. Whether BitChord begins playback before the peer transfer completes still depends on the player and its buffering/source-switching path. To support BitChord's follow-up byte-range requests without replacing an active Soulseek transfer, one peer transfer stays open and its incoming bytes are shared with each HTTP range request. The client library also buffers the active file in memory and temporarily writes a completed copy before BitSeekWin removes it. To limit memory use, files over 128 MiB are rejected and at most two peer transfers run at once.
+- A new non-empty search stops any active peer-to-BitChord transfer first, so skipping to another track releases the old transfer and stream slot before the next selection starts.
 - BitSeekWin uses BitChord's **HTTP add-on API**, not its JavaScript module API.
 - The source URL has a configurable adjective-and-noun phrase followed by a separate bearer token with 128 bits of randomness; keep the complete URL private. The phrase is descriptive only and does not provide authentication. Soulseek credentials are used by the local client and are never sent to BitChord.
 
