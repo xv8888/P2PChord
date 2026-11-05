@@ -445,6 +445,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('id="allowDownloads" type="checkbox"', page)
         self.assertIn('lan_access:$("lanAccess").checked', page)
         self.assertIn('allow_downloads:$("allowDownloads").checked', page)
+        self.assertIn('$("password").value="";$("logs").textContent="Connecting directly to Soulseek…";', page)
+        self.assertNotIn('$("username").value=""', page)
         self.assertIn('id="sourceSelection"', page)
         self.assertIn('source_selection:$("sourceSelection").value', page)
         self.assertIn('id="searchLimit" type="number" min="1" max="50"', page)
