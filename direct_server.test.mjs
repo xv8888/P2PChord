@@ -171,10 +171,26 @@ let base;
 let client;
 let downloads;
 let logEntries;
+let idleTransferTimeout;
+
+async function startServer(options = {}) {
+  ({ server } = createAddonServer({
+    client,
+    secret: "test-secret",
+    slug: "bitseekwin",
+    publicBaseUrl: "https://music.example.test",
+    logger: (level, message) => logEntries.push({ level, message }),
+    idleTransferTimeout,
+    ...options,
+  }));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
+}
 
 beforeEach(async () => {
   downloads = [];
   logEntries = [];
+  idleTransferTimeout = 30_000;
   client = {
     async search(options) {
       this.lastSearch = options;
@@ -191,21 +207,13 @@ beforeEach(async () => {
         options.offset
           ? [Buffer.from("2345"), Buffer.from("6789")]
           : [Buffer.from("0123"), Buffer.from("456789")],
-        80,
+        options.file.includes("Track A") ? 200 : 80,
       );
       downloads.push(download);
       return download;
     },
   };
-  ({ server } = createAddonServer({
-    client,
-    secret: "test-secret",
-    slug: "bitseekwin",
-    publicBaseUrl: "https://music.example.test",
-    logger: (level, message) => logEntries.push({ level, message }),
-  }));
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
+  await startServer();
 });
 
 afterEach(async () => {
@@ -213,8 +221,8 @@ afterEach(async () => {
   await new Promise((resolve) => server.close(resolve));
 });
 
-async function searchTrack() {
-  const response = await fetch(`${base}/search?q=kick`);
+async function searchTrack(query = "kick") {
+  const response = await fetch(`${base}/search?q=${encodeURIComponent(query)}`);
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
@@ -386,7 +394,11 @@ test("audio bytes arrive before the peer transfer completes", async () => {
   assert.equal((await reader.read()).done, true);
 });
 
-test("a new search cancels the active track before starting the next transfer", async () => {
+test("searching for another track leaves the active transfer delivering bytes", async () => {
+  client.search = async ({ req }) => [{
+    ...track,
+    file: req === "next track" ? "Other\\Next Track.flac" : track.file,
+  }];
   const firstId = await searchTrack();
   const firstResponse = await fetch(`${base}/file/${firstId}`);
   const firstReader = firstResponse.body.getReader();
@@ -395,24 +407,97 @@ test("a new search cancels the active track before starting the next transfer", 
 
   const searchResponse = await fetch(`${base}/search?q=next%20track`);
   assert.equal(searchResponse.status, 200);
-  assert.equal(downloads[0].isSettled, true);
-  assert.equal(downloads[0].options.signal.aborted, true);
-  await assert.rejects(firstReader.read());
+  assert.equal(downloads[0].options.signal.aborted, false);
+  assert.equal(Buffer.from((await firstReader.read()).value).toString(), "456789");
+  assert.equal(downloads[0].options.signal.aborted, false);
+});
 
-  const secondId = await searchTrack();
+test("two tracks can stream concurrently without sharing transfer data", async () => {
+  client.search = async ({ req }) => [{
+    ...track,
+    file: req === "track b" ? "Other\\Track B.flac" : track.file,
+  }];
+  const firstId = await searchTrack("track a");
+  const firstResponse = await fetch(`${base}/file/${firstId}`);
+  const firstReader = firstResponse.body.getReader();
+  assert.equal(Buffer.from((await firstReader.read()).value).toString(), "0123");
+
+  const secondId = await searchTrack("track b");
+  const secondResponse = await fetch(`${base}/file/${secondId}`);
+  const secondReader = secondResponse.body.getReader();
+  assert.equal(secondResponse.status, 200);
+  assert.equal(downloads.length, 2);
+  assert.equal(Buffer.from((await secondReader.read()).value).toString(), "0123");
+  assert.equal(Buffer.from((await firstReader.read()).value).toString(), "456789");
+  assert.equal(Buffer.from((await secondReader.read()).value).toString(), "456789");
+  assert.equal((await firstReader.read()).done, true);
+  assert.equal((await secondReader.read()).done, true);
+  assert.equal(downloads[0].options.signal.aborted, false);
+  assert.equal(downloads[1].options.signal.aborted, false);
+});
+
+test("disconnecting one track preserves shared consumers and expires abandoned transfers", async () => {
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  await startServer({ idleTransferTimeout: 25 });
+  client.search = async ({ req }) => [{
+    ...track,
+    file: req === "track a"
+      ? "Other\\Track A.flac"
+      : req === "track b"
+        ? "Other\\Track B.flac"
+        : req === "track c"
+          ? "Other\\Track C.flac"
+          : track.file,
+  }];
+
+  const firstId = await searchTrack("track a");
+  const firstResponse = await fetch(`${base}/file/${firstId}`);
+  const firstReader = firstResponse.body.getReader();
+  assert.equal(Buffer.from((await firstReader.read()).value).toString(), "0123");
+  const sharedResponse = await fetch(`${base}/file/${firstId}`);
+  const sharedReader = sharedResponse.body.getReader();
+  assert.equal(Buffer.from((await sharedReader.read()).value).toString(), "0123");
+  await firstReader.cancel();
+  assert.equal(downloads[0].options.signal.aborted, false);
+
+  const secondId = await searchTrack("track b");
+  const secondResponse = await fetch(`${base}/file/${secondId}`);
+  const secondReader = secondResponse.body.getReader();
+  assert.equal(Buffer.from((await secondReader.read()).value).toString(), "0123");
+  await secondReader.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(downloads[1].options.signal.aborted, true);
+  assert.equal(downloads[0].options.signal.aborted, false);
+
+  const thirdId = await searchTrack("track c");
+  const thirdResponse = await fetch(`${base}/file/${thirdId}`);
+  assert.equal(thirdResponse.status, 200);
+  assert.equal(downloads.length, 3);
+  assert.equal(downloads[2].options.signal.aborted, false);
+  assert.equal(Buffer.from((await sharedReader.read()).value).toString(), "456789");
+  await thirdResponse.arrayBuffer();
+});
+
+test("completed transfers release their slot for another track", async () => {
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+  await startServer({ maxActiveStreams: 1 });
+  client.search = async ({ req }) => [{
+    ...track,
+    file: req === "next track" ? "Other\\Next Track.flac" : track.file,
+  }];
+  const firstId = await searchTrack();
+  const firstResponse = await fetch(`${base}/file/${firstId}`);
+  assert.equal(firstResponse.status, 200);
+  await firstResponse.arrayBuffer();
+  await downloads[0].promise;
+
+  const secondId = await searchTrack("next track");
   const secondResponse = await fetch(`${base}/file/${secondId}`);
   assert.equal(secondResponse.status, 200);
   assert.equal(downloads.length, 2);
-  assert.equal(await secondResponse.text(), "0123456789");
-  assert.ok(logEntries.some(({ level, message }) =>
-    level === "STREAM" && message.includes("stopped because a new search arrived"),
-  ));
-  assert.equal(
-    logEntries.some(({ level, message }) =>
-      level === "ERROR" && message.includes("Superseded by a new search"),
-    ),
-    false,
-  );
+  await secondResponse.arrayBuffer();
 });
 
 test("search and stream lifecycle events are logged for the launcher", async () => {
@@ -433,16 +518,6 @@ test("search and stream lifecycle events are logged for the launcher", async () 
   assert.ok(logEntries.some(({ level, message }) =>
     level === "STREAM" && message.includes("Peer transfer complete"),
   ));
-});
-
-test("completed transfers release an active-stream slot", async () => {
-  const id = await searchTrack();
-  for (let index = 0; index < 3; index++) {
-    const response = await fetch(`${base}/file/${id}`);
-    assert.equal(response.status, 200);
-    await response.arrayBuffer();
-  }
-  assert.equal(downloads.length, 1);
 });
 
 test("range requests are served from the beginning of a peer transfer", async () => {

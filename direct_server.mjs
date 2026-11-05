@@ -47,6 +47,7 @@ const MAX_TRACKS = 1000;
 const MAX_ACTIVE_STREAMS = 2;
 const MAX_STREAM_BYTES = 128 * 1024 * 1024;
 const STREAM_TIMEOUT = 15 * 60 * 1000;
+const IDLE_TRANSFER_TIMEOUT = 30 * 1000;
 const TEMP_DIRECTORY = join(tmpdir(), "BitSeekWin");
 
 function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
@@ -339,9 +340,13 @@ export function createAddonServer({
   allowDownloads = ALLOW_DOWNLOADS,
   maxActiveStreams = MAX_ACTIVE_STREAMS,
   maxStreamBytes = MAX_STREAM_BYTES,
+  idleTransferTimeout = IDLE_TRANSFER_TIMEOUT,
 }) {
   if (typeof allowDownloads !== "boolean") {
     throw new TypeError("allowDownloads must be true or false.");
+  }
+  if (!Number.isSafeInteger(idleTransferTimeout) || idleTransferTimeout < 1) {
+    throw new RangeError("idleTransferTimeout must be a positive whole number.");
   }
   const tracks = new Map();
   const peerTransfers = new Map();
@@ -359,14 +364,6 @@ export function createAddonServer({
     resolve();
   }
 
-  async function stopActivePeerTransfers(reason) {
-    const active = [...peerTransfers.values()];
-    for (const transfer of active) {
-      transfer.cancel(reason);
-    }
-    await Promise.all(active.map((transfer) => transfer.released));
-  }
-
   function createPeerTransfer(track, transferKey) {
     const state = {
       trackSize: track.size,
@@ -381,6 +378,8 @@ export function createAddonServer({
       cancel: null,
       released: null,
       resolveReleased: null,
+      consumers: 0,
+      idleTimer: null,
     };
     state.changed = new Promise((resolve) => {
       state.resolveChange = resolve;
@@ -393,7 +392,7 @@ export function createAddonServer({
     log("STREAM", `Opening one Soulseek transfer for "${track.title}" from ${track.user}.`);
     const abortController = new AbortController();
     const timer = setTimeout(
-      () => abortController.abort(new Error("Stream timed out")),
+      () => state.cancel("Soulseek transfer timed out"),
       STREAM_TIMEOUT,
     );
     timer.unref();
@@ -410,6 +409,7 @@ export function createAddonServer({
       if (released) return;
       released = true;
       clearTimeout(timer);
+      clearTimeout(state.idleTimer);
       activeStreams--;
       if (peerTransfers.get(transferKey) === state) {
         peerTransfers.delete(transferKey);
@@ -421,7 +421,7 @@ export function createAddonServer({
       if (state.finished) return;
       state.cancelled = true;
       const error = new Error(reason);
-      log("STREAM", `"${track.title}" stopped because a new search arrived.`);
+      log("STREAM", `"${track.title}" stopped: ${reason}.`);
       abortController.abort(error);
       finish(error);
     };
@@ -621,7 +621,6 @@ export function createAddonServer({
         return;
       }
       try {
-        await stopActivePeerTransfers("Superseded by a new search");
         log("SEARCH", `Searching Soulseek for "${query}".`);
         let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
         if (results.length === 0) {
@@ -824,6 +823,9 @@ export function createAddonServer({
         return;
       }
 
+      transfer.consumers++;
+      clearTimeout(transfer.idleTimer);
+      transfer.idleTimer = null;
       const range = Readable.from(readTransferRange(transfer, start, end, response));
       range.on("error", (error) => {
         if (response.destroyed) return;
@@ -839,6 +841,15 @@ export function createAddonServer({
         if (!response.writableEnded) {
           log("WARN", `BitChord disconnected while streaming "${track.title}".`);
           notifyTransfer(transfer);
+        }
+        transfer.consumers--;
+        if (transfer.consumers === 0 && !transfer.finished) {
+          transfer.idleTimer = setTimeout(() => {
+            if (transfer.consumers === 0 && !transfer.finished) {
+              transfer.cancel("No active HTTP consumers");
+            }
+          }, idleTransferTimeout);
+          transfer.idleTimer.unref();
         }
       });
       response.writeHead(partial ? 206 : 200, headers);
