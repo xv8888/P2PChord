@@ -125,7 +125,10 @@ def build_bitseekwin_environment(
     public_url: str,
     word_count: int = DEFAULT_SECRET_WORD_COUNT,
     word_length: int = DEFAULT_SECRET_WORD_LENGTH,
+    allow_downloads: bool = False,
 ) -> dict[str, str]:
+    if not isinstance(allow_downloads, bool):
+        raise ValueError("Allow downloads must be true or false.")
     env = base.copy()
     for key in ("SLSKD_API_KEY", "SLSKD_SLSK_USERNAME", "SLSKD_SLSK_PASSWORD"):
         env.pop(key, None)
@@ -138,6 +141,7 @@ def build_bitseekwin_environment(
             "PORT": str(PORT),
             "BITSEEKWIN_WORD_COUNT": str(word_count),
             "BITSEEKWIN_WORD_LENGTH": str(word_length),
+            "BITSEEKWIN_ALLOW_DOWNLOADS": str(allow_downloads).lower(),
         }
     )
     return env
@@ -263,11 +267,14 @@ class LauncherController:
         password = str(config.get("password", ""))
         public_text = str(config.get("public_url", ""))
         use_funnel = config.get("start_funnel") is True
+        allow_downloads = config.get("allow_downloads", False)
         word_count = config.get("word_count", DEFAULT_SECRET_WORD_COUNT)
         word_length = config.get("word_length", DEFAULT_SECRET_WORD_LENGTH)
 
         if not username or not password:
             raise ValueError("Enter your Soulseek username and password.")
+        if not isinstance(allow_downloads, bool):
+            raise ValueError("Allow downloads must be true or false.")
         if (
             isinstance(word_count, bool)
             or not isinstance(word_count, int)
@@ -312,6 +319,7 @@ class LauncherController:
                 password,
                 public_url,
                 use_funnel,
+                allow_downloads,
                 word_count,
                 word_length,
             ),
@@ -352,6 +360,7 @@ class LauncherController:
         password: str,
         public_url: str,
         use_funnel: bool,
+        allow_downloads: bool,
         word_count: int,
         word_length: int,
     ) -> None:
@@ -393,6 +402,7 @@ class LauncherController:
                 public_url,
                 word_count,
                 word_length,
+                allow_downloads,
             )
 
             if use_funnel:
@@ -502,14 +512,17 @@ _HTML = r"""<!doctype html>
 <style>
 :root{font-family:"Segoe UI",system-ui,sans-serif;color:#e8e9eb;background:#111315;font-synthesis:none;--panel:#191c1f;--field:#101214;--line:#30353a;--muted:#a2a8ad;--subtle:#7f878d;--accent:#70c8a0;--green:#70c8a0}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:#111315}
+body{margin:0;min-height:100vh;background:#111315;zoom:1.5}
 button,input{font:inherit}
 button{cursor:pointer}
 .app{min-height:100vh}
 aside,.topline,.hero,.section-title{display:none}
 main{width:min(760px,100%);padding:38px 24px;margin:0 auto}
 .simple-header{margin-bottom:22px}
-.simple-header h1{font-size:23px;letter-spacing:-.4px;margin:0 0 5px}
+.simple-header h1{font-size:23px;letter-spacing:-.8px;margin:0 0 5px;line-height:1}
+.brand-bit{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand-seek{background:linear-gradient(110deg,#9b8cff,#5148ff 60%,#3429e8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand-win{font-size:.62em;letter-spacing:-.6px;vertical-align:baseline}
 .simple-header p{margin:0;color:var(--muted);font-size:13px}
 .cards{display:block}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;margin-bottom:14px}
@@ -568,7 +581,7 @@ details.source-settings[open] summary::after{content:"−"}
 <body>
 <div class="app">
 <main>
-<header class="simple-header"><h1>BitSeekWin</h1><p>Connect Soulseek to BitChord · Build __VERSION__</p></header>
+<header class="simple-header"><h1><span class="brand-bit">Bit</span><span class="brand-seek">Seek</span><span class="brand-win">win</span></h1><p>Connect Soulseek to BitChord · Build __VERSION__</p></header>
 <section class="cards">
 <article class="card"><div class="card-title"><span class="step">01</span> DIRECT SOULSEEK CONNECTION</div>
 <div class="field"><label for="username">Soulseek username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
@@ -591,6 +604,8 @@ details.source-settings[open] summary::after{content:"−"}
 <p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p>
 </div>
 </details>
+<label class="check download-option"><input id="allowDownloads" type="checkbox"> Allow downloads in BitChord</label>
+<p class="hint">Off by default. When enabled, BitChord may offer downloads from this source.</p>
 <div class="actions"><button class="button primary" id="start">▶ &nbsp; Start listening</button><button class="button" id="stop" disabled>Stop</button></div>
 </article>
 </section>
@@ -608,7 +623,7 @@ function updatePhrasePreview(){const count=Number($("wordCount").value),length=N
 updatePhrasePreview();
 update();
 $("start").addEventListener("click",async()=>{
-  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked,word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
+  const config={username:$("username").value,password:$("password").value,public_url:$("publicUrl").value.trim(),start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
   try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");$("password").value="";$("username").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}

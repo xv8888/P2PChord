@@ -223,8 +223,9 @@ async function searchTrack() {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "alpha-0.4.2");
+  assert.equal(manifest.version, "alpha-0.4.3");
   assert.match(manifest.description, /directly from Soulseek peers/);
+  assert.equal(manifest.allowDownloads, false);
   const response = await fetch(`${base}/search?q=kick`);
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
@@ -234,6 +235,27 @@ test("manifest and search expose only safe FLAC results", async () => {
   assert.equal("duration" in body.tracks[0], false);
   assert.equal(client.lastSearch.req, "kick");
   assert.equal(client.lastSearch.timeout, 2000);
+});
+
+test("downloads can be explicitly enabled in the addon manifest", async () => {
+  const enabled = createAddonServer({
+    client,
+    secret: "test-secret",
+    slug: "bitseekwin",
+    publicBaseUrl: "https://music.example.test",
+    allowDownloads: true,
+  });
+  await new Promise((resolve) => enabled.server.listen(0, "127.0.0.1", resolve));
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${enabled.server.address().port}/bitseekwin/test-secret/manifest.json`,
+    );
+    const manifest = await response.json();
+    assert.equal(manifest.allowDownloads, true);
+  } finally {
+    enabled.server.closeAllConnections();
+    await new Promise((resolve) => enabled.server.close(resolve));
+  }
 });
 
 test("search ranks the closest FLAC candidates first", async () => {
@@ -288,13 +310,25 @@ test("search retries likely missing vowels after an accent-stripped query misses
   );
   const body = await response.json();
   assert.equal(response.status, 200);
-  assert.ok(queries.includes("bad bnd dmon yeat"));
-  assert.ok(queries.includes("bad bend demon yeat"));
+  assert.deepEqual(queries, ["bad bnd dmon yeat", "bad bend demon yeat"]);
   assert.equal(body.tracks.length, 1);
   assert.equal(body.tracks[0].title, "Bad Bend Demon");
   assert.ok(logEntries.some(({ message }) =>
-    message.includes("Spelling recovery returned results"),
+    message.includes('retrying with likely missing vowels as "bad bend demon yeat"'),
   ));
+});
+
+test("ordinary consonant pairs do not trigger spelling-recovery searches", async () => {
+  const queries = [];
+  client.search = async ({ req }) => {
+    queries.push(req);
+    return [];
+  };
+  const response = await fetch(
+    `${base}/search?q=${encodeURIComponent("forest yhapojj")}`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(queries, ["forest yhapojj"]);
 });
 
 test("track-numbered artist-title filenames expose matchable metadata", async () => {

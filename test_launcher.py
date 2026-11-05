@@ -61,9 +61,26 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["PORT"], "8080")
         self.assertEqual(env["BITSEEKWIN_WORD_COUNT"], "3")
         self.assertEqual(env["BITSEEKWIN_WORD_LENGTH"], "6")
+        self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "false")
         self.assertEqual(env["KEEP"], "yes")
         self.assertNotIn("SLSKD_API_KEY", env)
         self.assertNotIn("SLSKD_SLSK_PASSWORD", env)
+
+    def test_bitseekwin_download_permission_is_opt_in(self):
+        env = build_bitseekwin_environment(
+            {},
+            "user",
+            "password",
+            "secret",
+            "http://127.0.0.1:8080",
+            allow_downloads=True,
+        )
+        self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "true")
+        with self.assertRaisesRegex(ValueError, "Allow downloads"):
+            build_bitseekwin_environment(
+                {}, "user", "password", "secret", "http://127.0.0.1:8080",
+                allow_downloads="true",
+            )
 
     def test_source_secret_words_follow_selected_count_and_length(self):
         entropy = bytes(range(16))
@@ -145,6 +162,17 @@ class LauncherConfigurationTests(unittest.TestCase):
                     }
                 )
 
+    def test_start_rejects_non_boolean_download_option(self):
+        with self.assertRaisesRegex(ValueError, "Allow downloads"):
+            LauncherController().start(
+                {
+                    "username": "user",
+                    "password": "password",
+                    "public_url": "http://127.0.0.1:8080",
+                    "allow_downloads": "true",
+                }
+            )
+
     def test_dashboard_uses_browser_ui_and_describes_source_security(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
@@ -155,6 +183,13 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn("Target letters per word", page)
         self.assertIn('<details class="source-settings">', page)
         self.assertIn("<summary>Source URL settings</summary>", page)
+        self.assertIn('id="allowDownloads" type="checkbox"', page)
+        self.assertIn('allow_downloads:$("allowDownloads").checked', page)
+        self.assertNotIn('id="allowDownloads" type="checkbox" checked', page)
+        self.assertIn('<span class="brand-bit">Bit</span>', page)
+        self.assertIn('<span class="brand-seek">Seek</span>', page)
+        self.assertIn('<span class="brand-win">win</span>', page)
+        self.assertIn("zoom:1.5", page)
         self.assertIn("Math.max(3,length-3)", page)
         self.assertIn("Word lengths: \"+low+\"–\"+high+\" letters.", page)
         self.assertNotIn("sourceWords", page)

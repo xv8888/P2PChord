@@ -15,6 +15,10 @@ const SOURCE_WORDS = JSON.parse(
 );
 const DEFAULT_SECRET_WORD_COUNT = 3;
 const DEFAULT_SECRET_WORD_LENGTH = 6;
+const ALLOW_DOWNLOADS = readBooleanEnvironmentValue(
+  "BITSEEKWIN_ALLOW_DOWNLOADS",
+  false,
+);
 const SECRET_WORD_LENGTH_VARIANCE = 3;
 const SECRET_WORD_COUNT = readIntegerEnvironmentValue(
   "BITSEEKWIN_WORD_COUNT",
@@ -37,6 +41,7 @@ const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`
 ).replace(/\/+$/, "");
 const SEARCH_TIMEOUT = 2000;
+const LOGIN_TIMEOUT = 30000;
 const SEARCH_LIMIT = 50;
 const MAX_TRACKS = 1000;
 const MAX_ACTIVE_STREAMS = 2;
@@ -55,6 +60,14 @@ function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
     throw new RangeError(`${name} must be between ${minimum} and ${maximum}.`);
   }
   return value;
+}
+
+function readBooleanEnvironmentValue(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new TypeError(`${name} must be "true" or "false".`);
 }
 
 export function generateSourceSecret(
@@ -125,51 +138,31 @@ export function normalizeSearchQuery(value) {
 
 function insertMissingVowels(word) {
   const vowels = ["e", "a", "i", "o", "u"];
-  const variants = [];
   for (let index = 0; index < word.length - 1; index++) {
     if (!/[bcdfghjklmnpqrstvwxyz]/i.test(word[index]) ||
         !/[bcdfghjklmnpqrstvwxyz]/i.test(word[index + 1])) {
       continue;
     }
     for (const vowel of vowels) {
-      const variant = `${word.slice(0, index + 1)}${vowel}${word.slice(index + 1)}`;
-      if (!variants.includes(variant)) variants.push(variant);
+      return `${word.slice(0, index + 1)}${vowel}${word.slice(index + 1)}`;
     }
   }
-  return variants;
+  return null;
 }
 
-function searchRecoveryQueries(query, limit = 24) {
+function searchRecoveryQuery(query) {
   const words = query.split(" ");
-  const options = words.map((word) => [
-    word,
-    ...insertMissingVowels(word),
-  ]);
-  if (options.every((variants) => variants.length === 1)) return [];
+  const hasCompressedWord = words.some((word) =>
+    /[bcdfghjklmnpqrstvwxyz]{3}/i.test(word),
+  );
+  if (!hasCompressedWord) return null;
 
-  const combinations = [];
-  function collect(index, current, changed) {
-    if (combinations.length >= limit * 4) return;
-    if (index === options.length) {
-      if (changed > 0) combinations.push({ query: current.join(" "), changed });
-      return;
-    }
-    for (let variantIndex = 0; variantIndex < options[index].length; variantIndex++) {
-      current.push(options[index][variantIndex]);
-      collect(index + 1, current, changed + Number(variantIndex > 0));
-      current.pop();
-    }
-  }
-  collect(0, [], 0);
-
-  const bestGuess = words.map((word, index) => options[index][1] ?? word).join(" ");
-  return [
-    bestGuess,
-    ...combinations
-      .filter(({ query: candidate }) => candidate !== bestGuess)
-      .sort((left, right) => left.changed - right.changed)
-      .map(({ query: candidate }) => candidate),
-  ].slice(0, limit);
+  const recovered = words.map((word) => {
+    const likelyCompressed = /[bcdfghjklmnpqrstvwxyz]{3}/i.test(word) ||
+      /^[bcdfghjklmnpqrstvwxyz]{2}[aeiou][bcdfghjklmnpqrstvwxyz]$/i.test(word);
+    return likelyCompressed ? insertMissingVowels(word) ?? word : word;
+  }).join(" ");
+  return recovered === query ? null : recovered;
 }
 
 function normalizeName(value) {
@@ -343,9 +336,13 @@ export function createAddonServer({
   secret = SECRET,
   slug = SLUG,
   publicBaseUrl = PUBLIC_BASE_URL,
+  allowDownloads = ALLOW_DOWNLOADS,
   maxActiveStreams = MAX_ACTIVE_STREAMS,
   maxStreamBytes = MAX_STREAM_BYTES,
 }) {
+  if (typeof allowDownloads !== "boolean") {
+    throw new TypeError("allowDownloads must be true or false.");
+  }
   const tracks = new Map();
   const peerTransfers = new Map();
   let activeStreams = 0;
@@ -605,7 +602,7 @@ export function createAddonServer({
           resources: ["search", "stream"],
           types: ["track"],
           contentType: "music",
-          allowDownloads: false,
+          allowDownloads,
         },
         request.method === "HEAD",
       );
@@ -628,31 +625,16 @@ export function createAddonServer({
         log("SEARCH", `Searching Soulseek for "${query}".`);
         let results = await client.search({ req: query, timeout: SEARCH_TIMEOUT });
         if (results.length === 0) {
-          const recoveryQueries = searchRecoveryQueries(query);
-          if (recoveryQueries.length) {
+          const recoveryQuery = searchRecoveryQuery(query);
+          if (recoveryQuery) {
             log(
               "SEARCH",
-              `No exact results; retrying with likely missing vowels in "${query}".`,
+              `No exact results; retrying with likely missing vowels as "${recoveryQuery}".`,
             );
-            const recovered = await Promise.all(
-              recoveryQueries.map(async (candidate) => ({
-                query: candidate,
-                results: await client.search({
-                  req: candidate,
-                  timeout: SEARCH_TIMEOUT,
-                }),
-              })),
-            );
-            results = recovered.flatMap(({ results: matches }) => matches);
-            const matchedQueries = recovered
-              .filter(({ results: matches }) => matches.length > 0)
-              .map(({ query: candidate }) => candidate);
-            if (matchedQueries.length) {
-              log(
-                "SEARCH",
-                `Spelling recovery returned results for: ${matchedQueries.slice(0, 3).join("; ")}.`,
-              );
-            }
+            results = await client.search({
+              req: recoveryQuery,
+              timeout: SEARCH_TIMEOUT,
+            });
           }
         }
         const candidates = [];
@@ -904,7 +886,7 @@ async function main() {
   }
 
   const client = new SlskClient({
-    timeout: 10000,
+    timeout: LOGIN_TIMEOUT,
     transferTimeout: 30000,
     downloadTimeout: STREAM_TIMEOUT,
     uploads: false,
@@ -932,7 +914,7 @@ async function main() {
   try {
     await client.login(username, password);
     defaultLogger("INFO", "Connected to Soulseek.");
-    ({ server } = createAddonServer({ client }));
+    ({ server } = createAddonServer({ client, allowDownloads: ALLOW_DOWNLOADS }));
     await new Promise((resolve, reject) => {
       server.once("error", reject);
       server.listen(PORT, "0.0.0.0", resolve);
