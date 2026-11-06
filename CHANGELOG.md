@@ -3,7 +3,7 @@
 Notable changes are recorded here. Historical entries summarize changes
 available in the project history and prior session records.
 
-## Unreleased
+## alpha-0.5.5
 
 - Added an explicit LAN source mode that detects a private IPv4 address, uses
   that reachable base URL, and authenticates with the readable adjective/noun

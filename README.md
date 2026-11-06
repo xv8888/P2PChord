@@ -23,7 +23,7 @@ See [docs/COMPATIBILITY_AND_ROADMAP.md](./docs/COMPATIBILITY_AND_ROADMAP.md) for
 
 See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
-> **Version `alpha-0.5.2`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
+> **Version `alpha-0.5.5`.** This is an early alpha prototype; expect bugs, breaking changes, and incomplete behavior.
 
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 

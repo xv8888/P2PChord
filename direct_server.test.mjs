@@ -325,7 +325,7 @@ async function searchTracks(query = "kick") {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "alpha-0.5.2");
+  assert.equal(manifest.version, "alpha-0.5.5");
   assert.match(manifest.description, /directly from Soulseek peers/);
   assert.equal(manifest.allowDownloads, false);
   assert.equal("bitchordAuth" in manifest, false);
