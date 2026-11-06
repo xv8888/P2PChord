@@ -206,9 +206,12 @@ def build_bitseekwin_environment(
     cache_max_size_mb: int = DEFAULT_CACHE_MAX_SIZE_MB,
     max_active_streams: int = DEFAULT_MAX_ACTIVE_STREAMS,
     max_stream_size_mb: int = DEFAULT_MAX_STREAM_SIZE_MB,
+    bitchord_auth: bool = False,
 ) -> dict[str, str]:
     if not isinstance(allow_downloads, bool):
         raise ValueError("Allow downloads must be true or false.")
+    if not isinstance(bitchord_auth, bool):
+        raise ValueError("BitChord authentication must be true or false.")
     if source_selection not in SOURCE_SELECTION_MODES:
         raise ValueError("Source selection must be 'match' or 'speed'.")
     if not isinstance(search_recovery, bool):
@@ -247,6 +250,7 @@ def build_bitseekwin_environment(
             "BITSEEKWIN_WORD_COUNT": str(word_count),
             "BITSEEKWIN_WORD_LENGTH": str(word_length),
             "BITSEEKWIN_ALLOW_DOWNLOADS": str(allow_downloads).lower(),
+            "BITSEEKWIN_BITCHORD_AUTH": str(bitchord_auth).lower(),
             "BITSEEKWIN_SOURCE_SELECTION": source_selection,
             "BITSEEKWIN_SEARCH_LIMIT": str(search_limit),
             "BITSEEKWIN_SEARCH_TIMEOUT_MS": str(search_timeout_ms),
@@ -385,6 +389,7 @@ class LauncherController:
         use_funnel = config.get("start_funnel") is True
         lan_access = config.get("lan_access", False)
         allow_downloads = config.get("allow_downloads", False)
+        bitchord_auth = config.get("bitchord_auth", False)
         source_selection = config.get("source_selection", DEFAULT_SOURCE_SELECTION)
         search_limit = _validate_integer_setting(
             config.get("search_limit", DEFAULT_SEARCH_LIMIT),
@@ -434,6 +439,8 @@ class LauncherController:
             raise ValueError("LAN access must be true or false.")
         if not isinstance(allow_downloads, bool):
             raise ValueError("Allow downloads must be true or false.")
+        if not isinstance(bitchord_auth, bool):
+            raise ValueError("BitChord authentication must be true or false.")
         if source_selection not in SOURCE_SELECTION_MODES:
             raise ValueError("Source selection must be 'match' or 'speed'.")
         if not isinstance(search_recovery, bool):
@@ -456,7 +463,6 @@ class LauncherController:
                 f"Word length must be between {MIN_SECRET_WORD_LENGTH} and "
                 f"{MAX_SECRET_WORD_LENGTH}."
             )
-        node = find_node_runtime()
         if lan_access:
             lan_ip = detect_lan_ip()
             if not lan_ip:
@@ -466,10 +472,24 @@ class LauncherController:
             public_url = f"http://{lan_ip}:{PORT}"
         else:
             public_url = normalize_public_url(public_text)
+        if bitchord_auth:
+            parsed_url = urlsplit(public_url)
+            host = parsed_url.hostname or ""
+            try:
+                loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = host.endswith(".localhost")
+            if parsed_url.scheme != "https" and not (
+                parsed_url.scheme == "http" and loopback
+            ):
+                raise ValueError(
+                    "BitChord authentication requires HTTPS, except for localhost."
+                )
         if use_funnel and not public_url.startswith("https://"):
             raise ValueError("Tailscale Funnel requires an https:// public URL.")
         if use_funnel and not self.tailscale:
             raise ValueError("Tailscale was not found. Install it or turn off Funnel.")
+        node = find_node_runtime()
 
         with self.lock:
             if self.starting or self._any_process_running():
@@ -484,6 +504,7 @@ class LauncherController:
             self.logs.clear()
         server_settings = {
             "allow_downloads": allow_downloads,
+            "bitchord_auth": bitchord_auth,
             "source_selection": source_selection,
             "search_limit": search_limit,
             "search_timeout_ms": search_timeout_ms,
@@ -992,6 +1013,7 @@ button{cursor:pointer}
           <div class="field"><label class="slider-label" for="wordLength">Target letters per word <output id="wordLengthValue" class="slider-value">6</output></label><input class="slider" id="wordLength" type="range" min="3" max="9" value="6"></div>
           <div class="field full"><p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. Non-LAN source URLs also include a separate random 128-bit bearer token.</p><p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p></div>
           <div class="field full"><label class="check"><input id="allowDownloads" type="checkbox">Allow downloads in BitChord</label><p class="hint">Off by default. When enabled, BitChord may offer downloads from this source.</p></div>
+          <div class="field full"><label class="check"><input id="bitchordAuth" type="checkbox">Require BitChord 1.9.1 signed authentication</label><p class="hint">Optional and off by default. Requires HTTPS except on localhost; older BitChord clients cannot use this mode.</p></div>
           <div class="field full"><label for="sourceSelection">Source selection</label><select id="sourceSelection"><option value="match">Best filename match (recommended)</option><option value="speed">Highest reported upload speed</option></select><p class="hint">Fastest-speed mode returns only the peer reporting the highest upload speed, even when another result may be a closer match. Peer speeds are self-reported.</p></div>
         </div>
       </section>
@@ -1059,7 +1081,7 @@ $("start").addEventListener("click",async()=>{
   const numericSettings=["searchLimit","searchTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize"];
   const invalidSetting=numericSettings.map(id=>$(id)).find(input=>!input.checkValidity());
   if(invalidSetting){invalidSetting.reportValidity();return;}
-  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
+  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,bitchord_auth:$("bitchordAuth").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
   try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("logs").textContent="Connecting directly to Soulseek…";}
   catch(e){$("start").disabled=false;alert(e.message);}

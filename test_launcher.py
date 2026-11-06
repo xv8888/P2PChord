@@ -100,6 +100,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["BITSEEKWIN_WORD_COUNT"], "3")
         self.assertEqual(env["BITSEEKWIN_WORD_LENGTH"], "6")
         self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "false")
+        self.assertEqual(env["BITSEEKWIN_BITCHORD_AUTH"], "false")
         self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "match")
         self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "50")
         self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "2000")
@@ -128,6 +129,45 @@ class LauncherConfigurationTests(unittest.TestCase):
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 allow_downloads="true",
             )
+
+    def test_bitchord_auth_is_opt_in_and_requires_https_except_loopback(self):
+        env = build_bitseekwin_environment(
+            {},
+            "user",
+            "password",
+            "secret",
+            "https://device.example.test",
+            bitchord_auth=True,
+        )
+        self.assertEqual(env["BITSEEKWIN_BITCHORD_AUTH"], "true")
+        with self.assertRaisesRegex(ValueError, "BitChord authentication"):
+            build_bitseekwin_environment(
+                {}, "user", "password", "secret", "https://device.example.test",
+                bitchord_auth="true",
+            )
+        with self.assertRaisesRegex(ValueError, "BitChord authentication"):
+            LauncherController().start(
+                {
+                    "username": "user",
+                    "password": "password",
+                    "public_url": "http://192.168.1.42:8080",
+                    "bitchord_auth": True,
+                }
+            )
+
+    def test_launcher_passes_bitchord_auth_setting_to_worker(self):
+        settings = {
+            "username": "user",
+            "password": "password",
+            "public_url": "https://device.example.test",
+            "bitchord_auth": True,
+        }
+        with patch("launcher.find_node_runtime", return_value="node"), patch(
+            "launcher.threading.Thread"
+        ) as worker_thread:
+            LauncherController().start(settings)
+
+        self.assertTrue(worker_thread.call_args.kwargs["args"][5]["bitchord_auth"])
 
     def test_source_selection_is_configurable_and_validated(self):
         env = build_bitseekwin_environment(
@@ -197,6 +237,7 @@ class LauncherConfigurationTests(unittest.TestCase):
             "password": "password",
             "public_url": "http://127.0.0.1:8080",
             "allow_downloads": True,
+            "bitchord_auth": True,
             "source_selection": "speed",
             "search_limit": 12,
             "search_timeout_ms": 5000,
@@ -401,6 +442,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn("Adjectives come first, then one noun", page)
         self.assertIn("random 128-bit bearer token", page)
         self.assertIn("another device on this LAN", page)
+        self.assertIn('id="bitchordAuth" type="checkbox"', page)
         self.assertIn("192.168.1.42", _page(
             "test-token", "https://device.example.ts.net", "192.168.1.42"
         ).decode("utf-8"))

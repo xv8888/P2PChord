@@ -1,5 +1,12 @@
-import { createHash, randomUUID, timingSafeEqual, randomBytes } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomUUID,
+  timingSafeEqual,
+  randomBytes,
+} from "node:crypto";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
@@ -7,6 +14,7 @@ import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { FileAttribute, SlskClient } from "slsk-client";
+import { createBitChordAuth } from "./bitchord_auth.mjs";
 import { StreamCache } from "./stream_cache.mjs";
 
 const APP_NAME = "BitSeekWin - BitChord-Soulseek Integration";
@@ -19,6 +27,10 @@ const DEFAULT_SECRET_WORD_COUNT = 3;
 const DEFAULT_SECRET_WORD_LENGTH = 6;
 const ALLOW_DOWNLOADS = readBooleanEnvironmentValue(
   "BITSEEKWIN_ALLOW_DOWNLOADS",
+  false,
+);
+const BITCHORD_AUTH_ENABLED = readBooleanEnvironmentValue(
+  "BITSEEKWIN_BITCHORD_AUTH",
   false,
 );
 const SECRET_WORD_LENGTH_VARIANCE = 3;
@@ -75,6 +87,7 @@ const MAX_STREAM_BYTES = readIntegerEnvironmentValue(
   128 * 1024 * 1024,
 );
 const STREAM_TIMEOUT = 15 * 60 * 1000;
+const SIGNED_MEDIA_URL_TTL_SECONDS = 15 * 60;
 const FIRST_BYTE_TIMEOUT = readIntegerEnvironmentValue(
   "BITSEEKWIN_FIRST_BYTE_TIMEOUT_MS",
   30 * 1000,
@@ -403,6 +416,8 @@ export function createAddonServer({
   secret = SECRET,
   slug = SLUG,
   publicBaseUrl = PUBLIC_BASE_URL,
+  requireBitChordAuth = BITCHORD_AUTH_ENABLED,
+  bitChordAuthOptions,
   allowDownloads = ALLOW_DOWNLOADS,
   sourceSelection = SOURCE_SELECTION,
   searchLimit = SEARCH_LIMIT,
@@ -422,6 +437,34 @@ export function createAddonServer({
   writeBatchBytes,
   writeBatchDelayMs,
 }) {
+  if (typeof requireBitChordAuth !== "boolean") {
+    throw new TypeError("requireBitChordAuth must be true or false.");
+  }
+  const parsedPublicBaseUrl = new URL(publicBaseUrl);
+  const publicHost = parsedPublicBaseUrl.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  const loopback =
+    publicHost === "localhost" ||
+    publicHost.endsWith(".localhost") ||
+    publicHost === "::1" ||
+    (isIP(publicHost) === 4 && publicHost.split(".")[0] === "127");
+  if (
+    requireBitChordAuth &&
+    parsedPublicBaseUrl.protocol !== "https:" &&
+    !(parsedPublicBaseUrl.protocol === "http:" && loopback)
+  ) {
+    throw new TypeError(
+      "BitChord authentication requires HTTPS, except for loopback development URLs.",
+    );
+  }
+  const bitChordAuth = requireBitChordAuth
+    ? createBitChordAuth({
+        hosts: [publicHost],
+        ...bitChordAuthOptions,
+      })
+    : null;
+  const mediaSigningKey = randomBytes(32);
   if (typeof allowDownloads !== "boolean") {
     throw new TypeError("allowDownloads must be true or false.");
   }
@@ -552,6 +595,33 @@ export function createAddonServer({
     return { track, searchRequestIds: [...state.searchRequestIds] };
   }
 
+  function signMediaUrl(trackId) {
+    const expires = Math.floor(Date.now() / 1000) + SIGNED_MEDIA_URL_TTL_SECONDS;
+    const signature = createHmac("sha256", mediaSigningKey)
+      .update(`${trackId}.${expires}`)
+      .digest("base64url");
+    return `?expires=${expires}&signature=${signature}`;
+  }
+
+  function validMediaSignature(trackId, url) {
+    if (!requireBitChordAuth) return true;
+    const expires = Number(url.searchParams.get("expires"));
+    const signature = url.searchParams.get("signature") ?? "";
+    if (
+      !Number.isSafeInteger(expires) ||
+      expires < Math.floor(Date.now() / 1000) ||
+      expires > Math.floor(Date.now() / 1000) + SIGNED_MEDIA_URL_TTL_SECONDS ||
+      !/^[A-Za-z0-9_-]{43}$/.test(signature)
+    ) {
+      return false;
+    }
+    const expected = createHmac("sha256", mediaSigningKey)
+      .update(`${trackId}.${expires}`)
+      .digest();
+    const received = Buffer.from(signature, "base64url");
+    return received.length === expected.length && timingSafeEqual(received, expected);
+  }
+
   const streamCache = new StreamCache({
     client,
     logger: log,
@@ -582,7 +652,8 @@ export function createAddonServer({
     if (request.method === "OPTIONS") {
       response.writeHead(204, {
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "Range, If-Range, Content-Type",
+        "Access-Control-Allow-Headers":
+          "Range, If-Range, Content-Type, X-BitChord-Token, X-BitChord-Proof",
         "Access-Control-Max-Age": "86400",
       });
       response.end();
@@ -615,6 +686,20 @@ export function createAddonServer({
     }
     const route = segments.slice(2);
 
+    if (
+      bitChordAuth &&
+      request.method === "GET" &&
+      (route[0] === "search" || route[0] === "stream")
+    ) {
+      const result = await bitChordAuth.verifyRequest(request);
+      if (!result.ok) {
+        const denied = bitChordAuth.rejection(result);
+        response.writeHead(denied.status, denied.headers);
+        response.end(denied.body);
+        return;
+      }
+    }
+
     if (route.length === 1 && route[0] === "monitoring" && request.method === "GET") {
       try {
         sendJson(response, 200, {
@@ -642,6 +727,7 @@ export function createAddonServer({
           types: ["track"],
           contentType: "music",
           allowDownloads,
+          ...(requireBitChordAuth ? { bitchordAuth: true } : {}),
         },
         request.method === "HEAD",
       );
@@ -816,7 +902,9 @@ export function createAddonServer({
           `searchRequests=${searchRequestIds.join(",")}; file="${track.file}" peer=${track.user}; HTTP 200.`,
       );
       sendJson(response, 200, {
-        url: `${publicBaseUrl}/${slug}/${secret}/file/${encodeURIComponent(track.id)}`,
+        url:
+          `${publicBaseUrl}/${slug}/${secret}/file/${encodeURIComponent(track.id)}` +
+          (requireBitChordAuth ? signMediaUrl(track.id) : ""),
         format: "flac",
         quality: "lossless",
         audioQuality: "LOSSLESS",
@@ -831,6 +919,10 @@ export function createAddonServer({
     if (route.length === 2 && route[0] === "file") {
       const requestId = randomUUID();
       const resultId = route[1];
+      if (!validMediaSignature(resultId, url)) {
+        sendError(response, 403, "Media URL is invalid or expired; resolve the stream again");
+        return;
+      }
       const rangeHeader = request.headers.range ?? "";
       log(
         "STREAM",

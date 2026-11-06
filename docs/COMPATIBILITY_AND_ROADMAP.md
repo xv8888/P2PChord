@@ -1,9 +1,9 @@
 # Compatibility and roadmap
 
-This document records inspected BitChord compatibility facts and proposes
-future work. Proposed features below are not implemented. The findings describe
-the specific source snapshot and published documentation cited here; they do
-not establish the protocol used by every installed BitChord client.
+This document records inspected BitChord compatibility facts and future work.
+The findings describe the specific source snapshot and published documentation
+cited here; they do not establish the protocol used by every installed
+BitChord client.
 
 ## Current compatibility findings
 
@@ -13,8 +13,15 @@ not establish the protocol used by every installed BitChord client.
   commit [`b690dc146009d4815825fa4a20815ef2e4ee8898`](https://github.com/kushagrasinghx/BitChord/blob/b690dc146009d4815825fa4a20815ef2e4ee8898/build.gradle.kts).
 - That source snapshot did not contain the newer signed add-on request-proof
   mechanism.
+- BitChord **1.9.1**, version code **39**, was released at commit
+  [`acf219a7e4a7f52f026d4336d5c7ac5cf7bfafcc`](https://github.com/kushagrasinghx/BitChord/blob/acf219a7e4a7f52f026d4336d5c7ac5cf7bfafcc/build.gradle.kts).
 - The [published BitChord add-on documentation](https://bitchord.kushagrasingh.in/docs)
-  describes mandatory add-on authentication beginning with BitChord **1.9.1**.
+  describes the new authentication as **optional** in 1.9.1, not mandatory for
+  every add-on. An add-on opts in with `bitchordAuth: true`; add-ons that do not
+  opt in continue to work, though BitChord displays an “Outdated addon” notice.
+- The inspected [1.9.1 add-on client](https://github.com/kushagrasinghx/BitChord/blob/acf219a7e4a7f52f026d4336d5c7ac5cf7bfafcc/app/src/main/java/com/music/bitchord/data/sources/addon/AddonClient.kt)
+  enables proof requests when the manifest declares `bitchordAuth`, or when a
+  server challenges with `401` and `WWW-Authenticate: BitChord`.
 - BitChord publishes a [Node request verifier](https://bitchord.kushagrasingh.in/addon-auth/bitchord-addon-auth.mjs)
   for that mechanism.
 
@@ -25,18 +32,19 @@ confirmed separately, and live add-on testing is still needed.
 ### BitSeekWin today
 
 BitSeekWin serves a JSON manifest with `resources: ["search", "stream"]` and
-the optional `allowDownloads` flag. It does **not** declare
-`bitchordAuth: true`. Its HTTP handler checks a secret in the URL path before
-dispatching the manifest, search, stream-descriptor, file, and monitoring
-routes. That path secret is BitSeekWin's own bearer-style credential; it is
-not BitChord's signed request proof. The server does not validate
-`X-BitChord-Token` or `X-BitChord-Proof`.
+the optional `allowDownloads` flag. Signed request authentication is now an
+explicit, default-off setting. When enabled, the manifest declares
+`bitchordAuth: true`; `/search` and `/stream` validate `X-BitChord-Token` and
+`X-BitChord-Proof` against BitChord's published protocol. The manifest remains
+accessible without a proof, while the existing secret URL path remains
+required in both modes.
 
-The stream descriptor returns a direct `/file/{id}` URL carrying the same
-path-secret credential. The file route supports byte ranges and feeds the
-existing persistent cache and transfer lifecycle. `PUBLIC_BASE_URL` can name
-an HTTPS address when deployed behind HTTPS termination, but the server itself
-does not provide TLS.
+In signed-auth mode, stream descriptors return `/file/{id}` URLs protected by
+a 15-minute HMAC signature as well as the existing path secret. File requests
+do not require BitChord proof headers and continue to support byte ranges and
+the existing persistent cache and transfer lifecycle. The launcher permits
+signed auth only over HTTPS, except for loopback development addresses. The
+server itself does not provide TLS.
 
 ### Compatibility implications
 
@@ -44,49 +52,56 @@ does not provide TLS.
   so the newer proof requirement is not indicated by that source snapshot.
   Whether a particular 1.9.0 build can reach a BitSeekWin URL still depends on
   network reachability, URL configuration, and Android cleartext policy.
-- **Documented 1.9.1+ behavior:** The current BitChord documentation says a
-  manifest without `bitchordAuth: true` is out of date and cannot be used for
-  search, streaming, or downloads. BitSeekWin does not currently meet that
-  documented requirement. A client following it can therefore accept or
-  display a source but refuse to use it; this must be verified against actual
-  releases.
-- **HTTPS:** The published proof protocol is documented for HTTPS. BitSeekWin's
-  plain-HTTP LAN URL cannot satisfy that transport requirement. The inspected
-  Android release manifest also sets `android:usesCleartextTraffic="false"`,
-  so plain HTTP may be blocked client-side even before add-on proof validation.
-  An HTTPS `PUBLIC_BASE_URL` requires a reachable TLS endpoint and a certificate
-  trusted by the device.
-- **Media requests:** BitSeekWin's current media URL uses its path secret,
-  not a short-lived signature. The published verifier is for add-on API
-  requests. The BitChord auth documentation recommends a separate signed,
-  expiring media URL for media fetches rather than requiring proof headers on
-  those requests.
+- **Inspected 1.9.1 behavior:** The legacy mode remains compatible with the
+  documented behavior for non-opted-in add-ons, which work without proof
+  headers but receive an “Outdated addon” notice. Opt-in mode is intended for
+  1.9.1+ clients; older clients cannot provide the required proof.
+- **HTTPS:** When an add-on opts into proof authentication, BitChord sends
+  proof headers only over HTTPS, except for loopback development addresses.
+  BitSeekWin's plain-HTTP LAN URL cannot use that opt-in mode. Independently,
+  the inspected Android release manifest sets
+  `android:usesCleartextTraffic="false"`, so a plain-HTTP LAN URL may be blocked
+  client-side even when the add-on stays in legacy mode. An HTTPS
+  `PUBLIC_BASE_URL` requires a reachable TLS endpoint and a certificate trusted
+  by the device.
+- **Media requests:** Opt-in mode uses expiring HMAC-signed media URLs because
+  the player fetches media without proof headers. Legacy mode keeps the
+  existing path-secret-only URLs.
 
 ### Verified versus unverified
 
 **Verified by source inspection:** the cited BitChord version values, absence
-of the new proof mechanism in that snapshot, current BitSeekWin manifest and
-path-secret checks, lack of request-proof verification, ranged `/file` route,
-and the cited Android cleartext setting.
+of the new proof mechanism in 1.9.0, the optional-auth behavior and request
+challenge handling in the inspected 1.9.1 source, and the cited Android
+cleartext setting.
+
+**Verified by automated tests:** BitSeekWin's legacy and opt-in paths,
+generated-token/proof verification, signed media URL checks, and ranged
+`/file` delivery.
 
 **Requires release/device testing:** which protocol a user's installed
 BitChord build enforces; whether it can register, search, resolve, play,
 download, and seek against the current BitSeekWin deployment; and whether a
 given HTTPS/LAN setup is reachable and trusted. Do not infer universal client
-compatibility from the inspected source version or published documentation
-alone.
+compatibility from synthetic protocol tests or the inspected source version
+and published documentation alone. The official verifier artifact is not
+vendored; BitSeekWin implements its published protocol independently.
 
 ## Known Limitations
 
-- BitSeekWin has no BitChord signed request-proof verification and does not
-  advertise `bitchordAuth`.
+- BitChord signed request authentication is optional and disabled by default.
+  Legacy mode continues to receive an “Outdated addon” notice in the inspected
+  BitChord 1.9.1 client. Opt-in mode has not yet been validated against a live
+  BitChord release/device.
 - The existing URL-path secret and the newer BitChord proof are separate
   mechanisms. The path secret does not establish that a request came from the
   official BitChord app.
-- The Node server does not terminate TLS. LAN HTTP is not an Android-compatible
-  substitute for HTTPS under the inspected release configuration.
-- Stream and file URLs currently use the stable path secret; they are not
-  short-lived signed media URLs.
+- The Node server does not terminate TLS. Proof-authenticated add-ons require
+  HTTPS for non-loopback URLs, and LAN HTTP may independently be blocked by
+  the inspected Android release cleartext policy.
+- In opt-in mode media URLs expire after 15 minutes. Resolve the stream again
+  to obtain a new URL after expiry. Legacy URLs continue to use only the path
+  secret.
 - Compatibility with installed BitChord versions, including actual playback,
   download, and range-seek behavior, has not been validated end to end across
   old and new clients.
@@ -95,66 +110,63 @@ alone.
 
 ## Compatibility and Migration Risks
 
-1. **Do not advertise support prematurely.** Add `bitchordAuth: true` only
-   after request-proof validation is implemented and tested. Advertising it
-   without verification would claim a security property BitSeekWin does not
-   provide.
+1. **Opt-in carefully.** BitSeekWin advertises `bitchordAuth: true` only when
+   proof verification is enabled. This mode is a security choice; BitChord
+   1.9.1 does not require every add-on to opt in.
 2. **Preserve the current path-secret mechanism during migration.** Removing
    it outright could break existing URLs, launcher workflows, and clients
-   using current behavior. A staged, opt-in mode and log-only validation phase
-   are safer than an immediate enforcement change.
-3. **Older clients may not send proof.** Investigate whether a narrowly scoped
-   compatibility mode can serve older clients without weakening the strict
-   mode. Do not assume old and new clients can safely share one strict endpoint
-   until tested.
-4. **Media authorization is a separate boundary.** If the API routes require
-   signed proof but the returned file URL does not, the media route still needs
-   an intentional authorization scheme. Short-lived signatures must permit
-   the multiple range requests used for seeking, without expiring mid-playback
-   or disrupting an active transfer.
-5. **Transport migration changes deployment requirements.** New proof requests
-   require HTTPS according to the published documentation. LAN users need a
-   reachable TLS endpoint with a device-trusted certificate, or a separately
-   reviewed BitChord-side, narrowly scoped transport change.
+   using current behavior. Since the new feature is opt-in, BitSeekWin can
+   remain in legacy mode while its value and migration are evaluated.
+3. **Opt-in changes client compatibility.** BitChord 1.9.0 and older clients
+   do not implement this proof protocol. If BitSeekWin starts requiring proof
+   on its existing endpoint, those clients will not be able to use it. Do not
+   assume a protected and legacy mode can safely share one endpoint until
+   tested.
+4. **Media authorization is a separate boundary.** Opt-in mode uses
+   15-minute signed media URLs and preserves repeated range requests while the
+   URL is valid. Test long playback and seeking with actual clients; after the
+   URL expires, BitChord must resolve the stream again.
+5. **Transport changes apply when opting in.** Proof-authenticated requests
+   require HTTPS outside loopback according to the inspected 1.9.1 client. LAN
+   users need a reachable TLS endpoint with a device-trusted certificate, or
+   a separately reviewed BitChord-side, narrowly scoped cleartext exception
+   for legacy mode.
 6. **Streaming behavior must remain stable.** Authentication changes must
    preserve existing HTTP range handling, seeking, persistent caching,
    resumable transfers, and independent cancellation for concurrent tracks.
-7. **No universal backward-compatibility claim is established.** Test the
-   current legacy path and any proposed strict/compatibility modes with real
-   supported BitChord versions before documenting them as interoperable.
+7. **No live compatibility claim is established.** The 1.9.1 source indicates
+   legacy add-ons remain usable, but test the current path and any opt-in
+   protected mode with real supported BitChord versions before documenting
+   them as interoperable.
 
-## Future authentication migration (planned)
+## Optional authentication implementation status
 
-1. Inspect and integrate BitChord's
-   [published Node authentication verifier](https://bitchord.kushagrasingh.in/addon-auth/bitchord-addon-auth.mjs),
-   following its current specification rather than reimplementing from memory.
-2. Verify signed request proofs on the appropriate add-on API routes. Keep the
-   manifest's proof handling consistent with BitChord's current published
-   instructions.
-3. Do not advertise `bitchordAuth: true` until verification is implemented,
-   covered by tests, and validated with a current BitChord client.
-4. Retain the existing path-secret authentication during a carefully managed
-   migration; avoid breaking current working clients without a tested rollout.
-5. Investigate a compatibility mode for older BitChord clients. Define its
-   trust and exposure boundaries before implementation.
-6. Introduce short-lived signed media URLs for stream/file delivery, with
-   explicit expiry and signature validation.
-7. Preserve byte-range requests, seeking, cache behavior, partial-download
-   resume, and independent transfer cancellation.
-8. Test source registration, search, stream resolution, playback, downloads,
-   and repeated/ranged requests on both older and newer BitChord clients.
-9. Document any unavoidable backward-compatibility limitations and migration
-   steps for users.
+The launcher and server now provide a default-off opt-in. The server verifies
+the published JWT and device-signed proof format for `/search` and `/stream`,
+returns BitChord-compatible `WWW-Authenticate` errors, and only advertises
+`bitchordAuth: true` when enabled. The existing path secret remains required.
+Opt-in media URLs carry an expiring HMAC signature; range handling and the
+existing transfer/cache lifecycle are unchanged. The launcher blocks opt-in
+for non-loopback HTTP addresses. Protocol tests use generated test keys and a
+mock JWKS endpoint; they do not prove live BitChord interoperability.
 
-This plan does not assume old and new clients can share one strict
-authentication endpoint; that design must be tested before it is promised.
+Remaining work:
+
+1. Test source registration, search, stream resolution, playback, downloads,
+   and repeated/ranged requests on BitChord 1.9.0 and 1.9.1+ clients.
+2. Verify JWKS key rotation and authentication behavior against the live
+   published service, and document any unavoidable migration limitations.
+3. Keep the existing path-secret mode as the default. Clients older than
+   1.9.1 cannot use the opt-in protected endpoint.
 
 ## Android LAN transport
 
-The inspected BitChord Android release manifest sets
-`android:usesCleartextTraffic="false"`. Advertising the Windows PC's reachable
-LAN IP instead of `127.0.0.1` is necessary for another device to reach the
-server, but it does not independently permit HTTP in BitChord.
+The inspected BitChord 1.9.1 Android release manifest sets
+[`android:usesCleartextTraffic="false"`](https://github.com/kushagrasinghx/BitChord/blob/acf219a7e4a7f52f026d4336d5c7ac5cf7bfafcc/app/src/main/AndroidManifest.xml).
+Advertising the Windows PC's reachable LAN IP instead of `127.0.0.1` is
+necessary for another device to reach the server, but it does not independently
+permit HTTP in BitChord. This restriction is separate from opting into add-on
+proof authentication.
 
 Plain-HTTP LAN access may require a narrowly scoped BitChord-side security
 configuration for a user-approved LAN destination. Do not globally disable
@@ -186,8 +198,9 @@ engine.
 ### Priority 1 — Compatibility
 
 - Confirm the exact BitChord versions currently used by existing users.
-- Test current BitSeekWin against those versions.
-- Implement the newer authentication protocol when necessary.
+- Test BitSeekWin's current legacy mode with BitChord 1.9.0 and 1.9.1+.
+- Keep authentication opt-in and test both legacy mode and the protected mode
+  against the exact BitChord versions in use.
 - Preserve existing working clients and streaming behavior during migration.
 
 ### Priority 2 — Reliability and performance

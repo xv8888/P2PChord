@@ -22,6 +22,13 @@ available in the project history and prior session records.
   connection inactivity. Nonresponsive/stalled transfers now fail promptly
   while retaining already-persisted partial data; the existing 15-minute
   overall transfer limit and two-transfer maximum are unchanged.
+- Clarified that BitChord 1.9.1 introduces optional add-on proof
+  authentication; legacy add-ons continue to work but are labeled outdated.
+- Added opt-in BitChord signed request verification for search and stream
+  resolution. The manifest advertises `bitchordAuth` only when enabled; media
+  URLs then use a 15-minute HMAC signature while retaining range support.
+  The launcher leaves this mode off by default and requires HTTPS except for
+  loopback addresses.
 
 ## alpha-0.5.2
 

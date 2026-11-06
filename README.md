@@ -56,7 +56,7 @@ python .\launcher.py
 1. Enter your Soulseek username and password. The password field is masked.
 2. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`. To connect from another device on the same LAN, use **Use LAN address** in Source.
 3. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
-4. Optionally open **Source URL settings** to adjust the public address, Funnel, and source URL word settings. The **Allow downloads in BitChord** option is separate and off by default. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
+4. Optionally open **Source URL settings** to adjust the public address, Funnel, and source URL word settings. **Allow downloads in BitChord** and **Require BitChord 1.9.1 signed authentication** are separate opt-ins and off by default. Signed authentication requires HTTPS except on localhost and is incompatible with BitChord clients older than 1.9.1. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
 5. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
 The launcher starts BitSeekWin, logs in to Soulseek, and displays the BitChord source URL in the Activity panel above the login form. The live activity console shows searches, peer transfer status, and streaming progress. If it shows repeated searches but no stream activity, BitChord is still checking candidates and has not accepted a FLAC match yet. Click **Copy source URL**, then add it in BitChord under **Sources → Add addon**. Credentials are sent only to the local launcher and child-process environment; they are not saved to a settings file. Stop with **Stop**, or use **Exit launcher** to disconnect and close the dashboard.
@@ -105,6 +105,9 @@ $env:SOULSEEK_PASSWORD = 'YOUR_SOULSEEK_PASSWORD'
 $env:PUBLIC_BASE_URL = 'http://127.0.0.1:8080'
 # Optional: enable BitChord's download action for this source (off by default).
 # $env:BITSEEKWIN_ALLOW_DOWNLOADS = 'true'
+# Optional: require BitChord 1.9.1 signed request authentication (off by default).
+# Requires HTTPS except for localhost; older clients cannot use this mode.
+# $env:BITSEEKWIN_BITCHORD_AUTH = 'true'
 node .\direct_server.mjs
 ```
 

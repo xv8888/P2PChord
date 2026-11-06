@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHash, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,6 +21,57 @@ const sourceWords = JSON.parse(
   readFileSync(new URL("./source_words.json", import.meta.url), "utf8"),
 );
 const serverSource = readFileSync(new URL("./direct_server.mjs", import.meta.url), "utf8");
+const textEncoder = new TextEncoder();
+
+function base64Url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+async function createBitChordCredentials(host) {
+  const signingPair = await webcrypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const devicePair = await webcrypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const signingJwk = await webcrypto.subtle.exportKey("jwk", signingPair.publicKey);
+  signingJwk.kid = "test-key";
+  const deviceJwk = await webcrypto.subtle.exportKey("jwk", devicePair.publicKey);
+  const now = Date.now();
+  const header = base64Url(JSON.stringify({ alg: "EdDSA", kid: signingJwk.kid }));
+  const claims = base64Url(JSON.stringify({
+    iss: "https://bitchord-auth.kushagrasingh.in",
+    aud: "bitchord-addons",
+    iat: Math.floor(now / 1000),
+    exp: Math.floor(now / 1000) + 3600,
+    cnf: { jwk: deviceJwk },
+  }));
+  const signingInput = `${header}.${claims}`;
+  const jwtSignature = await webcrypto.subtle.sign(
+    "Ed25519",
+    signingPair.privateKey,
+    textEncoder.encode(signingInput),
+  );
+  const token = `${signingInput}.${base64Url(jwtSignature)}`;
+  const timestamp = String(now);
+  const tokenHash = createHash("sha256").update(token).digest("base64url");
+  const proofSignature = await webcrypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    devicePair.privateKey,
+    textEncoder.encode(
+      `bitchord-addon-proof/v1\n${host}\n${timestamp}\n${tokenHash}`,
+    ),
+  );
+  return {
+    headers: {
+      "X-BitChord-Token": token,
+      "X-BitChord-Proof": `v1.${timestamp}.${base64Url(proofSignature)}`,
+    },
+    bitChordAuthOptions: {
+      fetch: async () => Response.json({ keys: [signingJwk] }),
+    },
+  };
+}
 
 class FakeDownload extends EventEmitter {
   constructor(options, chunks, delay = 0) {
@@ -275,6 +327,7 @@ test("manifest and search expose only safe FLAC results", async () => {
   assert.equal(manifest.version, "alpha-0.5.2");
   assert.match(manifest.description, /directly from Soulseek peers/);
   assert.equal(manifest.allowDownloads, false);
+  assert.equal("bitchordAuth" in manifest, false);
   const response = await fetch(`${base}/search?q=kick`);
   const body = await response.json();
   assert.equal(body.tracks.length, 1);
@@ -284,6 +337,84 @@ test("manifest and search expose only safe FLAC results", async () => {
   assert.equal("duration" in body.tracks[0], false);
   assert.equal(client.lastSearch.req, "kick");
   assert.equal(client.lastSearch.timeout, 2000);
+});
+
+test("opt-in BitChord auth protects add-on APIs and signs range-capable media URLs", async () => {
+  await stopServer();
+  const credentials = await createBitChordCredentials("music.example.test");
+  await startServer({
+    requireBitChordAuth: true,
+    bitChordAuthOptions: credentials.bitChordAuthOptions,
+  });
+
+  const manifest = await (await fetch(`${base}/manifest.json`)).json();
+  assert.equal(manifest.bitchordAuth, true);
+
+  const denied = await fetch(`${base}/search?q=kick`);
+  assert.equal(denied.status, 401);
+  assert.match(denied.headers.get("www-authenticate"), /^BitChord realm=/);
+  assert.equal((await denied.json()).code, "missing");
+
+  const [proofVersion, proofTimestamp, proofSignature] =
+    credentials.headers["X-BitChord-Proof"].split(".");
+  const invalidProof = await fetch(`${base}/search?q=kick`, {
+    headers: {
+      ...credentials.headers,
+      "X-BitChord-Proof":
+        `${proofVersion}.${proofTimestamp}.` +
+        `${proofSignature[0] === "A" ? "B" : "A"}${proofSignature.slice(1)}`,
+    },
+  });
+  assert.equal(invalidProof.status, 401);
+
+  const search = await fetch(`${base}/search?q=kick`, {
+    headers: credentials.headers,
+  });
+  assert.equal(search.status, 200);
+  const [{ id }] = (await search.json()).tracks;
+  const descriptorResponse = await fetch(`${base}/stream/${id}`, {
+    headers: credentials.headers,
+  });
+  assert.equal(descriptorResponse.status, 200);
+  const descriptor = await descriptorResponse.json();
+  const mediaUrl = new URL(descriptor.url);
+  assert.ok(mediaUrl.searchParams.has("expires"));
+  assert.ok(mediaUrl.searchParams.has("signature"));
+
+  const ranged = await fetch(
+    `${new URL(base).origin}${mediaUrl.pathname}${mediaUrl.search}`,
+    {
+      headers: { Range: "bytes=0-3" },
+    },
+  );
+  assert.equal(ranged.status, 206);
+  assert.equal(await ranged.text(), "0123");
+
+  const altered = new URL(mediaUrl);
+  altered.searchParams.set("signature", "A".repeat(43));
+  const rejectedMedia = await fetch(
+    `${new URL(base).origin}${altered.pathname}${altered.search}`,
+  );
+  assert.equal(rejectedMedia.status, 403);
+
+  const expired = new URL(mediaUrl);
+  expired.searchParams.set("expires", "1");
+  const expiredMedia = await fetch(
+    `${new URL(base).origin}${expired.pathname}${expired.search}`,
+  );
+  assert.equal(expiredMedia.status, 403);
+});
+
+test("BitChord auth rejects non-HTTPS public URLs except loopback", () => {
+  assert.throws(
+    () =>
+      createAddonServer({
+        client,
+        requireBitChordAuth: true,
+        publicBaseUrl: "http://music.example.test",
+      }),
+    /requires HTTPS/,
+  );
 });
 
 test("monitoring reports live connection, transfer and cache state without implying playback", async () => {
