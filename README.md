@@ -31,7 +31,7 @@ See [CHANGELOG.md](./CHANGELOG.md) for release history.
 
 > **New here?** Follow [Quick start](#quick-start-windows). You only need the [HTTPS setup](#remote-access-https) if BitChord cannot reach the server on the same computer or network.
 
-Please read the [public-domain and authorized-use notice](#public-domain-and-authorized-music) and [prototype disclaimer](#vibecoded-prototype-disclaimer).
+Please read the [public-domain and authorized-use notice](#public-domain-and-authorized-music).
 
 ---
 
@@ -321,7 +321,3 @@ Copyright (C) 2026 P2PChord contributors. P2PChord is licensed under the GNU Gen
 P2PChord is an independent project. It is not affiliated with, endorsed by, or sponsored by BitChord, Soulseek, Tailscale, or Caddy. Their names and marks belong to their respective owners.
 
 The runtime packages and upstream project references are listed in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). These notices do not change the license of P2PChord.
-
-## Vibecoded AI Prototype Disclaimer
-
-P2PChord is an experimental proof-of-concept. Its code and instructions may contain mistakes and have not been independently audited or tested against every Soulseek peer, BitTorrent swarm, network setup, or BitChord release. Review the code and configuration, and test in a controlled environment before exposing it to the internet. Use it at your own risk; the authors provide no warranty or guarantee of availability, security, or fitness for a particular purpose.
