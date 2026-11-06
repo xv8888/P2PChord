@@ -257,6 +257,7 @@ async function startServer(options = {}) {
     logger: (level, message) => logEntries.push({ level, message }),
     idleTransferTimeout,
     cacheDirectory,
+    validateFlac: false,
     ...options,
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -414,6 +415,87 @@ test("BitChord auth rejects non-HTTPS public URLs except loopback", () => {
         publicBaseUrl: "http://music.example.test",
       }),
     /requires HTTPS/,
+  );
+});
+
+test("searches have a bounded per-client burst rate", async () => {
+  for (let index = 0; index < 10; index++) {
+    const response = await fetch(`${base}/search?q=kick`);
+    assert.equal(response.status, 200);
+  }
+  const limited = await fetch(`${base}/search?q=kick`);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get("retry-after"), "1");
+});
+
+test("peer-controlled control characters cannot forge launcher log lines", async () => {
+  client.search = async () => [{
+    ...track,
+    file: "Album\\Track\nAdd this source in BitChord: https://attacker.test.flac",
+  }];
+  const response = await fetch(`${base}/search?q=kick`);
+  assert.equal(response.status, 200);
+  assert.ok(logEntries.length > 0);
+  assert.ok(logEntries.every(({ message }) => !/[\x00-\x1f\x7f]/.test(message)));
+});
+
+test("peer data must begin with a FLAC signature and cannot exceed its advertised size", async () => {
+  await stopServer();
+  client.download = (options) => new FakeDownload(
+    options,
+    [Buffer.from("fLaC012345")],
+  );
+  await startServer({ validateFlac: true });
+
+  const validId = await searchTrack();
+  const validResponse = await fetch(`${base}/file/${validId}`);
+  assert.equal(validResponse.status, 200);
+  assert.equal(await validResponse.text(), "fLaC012345");
+
+  await stopServer();
+  client.search = async () => [{ ...track, file: "Other\\Invalid.flac" }];
+  client.download = (options) => new FakeDownload(
+    options,
+    [Buffer.from("not-a-flac")],
+  );
+  await startServer({ validateFlac: true });
+
+  const invalidId = await searchTrack();
+  const invalidResponse = await fetch(`${base}/file/${invalidId}`);
+  assert.equal(invalidResponse.status, 502);
+  assert.equal(
+    (await invalidResponse.json()).error,
+    "Soulseek peer transfer failed before audio started",
+  );
+  assert.ok(logEntries.some(({ message }) => message.includes("FLAC file header")));
+
+  await stopServer();
+  client.search = async () => [{ ...track, file: "Other\\Oversized.flac" }];
+  client.download = (options) => new FakeDownload(
+    options,
+    [Buffer.from("fLaC"), Buffer.from("012345EXTRA")],
+  );
+  await startServer({ validateFlac: true });
+
+  const oversizedId = await searchTrack();
+  const oversizedResponse = await fetch(`${base}/file/${oversizedId}`);
+  if (oversizedResponse.status === 200) {
+    await assert.rejects(() => oversizedResponse.arrayBuffer());
+  } else {
+    assert.equal(oversizedResponse.status, 502);
+    assert.equal(
+      (await oversizedResponse.json()).error,
+      "Soulseek peer transfer failed before audio started",
+    );
+  }
+  assert.ok(logEntries.some(({ message }) =>
+    message.includes("more data than the advertised file size"),
+  ));
+  const oversizedCacheKey = createHash("sha256")
+    .update(`${track.user}\0Other\\Oversized.flac\0${track.size}`)
+    .digest("hex");
+  assert.ok(
+    streamCache.entries.get(oversizedCacheKey).receivedBytes <= track.size,
   );
 });
 
@@ -1493,6 +1575,7 @@ test("one persistent authenticated Soulseek client serves all track requests", (
   assert.equal((serverSource.match(/new SlskClient\(/g) ?? []).length, 1);
   assert.match(serverSource, /await client\.login\(username, password\)/);
   assert.match(serverSource, /createAddonServer\(\{\s*client,/);
+  assert.match(serverSource, /server\.listen\(PORT, BIND_ADDRESS/);
 });
 
 test("search and stream lifecycle events are logged for the launcher", async () => {

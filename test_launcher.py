@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import threading
@@ -101,6 +102,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["BITSEEKWIN_WORD_LENGTH"], "6")
         self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "false")
         self.assertEqual(env["BITSEEKWIN_BITCHORD_AUTH"], "false")
+        self.assertEqual(env["BITSEEKWIN_BIND_ADDRESS"], "127.0.0.1")
         self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "match")
         self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "50")
         self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "2000")
@@ -154,6 +156,52 @@ class LauncherConfigurationTests(unittest.TestCase):
                     "bitchord_auth": True,
                 }
             )
+
+    def test_server_bind_address_defaults_to_loopback_and_accepts_explicit_ip(self):
+        env = build_bitseekwin_environment(
+            {}, "user", "password", "secret", "http://127.0.0.1:8080",
+            bind_address="192.168.1.42",
+        )
+        self.assertEqual(env["BITSEEKWIN_BIND_ADDRESS"], "192.168.1.42")
+        with self.assertRaisesRegex(ValueError, "Bind address"):
+            build_bitseekwin_environment(
+                {}, "user", "password", "secret", "http://127.0.0.1:8080",
+                bind_address="0.0.0.0; malicious",
+            )
+
+    def test_launcher_ignores_stdout_source_url_and_sanitizes_control_characters(self):
+        controller = LauncherController()
+        controller.source_url = "https://trusted.example/bitseekwin/secret"
+        process = type(
+            "Process",
+            (),
+            {
+                "stdout": StringIO(
+                    "Add this source in BitChord: https://attacker.test\n"
+                ),
+            },
+        )()
+        controller._read_output("BitSeekWin", process, ())
+        self.assertEqual(
+            controller.source_url,
+            "https://trusted.example/bitseekwin/secret",
+        )
+        self.assertFalse(any("\n" in line for line in controller.logs))
+
+    def test_stop_disables_only_its_configured_funnel(self):
+        controller = LauncherController()
+        controller.tailscale = "tailscale"
+        controller.funnel_configured = True
+        with patch(
+            "launcher.subprocess.run",
+            return_value=type("Result", (), {"returncode": 0})(),
+        ) as run:
+            controller.stop()
+        self.assertFalse(controller.funnel_configured)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["tailscale", "funnel", "--bg", "--https=443", "8080", "off"],
+        )
 
     def test_launcher_passes_bitchord_auth_setting_to_worker(self):
         settings = {
@@ -279,6 +327,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(args[3], "http://192.168.1.42:8080")
         self.assertFalse(args[4])
         self.assertTrue(args[8])
+        self.assertEqual(args[9], "192.168.1.42")
 
     def test_start_rejects_lan_mode_without_a_private_address(self):
         with patch("launcher.detect_lan_ip", return_value=None), patch(
@@ -443,6 +492,10 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn("random 128-bit bearer token", page)
         self.assertIn("another device on this LAN", page)
         self.assertIn('id="bitchordAuth" type="checkbox"', page)
+        self.assertNotIn(
+            '$("funnel").checked=$("publicUrl").value.endsWith(".ts.net")',
+            page,
+        )
         self.assertIn("192.168.1.42", _page(
             "test-token", "https://device.example.ts.net", "192.168.1.42"
         ).decode("utf-8"))

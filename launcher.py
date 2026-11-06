@@ -207,11 +207,16 @@ def build_bitseekwin_environment(
     max_active_streams: int = DEFAULT_MAX_ACTIVE_STREAMS,
     max_stream_size_mb: int = DEFAULT_MAX_STREAM_SIZE_MB,
     bitchord_auth: bool = False,
+    bind_address: str = "127.0.0.1",
 ) -> dict[str, str]:
     if not isinstance(allow_downloads, bool):
         raise ValueError("Allow downloads must be true or false.")
     if not isinstance(bitchord_auth, bool):
         raise ValueError("BitChord authentication must be true or false.")
+    try:
+        ipaddress.ip_address(bind_address)
+    except ValueError as exc:
+        raise ValueError("Bind address must be an IP address.") from exc
     if source_selection not in SOURCE_SELECTION_MODES:
         raise ValueError("Source selection must be 'match' or 'speed'.")
     if not isinstance(search_recovery, bool):
@@ -251,6 +256,7 @@ def build_bitseekwin_environment(
             "BITSEEKWIN_WORD_LENGTH": str(word_length),
             "BITSEEKWIN_ALLOW_DOWNLOADS": str(allow_downloads).lower(),
             "BITSEEKWIN_BITCHORD_AUTH": str(bitchord_auth).lower(),
+            "BITSEEKWIN_BIND_ADDRESS": bind_address,
             "BITSEEKWIN_SOURCE_SELECTION": source_selection,
             "BITSEEKWIN_SEARCH_LIMIT": str(search_limit),
             "BITSEEKWIN_SEARCH_TIMEOUT_MS": str(search_timeout_ms),
@@ -351,6 +357,7 @@ class LauncherController:
         self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.stop_requested = threading.Event()
         self.tailscale = find_tailscale()
+        self.funnel_configured = False
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -470,8 +477,10 @@ class LauncherController:
             if use_funnel:
                 raise ValueError("Turn off Tailscale Funnel when using the LAN address.")
             public_url = f"http://{lan_ip}:{PORT}"
+            bind_address = lan_ip
         else:
             public_url = normalize_public_url(public_text)
+            bind_address = "127.0.0.1"
         if bitchord_auth:
             parsed_url = urlsplit(public_url)
             host = parsed_url.hostname or ""
@@ -527,6 +536,7 @@ class LauncherController:
                 word_count,
                 word_length,
                 lan_access,
+                bind_address,
             ),
             daemon=True,
         ).start()
@@ -534,9 +544,9 @@ class LauncherController:
     def _any_process_running(self) -> bool:
         return self.server_process is not None and self.server_process.poll() is None
 
-    def _port_in_use(self, port: int) -> bool:
+    def _port_in_use(self, port: int, host: str = "127.0.0.1") -> bool:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            with socket.create_connection((host, port), timeout=0.25):
                 return True
         except OSError:
             return False
@@ -547,16 +557,12 @@ class LauncherController:
         if process.stdout is None:
             return
         for line in process.stdout:
-            message = line.rstrip()
-            marker = "Add this source in BitChord: "
-            if marker in message:
-                source_url = message.split(marker, 1)[1].strip()
-                with self.lock:
-                    self.source_url = source_url
+            message = re.sub(r"[\x00-\x1f\x7f]", " ", line.rstrip())
             for secret in sensitive:
                 if secret:
                     message = message.replace(secret, "[redacted]")
             self.log(f"[{name}] {message}")
+        self._disable_funnel()
 
     def _start_worker(
         self,
@@ -569,6 +575,7 @@ class LauncherController:
         word_count: int,
         word_length: int,
         lan_access: bool = False,
+        bind_address: str = "127.0.0.1",
     ) -> None:
         server_process: subprocess.Popen | None = None
         try:
@@ -592,7 +599,7 @@ class LauncherController:
                     raise RuntimeError(
                         f"npm install failed: {detail[-2000:] or 'unknown error'}"
                     )
-            if self._port_in_use(PORT):
+            if self._port_in_use(PORT, bind_address):
                 raise RuntimeError(
                     f"Port {PORT} is already in use; close the existing BitSeekWin first."
                 )
@@ -600,17 +607,19 @@ class LauncherController:
                 raise RuntimeError("Startup was cancelled.")
 
             base_env = os.environ.copy()
+            source_secret = generate_source_secret(
+                word_count, word_length, include_token=not lan_access
+            )
             server_env = build_bitseekwin_environment(
                 base_env,
                 username,
                 password,
-                generate_source_secret(
-                    word_count, word_length, include_token=not lan_access
-                ),
+                source_secret,
                 public_url,
                 word_count,
                 word_length,
                 **server_settings,
+                bind_address=bind_address,
             )
 
             if use_funnel:
@@ -627,6 +636,8 @@ class LauncherController:
                         or result.stdout.strip()
                         or "Tailscale Funnel failed."
                     )
+                with self.lock:
+                    self.funnel_configured = True
                 self.log("Tailscale Funnel configured for local port 8080.")
 
             if self.stop_requested.is_set():
@@ -661,7 +672,7 @@ class LauncherController:
                     raise RuntimeError(
                         f"BitSeekWin exited with code {server_process.returncode}. Check the activity log."
                     )
-                if self._port_in_use(PORT):
+                if self._port_in_use(PORT, bind_address):
                     break
                 time.sleep(0.5)
             else:
@@ -671,11 +682,16 @@ class LauncherController:
             with self.lock:
                 self.status = "Listening"
                 self.detail = "Connected to Soulseek; direct streaming is ready."
+                slug = server_env.get("BITSEEKWIN_SLUG", "bitseekwin")
+                self.source_url = (
+                    f"{public_url.rstrip('/')}/{slug}/{source_secret}"
+                )
             self.log("BitSeekWin started. Add the source URL below in BitChord.")
         except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             self.log(f"Startup failed: {exc}")
             self.stop_requested.set()
             _terminate_process(server_process)
+            self._disable_funnel()
             with self.lock:
                 if self.server_process is server_process:
                     self.server_process = None
@@ -696,9 +712,37 @@ class LauncherController:
             self.source_url = ""
         self.log("Stopping BitSeekWin and the Soulseek connection…")
         _terminate_process(server_process)
-        self.log(
-            "BitSeekWin stopped. Tailscale Funnel, if enabled, remains configured in Tailscale."
-        )
+        self._disable_funnel()
+        self.log("BitSeekWin stopped.")
+
+    def _disable_funnel(self) -> None:
+        with self.lock:
+            if not self.funnel_configured:
+                return
+            self.funnel_configured = False
+            tailscale = self.tailscale
+        if not tailscale:
+            self.log("Could not disable Tailscale Funnel: Tailscale was not found.")
+            with self.lock:
+                self.funnel_configured = True
+            return
+        try:
+            result = subprocess.run(
+                [tailscale, "funnel", "--bg", "--https=443", str(PORT), "off"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(detail or "Tailscale Funnel returned an error.")
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            with self.lock:
+                self.funnel_configured = True
+            self.log(f"Could not disable Tailscale Funnel: {exc}")
+        else:
+            self.log("Tailscale Funnel disabled.")
 
 
 def _page(token: str, public_url: str, lan_ip: str | None = None) -> bytes:
@@ -1060,7 +1104,6 @@ applyTheme(savedTheme);
 $("themeToggle").addEventListener("click",()=>applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark",true));
 $("publicUrl").value=__PUBLIC_URL_JSON__;
 try{const savedPublicUrl=localStorage.getItem("bitseekwin.publicBaseUrl");if(savedPublicUrl&&normalizePublicUrl(savedPublicUrl))$("publicUrl").value=savedPublicUrl;}catch(e){$("publicUrlState").textContent="Saved address could not be loaded from this browser.";}
-$("funnel").checked=$("publicUrl").value.endsWith(".ts.net");
 const lanBaseUrl=lanIp?"http://"+lanIp+":8080":"";
 $("lanAddressHint").textContent=lanIp?"Detected LAN address: "+lanBaseUrl+". Android BitChord does not currently allow this HTTP URL.":"No private LAN IPv4 address was detected.";
 $("useLan").disabled=!lanIp;

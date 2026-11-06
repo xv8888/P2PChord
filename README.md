@@ -55,7 +55,7 @@ python .\launcher.py
 
 1. Enter your Soulseek username and password. The password field is masked.
 2. Keep the detected Tailscale HTTPS URL, or enter your own public base URL. For local-only testing, use `http://127.0.0.1:8080`. To connect from another device on the same LAN, use **Use LAN address** in Source.
-3. Leave **Start Tailscale Funnel** checked if you want to use the `.ts.net` URL and Funnel is enabled for your Tailscale account.
+3. **Start Tailscale Funnel** is off by default because it exposes the server to the public internet. Enable it only when you intend to use Funnel; BitSeekWin turns off the Funnel endpoint it configured when stopped.
 4. Optionally open **Source URL settings** to adjust the public address, Funnel, and source URL word settings. **Allow downloads in BitChord** and **Require BitChord 1.9.1 signed authentication** are separate opt-ins and off by default. Signed authentication requires HTTPS except on localhost and is incompatible with BitChord clients older than 1.9.1. Each word's length is randomized within 3 letters of the target, limited to supported 3–9 letter words. The word list offers 10 times as many adjective and noun choices as before.
 5. Click **Start**. Keep the dashboard and launcher running while using BitChord.
 
@@ -68,9 +68,10 @@ BitSeekWin no longer starts slskd, creates an slskd API key, or requires a downl
 Connect the PC and device to the same trusted private network. In the launcher,
 select **Use LAN address** or enable **Connect from another device on this LAN**.
 BitSeekWin detects a private IPv4 address, uses `http://<LAN-IP>:8080` as its
-advertised base URL, and prints a copyable source URL containing the
-adjective/noun route phrase. The phrase is the route credential in this mode
-and has less entropy than the normal 128-bit token, so use it only on a trusted
+advertised base URL, binds the server only to that private address, and prints
+a copyable source URL containing the adjective/noun route phrase. The phrase
+is the route credential in this mode and has less entropy than the normal
+128-bit token, so use it only on a trusted
 LAN and keep the full URL private. If Windows Firewall
 asks, allow BitSeekWin on **Private networks only**; do not expose port 8080 to
 Public networks or the internet. If no private address is detected, use the
@@ -88,10 +89,16 @@ using HTTPS with a certificate trusted by Android (for example a Tailscale
 HTTPS address when both devices are on that tailnet). Do not globally enable
 cleartext traffic or install an untrusted certificate just to use this URL.
 
-If the launcher cannot find Tailscale, enter the URL manually and start Funnel separately:
+For manual Funnel setup, use:
 
 ```powershell
 tailscale funnel --bg 8080
+```
+
+When finished, turn off that manually configured endpoint with:
+
+```powershell
+tailscale funnel --bg --https=443 8080 off
 ```
 
 ### Manual setup (without the launcher)
@@ -103,6 +110,9 @@ npm install
 $env:SOULSEEK_USERNAME = 'YOUR_SOULSEEK_USERNAME'
 $env:SOULSEEK_PASSWORD = 'YOUR_SOULSEEK_PASSWORD'
 $env:PUBLIC_BASE_URL = 'http://127.0.0.1:8080'
+# The server binds to localhost by default. For LAN access, bind to the PC's
+# private LAN IPv4 address (the launcher does this automatically in LAN mode).
+# $env:BITSEEKWIN_BIND_ADDRESS = '192.168.1.42'
 # Optional: enable BitChord's download action for this source (off by default).
 # $env:BITSEEKWIN_ALLOW_DOWNLOADS = 'true'
 # Optional: require BitChord 1.9.1 signed request authentication (off by default).

@@ -62,6 +62,7 @@ export class StreamCache {
     peerIdleTimeout,
     idleTransferTimeout,
     formatBytes,
+    validateFlac = true,
     writeBatchBytes = WRITE_BATCH_BYTES,
     writeBatchDelayMs = WRITE_BATCH_DELAY_MS,
   }) {
@@ -77,6 +78,7 @@ export class StreamCache {
     this.peerIdleTimeout = peerIdleTimeout;
     this.idleTransferTimeout = idleTransferTimeout;
     this.formatBytes = formatBytes;
+    this.validateFlac = validateFlac;
     this.writeBatchBytes = writeBatchBytes;
     this.writeBatchDelayMs = writeBatchDelayMs;
     if (!Number.isSafeInteger(writeBatchBytes) || writeBatchBytes < 1) {
@@ -574,6 +576,10 @@ export class StreamCache {
     }
     if (chunk.length === 0) return;
     const position = transfer.writePosition;
+    if (position + chunk.length > transfer.track.size) {
+      transfer.cancel("Peer sent more data than the advertised file size");
+      return;
+    }
     transfer.writePosition += chunk.length;
     if (transfer.writePosition > this.maxStreamBytes) {
       this.log("WARN", `"${transfer.track.title}" exceeded the stream-size limit.`);
@@ -834,6 +840,27 @@ export class StreamCache {
       signal.removeEventListener("abort", abort);
     };
     try {
+      if (this.validateFlac) {
+        while (
+          entry.receivedBytes < 4 &&
+          !entry.complete &&
+          !entry.lastError &&
+          !stopped()
+        ) {
+          await waitForChange();
+        }
+        if (stopped()) return;
+        if (entry.lastError) throw entry.lastError;
+        const signature = Buffer.alloc(4);
+        const { bytesRead } = await fileHandle.read(signature, 0, 4, 0);
+        if (
+          bytesRead < 4 ||
+          (!signature.equals(Buffer.from("fLaC")) &&
+            !signature.subarray(0, 3).equals(Buffer.from("ID3")))
+        ) {
+          throw new Error("Soulseek peer did not send a FLAC file header");
+        }
+      }
       while (position <= end) {
         if (stopped()) return;
         while (

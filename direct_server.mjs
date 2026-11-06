@@ -29,6 +29,7 @@ const ALLOW_DOWNLOADS = readBooleanEnvironmentValue(
   "BITSEEKWIN_ALLOW_DOWNLOADS",
   false,
 );
+const BIND_ADDRESS = process.env.BITSEEKWIN_BIND_ADDRESS ?? "127.0.0.1";
 const BITCHORD_AUTH_ENABLED = readBooleanEnvironmentValue(
   "BITSEEKWIN_BITCHORD_AUTH",
   false,
@@ -125,6 +126,8 @@ const CACHE_DIRECTORY = resolve(
 const SOURCE_SELECTION = process.env.BITSEEKWIN_SOURCE_SELECTION ?? "match";
 const SOURCE_SELECTION_MODES = new Set(["match", "speed"]);
 const SEARCH_LIMIT_MAX = 50;
+const SEARCH_RATE_LIMIT_BURST = 10;
+const SEARCH_RATE_LIMIT_REFILL_MS = 1000;
 if (!SOURCE_SELECTION_MODES.has(SOURCE_SELECTION)) {
   throw new TypeError("BITSEEKWIN_SOURCE_SELECTION must be 'match' or 'speed'.");
 }
@@ -434,11 +437,15 @@ export function createAddonServer({
   cacheDirectory = CACHE_DIRECTORY,
   cacheTtlMs = CACHE_TTL_MS,
   maxCacheBytes = MAX_CACHE_BYTES,
+  validateFlac = true,
   writeBatchBytes,
   writeBatchDelayMs,
 }) {
   if (typeof requireBitChordAuth !== "boolean") {
     throw new TypeError("requireBitChordAuth must be true or false.");
+  }
+  if (typeof validateFlac !== "boolean") {
+    throw new TypeError("validateFlac must be true or false.");
   }
   const parsedPublicBaseUrl = new URL(publicBaseUrl);
   const publicHost = parsedPublicBaseUrl.hostname
@@ -537,9 +544,37 @@ export function createAddonServer({
   }
   const tracks = new Map();
   const trackState = new Map();
+  const searchRateLimits = new Map();
 
   function log(level, message) {
-    logger(level, message);
+    logger(level, sanitizeLogMessage(message));
+  }
+
+  function searchRateLimitDelay(address, now = Date.now()) {
+    for (const [key, state] of searchRateLimits) {
+      if (now - state.updatedAt > SEARCH_RATE_LIMIT_BURST * SEARCH_RATE_LIMIT_REFILL_MS) {
+        searchRateLimits.delete(key);
+      }
+    }
+    if (!searchRateLimits.has(address) && searchRateLimits.size >= 1024) {
+      searchRateLimits.delete(searchRateLimits.keys().next().value);
+    }
+    const state = searchRateLimits.get(address) ?? {
+      tokens: SEARCH_RATE_LIMIT_BURST,
+      updatedAt: now,
+    };
+    state.tokens = Math.min(
+      SEARCH_RATE_LIMIT_BURST,
+      state.tokens + (now - state.updatedAt) / SEARCH_RATE_LIMIT_REFILL_MS,
+    );
+    state.updatedAt = now;
+    if (state.tokens < 1) {
+      searchRateLimits.set(address, state);
+      return Math.ceil(1 - state.tokens);
+    }
+    state.tokens--;
+    searchRateLimits.set(address, state);
+    return 0;
   }
 
   function pruneTrackRecords(now = Date.now()) {
@@ -630,6 +665,7 @@ export function createAddonServer({
     maxBytes: maxCacheBytes,
     maxActiveStreams,
     maxStreamBytes,
+    validateFlac,
     streamTimeout: STREAM_TIMEOUT,
     firstByteTimeout,
     peerIdleTimeout,
@@ -642,7 +678,7 @@ export function createAddonServer({
   async function handle(request, response) {
     const requestStartedAt = performance.now();
     response.on("error", (error) => {
-      console.error("HTTP response failed:", error.message);
+      console.error("HTTP response failed:", sanitizeLogMessage(error.message));
     });
     response.setHeader("Access-Control-Allow-Origin", "*");
     response.setHeader(
@@ -735,6 +771,14 @@ export function createAddonServer({
     }
 
     if (route.length === 1 && route[0] === "search" && request.method === "GET") {
+      const retryAfter = searchRateLimitDelay(
+        request.socket.remoteAddress ?? "unknown",
+      );
+      if (retryAfter) {
+        response.setHeader("Retry-After", String(retryAfter));
+        sendError(response, 429, "Search rate limit exceeded; retry shortly");
+        return;
+      }
       const searchRequestId = randomUUID();
       const query = normalizeSearchQuery(url.searchParams.get("q") ?? "");
       if (!query) {
@@ -874,7 +918,7 @@ export function createAddonServer({
         });
       } catch (error) {
         log("ERROR", `Search request ${searchRequestId} failed for "${query}": ${error.message}; HTTP 502.`);
-        console.error("Soulseek search failed:", error.message);
+        console.error("Soulseek search failed:", sanitizeLogMessage(error.message));
         sendError(response, 502, "Soulseek search failed");
       }
       return;
@@ -1078,7 +1122,7 @@ export function createAddonServer({
             `peer=${track.user} failed${response.headersSent ? ` after HTTP ${response.statusCode} began` : " before audio started"}: ${error.message}` +
             `${response.headersSent ? "." : "; HTTP 502."}`,
         );
-        console.error("Soulseek stream failed:", error.message);
+        console.error("Soulseek stream failed:", sanitizeLogMessage(error.message));
         if (response.headersSent) {
           response.destroy(error);
         } else {
@@ -1142,7 +1186,7 @@ export function createAddonServer({
   const server = createServer((request, response) => {
     void handle(request, response).catch((error) => {
       logger("ERROR", `HTTP request failed: ${error.message}`);
-      console.error("Request failed:", error.message);
+      console.error("Request failed:", sanitizeLogMessage(error.message));
       if (!response.headersSent) sendError(response, 500, "Internal server error");
       else response.destroy(error);
     });
@@ -1152,7 +1196,12 @@ export function createAddonServer({
 
 function defaultLogger(level, message) {
   const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
-  console.log(`[${time}] [${level}] ${message}`);
+  const safeMessage = sanitizeLogMessage(message);
+  console.log(`[${time}] [${level}] ${safeMessage}`);
+}
+
+function sanitizeLogMessage(message) {
+  return String(message).replace(/[\x00-\x1f\x7f]/g, " ");
 }
 
 function formatBytes(bytes) {
@@ -1172,6 +1221,9 @@ async function main() {
   }
   if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
     throw new Error("PORT must be a valid TCP port.");
+  }
+  if (!isIP(BIND_ADDRESS)) {
+    throw new Error("BITSEEKWIN_BIND_ADDRESS must be an IP address.");
   }
 
   const client = new SlskClient({
@@ -1251,13 +1303,10 @@ async function main() {
     }));
     await new Promise((resolve, reject) => {
       server.once("error", reject);
-      server.listen(PORT, "0.0.0.0", resolve);
+      server.listen(PORT, BIND_ADDRESS, resolve);
     });
     defaultLogger("INFO", `${APP_NAME} v${VERSION}.`);
-    defaultLogger(
-      "INFO",
-      `Add this source in BitChord: ${PUBLIC_BASE_URL}/${SLUG}/${SECRET}`,
-    );
+    defaultLogger("INFO", "BitChord source endpoint is ready.");
     defaultLogger("INFO", `Listening on port ${PORT}; direct streaming enabled.`);
   } catch (error) {
     client.destroy();

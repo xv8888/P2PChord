@@ -32,8 +32,9 @@ module inside BitChord. A source URL contains a path slug and a route
 credential; all add-on routes are under that prefix. Localhost and custom
 non-LAN URLs use a separate random 128-bit bearer token. Launcher LAN mode
 uses only the randomly generated adjective/noun phrase as that route
-credential. The Node HTTP server listens on `0.0.0.0` and uses
-`PUBLIC_BASE_URL` when constructing the playable audio URL.
+credential. The Node HTTP server binds to `127.0.0.1` by default; launcher LAN
+mode binds only to the detected private LAN address. `PUBLIC_BASE_URL` is used
+when constructing the playable audio URL.
 
 ## BitChord add-on protocol
 
@@ -261,8 +262,8 @@ drains active cache transfers, destroys the Soulseek client, and exits. The
 launcher Stop action calls `Popen.terminate()` for the child process. On
 Windows, this can terminate the process without delivering a JavaScript
 shutdown signal, so graceful cache/transfer cleanup is not guaranteed by that
-launcher action. A configured Tailscale Funnel remains configured when the
-launcher stops BitSeekWin.
+launcher action. When the launcher configured Tailscale Funnel, it disables
+that endpoint on stop.
 
 ## Implemented behavior versus known limitations
 
@@ -274,6 +275,8 @@ launcher stops BitSeekWin.
   period, per-transfer timeout, and transfer cleanup.
 - FLAC candidate filtering and ranking, direct HTTP audio streaming, range
   requests, partial-file offset reuse, and persistent completed-file caching.
+- Per-client search burst limiting, FLAC/ID3 signature checks before media
+  bytes are served, and rejection of peer data beyond the advertised file size.
 - Cache expiry and LRU size management with active-entry protection.
 - Download permission advertised in the manifest, off by default. When enabled,
   BitChord's direct-download request follows the regular `/stream/{id}` URL to

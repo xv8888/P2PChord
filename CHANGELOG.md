@@ -29,6 +29,14 @@ available in the project history and prior session records.
   URLs then use a 15-minute HMAC signature while retaining range support.
   The launcher leaves this mode off by default and requires HTTPS except for
   loopback addresses.
+- Hardened peer streaming by validating the FLAC/ID3 signature before serving
+  bytes and rejecting data beyond the peer-advertised size. Search endpoints
+  now have a bounded per-client request burst.
+- Changed the server bind default to loopback; launcher LAN mode binds only to
+  the detected private address. Tailscale Funnel now defaults off and is
+  disabled when the launcher stops after configuring it.
+- The launcher now constructs its source URL from its own secret instead of
+  parsing server output, and control characters are removed from logged data.
 
 ## alpha-0.5.2
 
