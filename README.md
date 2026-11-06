@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/p2pchord-icon.png" alt="P2PChord project icon" width="160">
+</p>
+
 # P2PChord
 
 ### Peer-powered music. One streaming bridge.

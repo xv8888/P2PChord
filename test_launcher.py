@@ -628,6 +628,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn(':root[data-theme="light"]', page)
         self.assertIn('addEventListener("click",()=>applyTheme(', page)
         self.assertIn('src:url("/test-token/assets/inter-variable.woff2") format("woff2")', page)
+        self.assertIn('href="/test-token/assets/p2pchord-icon.png"', page)
+        self.assertIn('class="brand-icon" src="/test-token/assets/p2pchord-icon.png"', page)
         self.assertNotIn("Segoe UI", page)
         self.assertIn(".slider::-webkit-slider-runnable-track", page)
         self.assertIn(".slider::-webkit-slider-thumb", page)
@@ -691,11 +693,20 @@ class LauncherConfigurationTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Content-Type"], "font/woff2")
                 self.assertEqual(response.read(4), b"wOF2")
+            with urlopen(
+                f"{base}/{token}/assets/p2pchord-icon.png", timeout=3
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Content-Type"], "image/png")
+                self.assertEqual(response.read(8), b"\x89PNG\r\n\x1a\n")
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{base}/wrong-token", timeout=3)
             self.assertEqual(error.exception.code, 403)
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{base}/wrong-token/assets/inter-variable.woff2", timeout=3)
+            self.assertEqual(error.exception.code, 403)
+            with self.assertRaises(HTTPError) as error:
+                urlopen(f"{base}/wrong-token/assets/p2pchord-icon.png", timeout=3)
             self.assertEqual(error.exception.code, 403)
             request = Request(
                 f"{base}/{token}/api/start",

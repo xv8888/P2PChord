@@ -43,6 +43,7 @@ SOURCE_WORDS = json.loads(
     (PROJECT_DIR / "source_words.json").read_text(encoding="utf-8")
 )
 INTER_FONT_DATA = (PROJECT_DIR / "fonts" / "InterVariable.woff2").read_bytes()
+ICON_DATA = (PROJECT_DIR / "assets" / "p2pchord-icon.png").read_bytes()
 
 SEARCH_LIMIT_BOUNDS = (1, 50)
 SEARCH_TIMEOUT_BOUNDS = (500, 30000)
@@ -840,6 +841,10 @@ def _page(token: str, public_url: str, lan_ip: str | None = None) -> bytes:
             "__FONT_URL__",
             json.dumps(f"/{token}/assets/inter-variable.woff2"),
         )
+        .replace(
+            "__ICON_URL__",
+            json.dumps(f"/{token}/assets/p2pchord-icon.png"),
+        )
     )
     return html.encode("utf-8")
 
@@ -850,6 +855,7 @@ _HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
+<link rel="icon" type="image/png" href=__ICON_URL__>
 <title>P2PChord • Setup</title>
 <style>
 @font-face{
@@ -950,7 +956,8 @@ button,input,select{font:inherit}
 button{cursor:pointer}
 .app{min-height:100vh;background:var(--surface)}
 .titlebar{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:62px;padding:0 30px;background:var(--surface);border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:baseline;gap:15px;font-size:var(--text-brand);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-brand);line-height:var(--leading-tight);white-space:nowrap}
+.brand{display:flex;align-items:center;gap:12px;font-size:var(--text-brand);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-brand);line-height:var(--leading-tight);white-space:nowrap}
+.brand-icon{width:36px;height:36px;flex:none;border-radius:9px}
 .brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}
 .brand-bit{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7);-webkit-background-clip:text;background-clip:text;color:transparent}
 .brand-seek{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -1058,7 +1065,7 @@ button{cursor:pointer}
 <body>
 <div class="app">
   <header class="titlebar">
-    <div class="brand" aria-label="P2PChord"><span><span class="brand-bit">P2P</span><span class="brand-seek">Chord</span></span><span class="brand-tagline">Peer-powered music for BitChord</span></div>
+    <div class="brand" aria-label="P2PChord"><img class="brand-icon" src=__ICON_URL__ alt=""><span><span class="brand-bit">P2P</span><span class="brand-seek">Chord</span></span><span class="brand-tagline">Peer-powered music for BitChord</span></div>
     <div class="toolbar-actions">
       <button class="button" id="themeToggle" type="button" aria-label="Switch to light mode" aria-pressed="true">Light mode</button>
       <button class="button" id="exit" type="button">Exit</button>
@@ -1290,6 +1297,14 @@ def make_handler(controller: LauncherController, token: str):
                 self._security_headers()
                 self.end_headers()
                 self.wfile.write(INTER_FONT_DATA)
+            elif path == f"/{token}/assets/p2pchord-icon.png":
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(ICON_DATA)))
+                self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+                self._security_headers()
+                self.end_headers()
+                self.wfile.write(ICON_DATA)
             elif path == f"/{token}/api/status":
                 self._send_json(controller.snapshot())
             else:
