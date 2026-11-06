@@ -10,7 +10,7 @@ from launcher import (
     LauncherController,
     SOURCE_WORDS,
     _page,
-    build_bitseekwin_environment,
+    build_p2pchord_environment,
     detect_lan_ip,
     find_node_runtime,
     generate_source_secret,
@@ -81,8 +81,8 @@ class LauncherConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Node.js 22 or newer"):
                 find_node_runtime()
 
-    def test_bitseekwin_receives_session_credentials_only_in_environment(self):
-        env = build_bitseekwin_environment(
+    def test_p2pchord_receives_session_credentials_only_in_environment(self):
+        env = build_p2pchord_environment(
             {
                 "KEEP": "yes",
                 "SLSKD_API_KEY": "stale-key",
@@ -98,26 +98,63 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["BITCHORD_SECRET"], "generated-source-secret")
         self.assertEqual(env["PUBLIC_BASE_URL"], "https://device.example.ts.net")
         self.assertEqual(env["PORT"], "8080")
-        self.assertEqual(env["BITSEEKWIN_WORD_COUNT"], "3")
-        self.assertEqual(env["BITSEEKWIN_WORD_LENGTH"], "6")
-        self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "false")
-        self.assertEqual(env["BITSEEKWIN_BITCHORD_AUTH"], "false")
-        self.assertEqual(env["BITSEEKWIN_BIND_ADDRESS"], "127.0.0.1")
-        self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "match")
-        self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "50")
-        self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "2000")
-        self.assertEqual(env["BITSEEKWIN_SEARCH_RECOVERY"], "true")
-        self.assertEqual(env["BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS"], "30000")
-        self.assertEqual(env["BITSEEKWIN_CACHE_TTL_MS"], "1800000")
-        self.assertEqual(env["BITSEEKWIN_CACHE_MAX_BYTES"], str(2 * 1024 * 1024 * 1024))
-        self.assertEqual(env["BITSEEKWIN_MAX_ACTIVE_STREAMS"], "2")
-        self.assertEqual(env["BITSEEKWIN_MAX_STREAM_BYTES"], str(128 * 1024 * 1024))
+        self.assertEqual(env["P2PCHORD_WORD_COUNT"], "3")
+        self.assertEqual(env["P2PCHORD_WORD_LENGTH"], "6")
+        self.assertEqual(env["P2PCHORD_ALLOW_DOWNLOADS"], "false")
+        self.assertEqual(env["P2PCHORD_BITCHORD_AUTH"], "false")
+        self.assertEqual(env["P2PCHORD_BIND_ADDRESS"], "127.0.0.1")
+        self.assertEqual(env["P2PCHORD_SOURCE_SELECTION"], "match")
+        self.assertEqual(env["P2PCHORD_SEARCH_LIMIT"], "50")
+        self.assertEqual(env["P2PCHORD_SEARCH_TIMEOUT_MS"], "2000")
+        self.assertEqual(env["P2PCHORD_SEARCH_RECOVERY"], "true")
+        self.assertEqual(env["P2PCHORD_IDLE_TRANSFER_TIMEOUT_MS"], "30000")
+        self.assertEqual(env["P2PCHORD_CACHE_TTL_MS"], "1800000")
+        self.assertEqual(env["P2PCHORD_CACHE_MAX_BYTES"], str(2 * 1024 * 1024 * 1024))
+        self.assertEqual(env["P2PCHORD_MAX_ACTIVE_STREAMS"], "2")
+        self.assertEqual(env["P2PCHORD_MAX_STREAM_BYTES"], str(128 * 1024 * 1024))
+        self.assertEqual(env["P2PCHORD_SOULSEEK_ENABLED"], "true")
+        self.assertEqual(env["P2PCHORD_TORRENT_ENABLED"], "false")
+        self.assertEqual(env["P2PCHORD_TORRENT_SOURCES"], "[]")
+        self.assertEqual(env["P2PCHORD_TORRENT_STORAGE_MAX_BYTES"], str(4 * 1024 * 1024 * 1024))
         self.assertEqual(env["KEEP"], "yes")
         self.assertNotIn("SLSKD_API_KEY", env)
         self.assertNotIn("SLSKD_SLSK_PASSWORD", env)
 
-    def test_bitseekwin_download_permission_is_opt_in(self):
-        env = build_bitseekwin_environment(
+    def test_torrent_only_environment_does_not_inherit_soulseek_credentials(self):
+        env = build_p2pchord_environment(
+            {"SOULSEEK_USERNAME": "stale", "SOULSEEK_PASSWORD": "stale"},
+            "",
+            "",
+            "secret",
+            "https://device.example.test",
+            soulseek_enabled=False,
+            torrent_enabled=True,
+            torrent_sources=["magnet:?xt=urn:btih:0123456789012345678901234567890123456789"],
+        )
+        self.assertEqual(env["P2PCHORD_SOULSEEK_ENABLED"], "false")
+        self.assertEqual(env["P2PCHORD_TORRENT_ENABLED"], "true")
+        self.assertEqual(
+            env["P2PCHORD_TORRENT_SOURCES"],
+            '["magnet:?xt=urn:btih:0123456789012345678901234567890123456789"]',
+        )
+        self.assertNotIn("SOULSEEK_USERNAME", env)
+        self.assertNotIn("SOULSEEK_PASSWORD", env)
+        with self.assertRaisesRegex(ValueError, "Enable Soulseek"):
+            build_p2pchord_environment(
+                {}, "", "", "secret", "http://127.0.0.1:8080",
+                soulseek_enabled=False,
+                torrent_enabled=False,
+            )
+        with self.assertRaisesRegex(ValueError, "valid BitTorrent info hash"):
+            build_p2pchord_environment(
+                {}, "", "", "secret", "http://127.0.0.1:8080",
+                soulseek_enabled=False,
+                torrent_enabled=True,
+                torrent_sources=["magnet:?xt=urn:btih:invalid"],
+            )
+
+    def test_p2pchord_download_permission_is_opt_in(self):
+        env = build_p2pchord_environment(
             {},
             "user",
             "password",
@@ -125,15 +162,15 @@ class LauncherConfigurationTests(unittest.TestCase):
             "http://127.0.0.1:8080",
             allow_downloads=True,
         )
-        self.assertEqual(env["BITSEEKWIN_ALLOW_DOWNLOADS"], "true")
+        self.assertEqual(env["P2PCHORD_ALLOW_DOWNLOADS"], "true")
         with self.assertRaisesRegex(ValueError, "Allow downloads"):
-            build_bitseekwin_environment(
+            build_p2pchord_environment(
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 allow_downloads="true",
             )
 
     def test_bitchord_auth_is_opt_in_and_requires_https_except_loopback(self):
-        env = build_bitseekwin_environment(
+        env = build_p2pchord_environment(
             {},
             "user",
             "password",
@@ -141,9 +178,9 @@ class LauncherConfigurationTests(unittest.TestCase):
             "https://device.example.test",
             bitchord_auth=True,
         )
-        self.assertEqual(env["BITSEEKWIN_BITCHORD_AUTH"], "true")
+        self.assertEqual(env["P2PCHORD_BITCHORD_AUTH"], "true")
         with self.assertRaisesRegex(ValueError, "BitChord authentication"):
-            build_bitseekwin_environment(
+            build_p2pchord_environment(
                 {}, "user", "password", "secret", "https://device.example.test",
                 bitchord_auth="true",
             )
@@ -158,20 +195,20 @@ class LauncherConfigurationTests(unittest.TestCase):
             )
 
     def test_server_bind_address_defaults_to_loopback_and_accepts_explicit_ip(self):
-        env = build_bitseekwin_environment(
+        env = build_p2pchord_environment(
             {}, "user", "password", "secret", "http://127.0.0.1:8080",
             bind_address="192.168.1.42",
         )
-        self.assertEqual(env["BITSEEKWIN_BIND_ADDRESS"], "192.168.1.42")
+        self.assertEqual(env["P2PCHORD_BIND_ADDRESS"], "192.168.1.42")
         with self.assertRaisesRegex(ValueError, "Bind address"):
-            build_bitseekwin_environment(
+            build_p2pchord_environment(
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 bind_address="0.0.0.0; malicious",
             )
 
     def test_launcher_ignores_stdout_source_url_and_sanitizes_control_characters(self):
         controller = LauncherController()
-        controller.source_url = "https://trusted.example/bitseekwin/secret"
+        controller.source_url = "https://trusted.example/p2pchord/secret"
         process = type(
             "Process",
             (),
@@ -181,10 +218,10 @@ class LauncherConfigurationTests(unittest.TestCase):
                 ),
             },
         )()
-        controller._read_output("BitSeekWin", process, ())
+        controller._read_output("P2PChord", process, ())
         self.assertEqual(
             controller.source_url,
-            "https://trusted.example/bitseekwin/secret",
+            "https://trusted.example/p2pchord/secret",
         )
         self.assertFalse(any("\n" in line for line in controller.logs))
 
@@ -218,7 +255,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertTrue(worker_thread.call_args.kwargs["args"][5]["bitchord_auth"])
 
     def test_source_selection_is_configurable_and_validated(self):
-        env = build_bitseekwin_environment(
+        env = build_p2pchord_environment(
             {},
             "user",
             "password",
@@ -226,15 +263,15 @@ class LauncherConfigurationTests(unittest.TestCase):
             "http://127.0.0.1:8080",
             source_selection="speed",
         )
-        self.assertEqual(env["BITSEEKWIN_SOURCE_SELECTION"], "speed")
+        self.assertEqual(env["P2PCHORD_SOURCE_SELECTION"], "speed")
         with self.assertRaisesRegex(ValueError, "Source selection"):
-            build_bitseekwin_environment(
+            build_p2pchord_environment(
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 source_selection="unrecognized",
             )
 
     def test_search_and_fetch_options_map_to_server_environment(self):
-        env = build_bitseekwin_environment(
+        env = build_p2pchord_environment(
             {},
             "user",
             "password",
@@ -249,14 +286,14 @@ class LauncherConfigurationTests(unittest.TestCase):
             max_active_streams=1,
             max_stream_size_mb=64,
         )
-        self.assertEqual(env["BITSEEKWIN_SEARCH_LIMIT"], "12")
-        self.assertEqual(env["BITSEEKWIN_SEARCH_TIMEOUT_MS"], "5000")
-        self.assertEqual(env["BITSEEKWIN_SEARCH_RECOVERY"], "false")
-        self.assertEqual(env["BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS"], "45000")
-        self.assertEqual(env["BITSEEKWIN_CACHE_TTL_MS"], "5400000")
-        self.assertEqual(env["BITSEEKWIN_CACHE_MAX_BYTES"], str(512 * 1024 * 1024))
-        self.assertEqual(env["BITSEEKWIN_MAX_ACTIVE_STREAMS"], "1")
-        self.assertEqual(env["BITSEEKWIN_MAX_STREAM_BYTES"], str(64 * 1024 * 1024))
+        self.assertEqual(env["P2PCHORD_SEARCH_LIMIT"], "12")
+        self.assertEqual(env["P2PCHORD_SEARCH_TIMEOUT_MS"], "5000")
+        self.assertEqual(env["P2PCHORD_SEARCH_RECOVERY"], "false")
+        self.assertEqual(env["P2PCHORD_IDLE_TRANSFER_TIMEOUT_MS"], "45000")
+        self.assertEqual(env["P2PCHORD_CACHE_TTL_MS"], "5400000")
+        self.assertEqual(env["P2PCHORD_CACHE_MAX_BYTES"], str(512 * 1024 * 1024))
+        self.assertEqual(env["P2PCHORD_MAX_ACTIVE_STREAMS"], "1")
+        self.assertEqual(env["P2PCHORD_MAX_STREAM_BYTES"], str(64 * 1024 * 1024))
 
     def test_search_and_fetch_options_reject_values_outside_supported_limits(self):
         for option, value in (
@@ -269,12 +306,12 @@ class LauncherConfigurationTests(unittest.TestCase):
             ("max_stream_size_mb", 129),
         ):
             with self.subTest(option=option), self.assertRaises(ValueError):
-                build_bitseekwin_environment(
+                build_p2pchord_environment(
                     {}, "user", "password", "secret", "http://127.0.0.1:8080",
                     **{option: value},
                 )
         with self.assertRaisesRegex(ValueError, "Search recovery"):
-            build_bitseekwin_environment(
+            build_p2pchord_environment(
                 {}, "user", "password", "secret", "http://127.0.0.1:8080",
                 search_recovery="false",
             )
@@ -308,6 +345,12 @@ class LauncherConfigurationTests(unittest.TestCase):
                 key: value
                 for key, value in settings.items()
                 if key not in {"username", "password", "public_url"}
+            }
+            | {
+                "soulseek_enabled": True,
+                "torrent_enabled": False,
+                "torrent_sources": [],
+                "torrent_storage_max_size_gb": 4,
             },
         )
 
@@ -501,6 +544,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         ).decode("utf-8"))
         self.assertIn("Target letters per word", page)
         self.assertIn('aria-label="Launcher sections"', page)
+        self.assertIn(".content-scroll{min-height:0}", page)
+        self.assertNotIn("overscroll-behavior:contain", page)
         for section in (
             "connection",
             "source-settings",
@@ -508,9 +553,15 @@ class LauncherConfigurationTests(unittest.TestCase):
             "transfer-settings",
             "cache-settings",
             "activity",
+            "providers",
         ):
             self.assertIn(f'id="{section}"', page)
-            self.assertIn(f'href="#{section}"', page)
+        for target in ("activity", "providers", "transfer-settings", "cache-settings", "source-settings"):
+            self.assertIn(f'href="#{target}"', page)
+        self.assertIn('class="titlebar"', page)
+        self.assertIn('class="app-footer"><span>P2PChord | alpha-0.1.0</span>', page)
+        self.assertNotIn('class="sidebar"', page)
+        self.assertNotIn('class="player"', page)
         self.assertLess(page.index('id="activity"'), page.index('id="connection"'))
         for control in (
             "username",
@@ -540,7 +591,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('id="allowDownloads" type="checkbox"', page)
         self.assertIn('lan_access:$("lanAccess").checked', page)
         self.assertIn('allow_downloads:$("allowDownloads").checked', page)
-        self.assertIn('$("password").value="";$("logs").textContent="Connecting directly to Soulseek…";', page)
+        self.assertIn('$("password").value="";$("logs").textContent="Starting enabled P2P sources…";', page)
         self.assertNotIn('$("username").value=""', page)
         self.assertIn('id="sourceSelection"', page)
         self.assertIn('source_selection:$("sourceSelection").value', page)
@@ -557,9 +608,10 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('max_active_streams:Number($("transferSlots").value)', page)
         self.assertIn("if(invalidSetting){invalidSetting.reportValidity();return;}", page)
         self.assertNotIn('id="allowDownloads" type="checkbox" checked', page)
-        self.assertIn('<span class="brand-bit">Bit</span>', page)
-        self.assertIn('<span class="brand-seek">Seek</span>', page)
-        self.assertIn('<span class="brand-win">Win</span>', page)
+        self.assertIn('<span class="brand-bit">P2P</span>', page)
+        self.assertIn('<span class="brand-seek">Chord</span>', page)
+        self.assertIn(".brand-bit{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7)", page)
+        self.assertIn(".brand-seek{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%)", page)
         self.assertIn("--text-brand-primary:1.08em", page)
         self.assertIn("--text-brand-win:.48em", page)
         self.assertIn(".brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}", page)
@@ -570,8 +622,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('<html lang="en" data-theme="dark">', page)
         self.assertIn('aria-label="Switch to light mode" aria-pressed="true"', page)
         self.assertIn('let savedTheme="dark"', page)
-        self.assertIn('localStorage.getItem("bitseekwin.theme")', page)
-        self.assertIn('localStorage.setItem("bitseekwin.theme"', page)
+        self.assertIn('localStorage.getItem("p2pchord.theme")', page)
+        self.assertIn('localStorage.setItem("p2pchord.theme"', page)
         self.assertIn("applyTheme(savedTheme)", page)
         self.assertIn(':root[data-theme="light"]', page)
         self.assertIn('addEventListener("click",()=>applyTheme(', page)
@@ -605,8 +657,8 @@ class LauncherConfigurationTests(unittest.TestCase):
 
     def test_dashboard_persists_and_validates_source_address(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
-        self.assertIn('localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl)', page)
-        self.assertIn('localStorage.getItem("bitseekwin.publicBaseUrl")', page)
+        self.assertIn('localStorage.setItem("p2pchord.publicBaseUrl",publicUrl)', page)
+        self.assertIn('localStorage.getItem("p2pchord.publicBaseUrl")', page)
         self.assertIn("function validatePublicUrl()", page)
 
     def test_ez_start_launches_the_browser_launcher(self):
@@ -629,7 +681,7 @@ class LauncherConfigurationTests(unittest.TestCase):
                 with urlopen(f"{base}/{token}", timeout=3) as response:
                     self.assertEqual(response.status, 200)
                     page = response.read()
-                    self.assertIn(b"BitSeekWin", page)
+                    self.assertIn(b"P2PChord", page)
                     self.assertIn(
                         "font-src 'self'", response.headers["Content-Security-Policy"]
                     )

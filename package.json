@@ -1,8 +1,8 @@
 {
-  "name": "bitseekwin",
+  "name": "p2pchord",
   "private": true,
   "license": "GPL-3.0-only",
-  "description": "Direct Soulseek-to-BitChord streaming add-on",
+  "description": "P2PChord: peer-powered FLAC streaming add-on for BitChord",
   "type": "module",
   "scripts": {
     "test": "node --test"
@@ -11,6 +11,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "slsk-client": "2.0.2"
+    "slsk-client": "2.0.2",
+    "webtorrent": "3.0.21"
   }
 }

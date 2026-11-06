@@ -1,7 +1,7 @@
-# BitSeekWin architecture
+# P2PChord architecture
 
-This document describes the architecture implemented in the current source,
-not a proposed design. The BitChord protocol summary follows the
+This document describes the implemented architecture and labels planned work
+separately. The BitChord protocol summary follows the
 [official BitChord add-on documentation](https://bitchord.kushagrasingh.in/docs).
 Implementation details were checked against `direct_server.mjs`,
 `stream_cache.mjs`, `launcher.py`, and the installed `slsk-client` 2.0.2
@@ -11,30 +11,38 @@ download implementation.
 
 ```mermaid
 flowchart LR
-    BC[BitChord] -->|GET manifest, search, stream| HTTP[BitSeekWin HTTP server]
+    BC[BitChord] -->|GET manifest, search, stream| HTTP[P2PChord HTTP server]
     BC -->|GET or ranged GET audio URL| HTTP
-    subgraph BitSeekWin process
-        HTTP -->|search / download requests| SC[One authenticated SlskClient]
-        HTTP --> TM[Track map and StreamCache]
-        TM -->|independent downloads, max 2 active| SC
-        TM -->|partial and completed files| DISK[(Persistent cache directory)]
-        SC -->|connection status and reconnect events| LIFE[Lifecycle and logs]
+    subgraph P2PChord process
+        HTTP --> TM[Provider-neutral track map and routes]
+        TM -->|shared concurrency limit| SC[Optional SlskClient + StreamCache]
+        TM -->|shared concurrency limit| TP[Optional TorrentProvider]
+        SC -->|partial/completed files| DISK[(Soulseek cache)]
+        TP -->|verified pieces| TDISK[(Separate WebTorrent store)]
+        TP --> WT[WebTorrent client]
+        SC --> LIFE[Lifecycle and logs]
+        TP --> LIFE
     end
     SC <-->|one login session; search/control| SS[Soulseek server]
     SC <-->|peer file-transfer connections| PEERS[Soulseek peers]
     PEERS -->|FLAC chunks| SC
+    WT <-->|metadata and verified pieces| BTPEERS[Configured torrent peers]
     PY[Python launcher] -->|starts Node process; passes environment| HTTP
     PY -->|stop / exit| LIFE
 ```
 
-BitSeekWin is an HTTP add-on bridge. It does not expose a JavaScript add-on
+P2PChord is an HTTP add-on bridge. It does not expose a JavaScript add-on
 module inside BitChord. A source URL contains a path slug and a route
 credential; all add-on routes are under that prefix. Localhost and custom
 non-LAN URLs use a separate random 128-bit bearer token. Launcher LAN mode
 uses only the randomly generated adjective/noun phrase as that route
 credential. The Node HTTP server binds to `127.0.0.1` by default; launcher LAN
 mode binds only to the detected private LAN address. `PUBLIC_BASE_URL` is used
-when constructing the playable audio URL.
+when constructing the playable audio URL. The external identifier,
+`P2PCHORD_*` environment variables, and `%LOCALAPPDATA%\P2PChord` storage
+namespace are now P2PChord-specific. This rename is breaking: prior environment
+variables, add-on IDs, source URL slugs, and storage paths are not migrated;
+existing cache directories are left untouched.
 
 ## BitChord add-on protocol
 
@@ -45,17 +53,17 @@ The official protocol uses three JSON-over-HTTP GET endpoints:
      `version` are recommended.
    - Advertise `resources: ["search", "stream"]` for this endpoint-based flow.
    - `allowDownloads` is optional in BitChord and defaults to allowed when
-     omitted. BitSeekWin explicitly reports a boolean, defaulting to `false`;
+     omitted. P2PChord explicitly reports a boolean, defaulting to `false`;
      the launcher has the same default. BitChord deliberately omits an add-on
      from download-source selection when this value is false, while playback
      can still use it. Enabling the launcher option or setting
-     `BITSEEKWIN_ALLOW_DOWNLOADS=true` makes BitChord eligible to use the
+     `P2PCHORD_ALLOW_DOWNLOADS=true` makes BitChord eligible to use the
      existing stream URL for a download; refresh or re-add the source after
      changing the manifest setting.
    - Optional `settings` can define a quality picker using
      `{ "key": "quality", "type": "select", "options": [...] }`; BitChord sends
      the selected option on search and stream requests. The official protocol
-     also defines the optional `checkValidLossless` gate. BitSeekWin does not
+     also defines the optional `checkValidLossless` gate. P2PChord does not
      currently implement these features.
 
 2. **Search — `GET /search?q=...`**
@@ -66,25 +74,26 @@ The official protocol uses three JSON-over-HTTP GET endpoints:
    - BitChord may send a `quality` parameter and other hints such as `atmos`.
      Search responses should be focused and fast; the official protocol does
      not define a result-count parameter.
-   - BitSeekWin returns the standard `tracks`, `albums`, `artists`, and
-     `playlists` arrays. It filters to safe `.flac` Soulseek results and, by
-     default, ranks candidates by filename match and returns at most 50 tracks.
-     The launcher can instead select a fastest-speed mode that returns only
-     the peer reporting the highest speed. It reports an empty set of arrays
-     for an empty query or no usable match.
+   - P2PChord returns the standard `tracks`, `albums`, `artists`, and
+     `playlists` arrays. It filters safe `.flac` results from enabled providers
+     and, by default, ranks candidates by filename match and returns at most 50
+     tracks. BitTorrent searches only configured torrent filenames; it does
+     not query a public index. Fastest-speed mode returns one result using the
+     source's reported or observed transfer speed. Empty queries and searches
+     without a usable match return empty arrays.
 
 3. **Stream — `GET /stream/{id}`**
    - Return JSON with an absolute, directly playable media or manifest `url`.
      Codec, container, manifest kind, encryption, and audio-quality metadata
      are recommended when known.
    - BitChord may send the selected `quality` and other hints to this route.
-   - BitSeekWin returns a URL to its own `/file/{id}` route and declares FLAC
+   - P2PChord returns a URL to its own `/file/{id}` route and declares FLAC
      format, codec, container, MIME type, and lossless quality. Unknown or
      expired track IDs return 404.
 
-The separate `/file/{id}` route is BitSeekWin's media transport endpoint, not
+The separate `/file/{id}` route is P2PChord's media transport endpoint, not
 a fourth add-on resource. It returns FLAC bytes and supports byte ranges for
-playback, seeking, and follow-up requests. BitSeekWin also accepts `HEAD` and
+playback, seeking, and follow-up requests. P2PChord also accepts `HEAD` and
 `OPTIONS` on the HTTP server; these do not replace the three GET protocol
 routes.
 
@@ -98,17 +107,20 @@ Each Soulseek query has a configurable timeout, defaulting to two seconds.
 The launcher exposes integer seconds from 1 to 30; the server also accepts
 direct settings from 500 to 30,000 milliseconds.
 
-Only safe, positive-size FLAC results with a peer username are considered.
+Only safe, positive-size FLAC results from enabled providers are considered.
 Candidate titles and artist names are inferred from filenames and the query;
 full file tags are not read. The launcher defaults to match-first selection:
-results are ordered by filename match, available peer slots, reported speed,
+results are ordered by filename match, available peer slots, reported or
+observed speed,
 queue length, and stable ID, and up to 50 are returned for BitChord to select.
 The launcher can lower the result limit to 1.
 The launcher can be set to fastest-speed mode, which returns only the result
-from the peer reporting the highest upload speed across all matching FLAC
-results. The speed is self-reported, not measured by BitSeekWin; fastest-speed
-mode can return a less relevant result than a slower match. A track ID is a
-truncated SHA-256 digest of peer username, remote filename, and size. Track
+from matching results. Soulseek speed is self-reported; BitTorrent speed is
+observed by WebTorrent. Neither guarantees playback throughput, and
+fastest-speed mode can return a less relevant result than a closer match.
+Soulseek track IDs are truncated SHA-256 digests of peer username, remote
+filename, and size. Torrent track IDs are provider-prefixed hashes of torrent
+info hash and file index, keeping the provider identities separate. Track
 records remain resolvable for 20 minutes after their latest search, stream, or
 file request, covering BitChord's documented 10-minute search and 5-minute stream
 caches. Expired records are pruned on search. The server does not evict still
@@ -155,8 +167,8 @@ canceled and releases its slot; its partial bytes are retained.
 Transfers also have a 15-minute overall timeout. By default, a new transfer is
 cancelled if no peer audio chunk arrives within 30 seconds; peer-connection
 inactivity also times out after 30 seconds. These deadlines are separately
-configurable with `BITSEEKWIN_FIRST_BYTE_TIMEOUT_MS` and
-`BITSEEKWIN_PEER_IDLE_TIMEOUT_MS` (1–300 seconds). A server shutdown cancels
+configurable with `P2PCHORD_FIRST_BYTE_TIMEOUT_MS` and
+`P2PCHORD_PEER_IDLE_TIMEOUT_MS` (1–300 seconds). A server shutdown cancels
 outstanding transfers and waits for them to release before destroying the
 client.
 
@@ -188,7 +200,7 @@ can therefore return HTTP 502; a failure after streaming starts is logged and
 the already-started response is terminated.
 
 Partial files are retained in the cache directory. The installed
-`slsk-client` supports an `offset` download option, and BitSeekWin starts a
+`slsk-client` supports an `offset` download option, and P2PChord starts a
 subsequent transfer at the contiguous partial-file length. The library itself
 also retries interrupted downloads at its received offset. A partial entry is
 never treated as completed merely because it has bytes: completion requires a
@@ -199,8 +211,9 @@ partial file is then atomically renamed to the completed `.flac` cache file.
 
 Cache identity is SHA-256 over peer username, remote filename, and file size,
 so a new BitChord track ID can reuse an existing entry when those fields are
-the same. The default cache location is `%LOCALAPPDATA%\\BitSeekWin\\cache` on
-Windows and `~/.cache/BitSeekWin/cache` elsewhere.
+the same. The default cache location is `%LOCALAPPDATA%\P2PChord\cache` on
+Windows and `~/.cache/P2PChord/cache` elsewhere. Torrent data uses the
+separate `%LOCALAPPDATA%\P2PChord\torrents` store by default.
 
 Completed files and partial files have metadata persisted beside them and
 survive process restarts. Defaults are a 30-minute expiration since last
@@ -209,8 +222,8 @@ current launch only (TTL: 1–10,080 minutes; size: 16–32,768 MiB). Inactive
 entries are removed by expiry or least-recently-used eviction; entries with
 active HTTP consumers or transfers
 are protected. The directory, TTL, and maximum size can be changed through
-`BITSEEKWIN_CACHE_DIRECTORY`, `BITSEEKWIN_CACHE_TTL_MS`, and
-`BITSEEKWIN_CACHE_MAX_BYTES`. The launcher exposes the TTL, size, and idle
+`P2PCHORD_CACHE_DIRECTORY`, `P2PCHORD_CACHE_TTL_MS`, and
+`P2PCHORD_CACHE_MAX_BYTES`. The launcher exposes the TTL, size, and idle
 transfer grace period; all launcher settings are per launch and default to
 the current behavior when not provided.
 
@@ -219,7 +232,7 @@ the current behavior when not provided.
 Disk-backed streaming and caching do **not** make Soulseek downloads
 memory-free. In the installed `slsk-client` 2.0.2 implementation, each download
 retains received chunks in memory and concatenates them when the download
-completes. BitSeekWin rejects files larger than its configurable per-track
+completes. P2PChord rejects files larger than its configurable per-track
 limit (128 MiB by default, not configurable above 128 MiB) and allows one or
 two active transfers, but two near-limit downloads can still consume substantial
 memory, including extra peak use during concatenation. The disk cache is for
@@ -265,78 +278,104 @@ shutdown signal, so graceful cache/transfer cleanup is not guaranteed by that
 launcher action. When the launcher configured Tailscale Funnel, it disables
 that endpoint on stop.
 
+## Provider lifecycle and BitTorrent
+
+Soulseek remains enabled by default and continues to use one authenticated
+`SlskClient` plus `StreamCache`. BitTorrent is an optional, experimental
+provider implemented in `torrent_provider.mjs`; it is disabled by default.
+The launcher supports Soulseek-only, BitTorrent-only, or both. Provider-neutral
+search results include a `provider` field, and torrent IDs are prefixed to keep
+them distinct from Soulseek cache identities. The HTTP stream descriptor and
+range-capable `/file/{id}` route dispatch to the provider that created the
+track. A shared `TransferBudget` limits active transfers across both providers.
+
+The torrent provider accepts user-configured magnet URIs with a `btih` info
+hash or absolute local `.torrent` paths (metadata files are capped at 2 MiB).
+It adds at most eight configured sources, rejects torrents with over 10,000
+files and unsafe file paths, and
+returns only size-limited `.flac` files whose filenames contain every query
+term. It does not search a public index. WebTorrent 3.0.21 provides the
+magnet/metadata client and range-readable file streams. WebTorrent verifies
+piece hashes before exposing those pieces to readers. Torrent files use a
+separate persistent piece store and do not enter the Soulseek cache.
+
+The WebTorrent client explicitly disables UPnP and NAT-PMP, sets uploads to
+zero, caps peer connections, disables local peer discovery and web seeds, and
+starts with torrent files deselected. Reading an incomplete file selects its
+pieces; when readers become idle, selection is removed while stored verified
+pieces remain.
+The source manager limits aggregate declared torrent size, candidate file size,
+source count, and active transfer count. The launcher defaults to a 4 GiB
+aggregate torrent-size limit and a 128 MiB per-track limit. These limits are
+not claims about measured disk consumption or network throughput.
+
+The `libtorrent` npm binding inspected during library selection was version
+0.0.3, a legacy native Node addon with uncertain Windows build and maintenance
+status. WebTorrent was selected to avoid that native build path, not because
+its Windows networking or large-swarm behavior has been validated here.
+
 ## Implemented behavior versus known limitations
 
 ### Implemented
 
-- One authenticated Soulseek client per server process, shared by searches and
-  independent peer-file transfers.
-- Two active transfer slots by default, per-track consumers, disconnect grace
-  period, per-transfer timeout, and transfer cleanup.
-- FLAC candidate filtering and ranking, direct HTTP audio streaming, range
-  requests, partial-file offset reuse, and persistent completed-file caching.
-- Per-client search burst limiting, FLAC/ID3 signature checks before media
-  bytes are served, and rejection of peer data beyond the advertised file size.
-- Cache expiry and LRU size management with active-entry protection.
-- Download permission advertised in the manifest, off by default. When enabled,
-  BitChord's direct-download request follows the regular `/stream/{id}` URL to
-  `/file/{id}`; no separate server-side download subsystem is needed.
+- Optional provider startup, Soulseek enabled by default, BitTorrent disabled
+  by default, and conditional Soulseek credentials.
+- Provider-neutral FLAC search, stable provider-separated track identities,
+  shared transfer concurrency, stream routing, monitor data, and cancellation
+  of HTTP readers.
+- Soulseek search/transfer behavior, persistent partial/completed cache,
+  byte-range service, offset resume, FLAC signature validation, and size checks.
+- User-configured magnet and local `.torrent` inputs, filename matching, and
+  WebTorrent piece-aware range reads.
+- Per-client search rate limiting, signed media URLs when BitChord proof auth
+  is enabled, and source URL path authentication.
 
-### Known compatibility gaps and limitations
+### Known limitations
 
-- **Android cleartext policy blocks the plain-HTTP LAN URL.** The current
+- **No live BitTorrent peer or BitChord playback validation has been performed.**
+  Current automated tests use local/synthetic data; availability, first-byte
+  latency, repeated range behavior, and cancellation against real swarms remain
+  unverified.
+- **Android cleartext policy blocks the plain-HTTP LAN URL.** The inspected
   BitChord Android manifest sets `android:usesCleartextTraffic="false"`.
-  BitSeekWin cannot override that client-side policy. BitChord would need a
+  P2PChord cannot override that client-side policy. BitChord would need a
   user-approved, host-scoped LAN cleartext exception, or the connection must
-  use HTTPS trusted by Android (for example, Tailscale HTTPS on both devices).
-  Do not disable cleartext protection globally.
-- **Quality tiers are ignored.** BitChord documents sending `quality` on both
-  search and stream requests. BitSeekWin currently reads only the search `q`
-  parameter and always searches/returns FLAC lossless results, regardless of
-  a requested tier such as `HIGH` or `LOW`. The stream handler likewise
-  returns FLAC without negotiating the query parameter.
-- **Manifest IDs may collide.** The current ID is
-  `bitseekwin-addon.${slug}`; with the default slug, independent installations
-  report the same ID. The official docs require a stable, unique ID. Setting
-  a distinct slug also changes this ID, but there is no generated per-install
-  identity mechanism.
-- The server caps each search response at 50 tracks; BitChord's protocol does
-  not define a result limit parameter.
-- Soulseek peers may be offline, queue or refuse transfers, disconnect, or
-  provide data that differs from the search result. Actual playback and
-  offset-resume behavior depends on the peer, network, library, and BitChord
-  client and needs live testing. BitSeekWin does not automatically switch a
-  failed stream to another peer: cache entries are bound to peer/file/size,
-  and transparent switching would need to prove that alternate bytes represent
-  the same recording before continuing a range or partial transfer. BitChord
-  can select another returned result, or the user can retry after changing the
-  source result.
-- `stream_cache.bench.mjs` compares per-chunk writes with multiple batch
-  thresholds, peer chunk sizes, flush delays, and one or two local transfers.
-  It uses a synthetic local peer and measures the cache/HTTP path only; results
-  do not predict Soulseek peer throughput or WAN performance. Run it with
-  `node --expose-gc stream_cache.bench.mjs`; `BITSEEKWIN_BENCH_MIB` and
-  `BITSEEKWIN_BENCH_REPEATS` control the synthetic file size and repetitions.
-  Set `BITSEEKWIN_BENCH_TARGETED=true` to compare per-chunk writes with the
-  selected 128 KiB batch across 64/128/256/512 KiB peer chunks.
-- The library's in-memory buffering and the 128 MiB/two-transfer limits mean
-  peak memory can still be high. Disk caching does not remove this limitation.
-- The server-side manifest/stream/file handoff is covered by tests, but a
-  download in the actual BitChord app has not been validated end to end. That
-  requires running the app with a reachable BitSeekWin instance and a peer
-  that serves the selected file; any app-version-specific download behavior
-  would need to be diagnosed there.
-- On Windows, stopping the child through the launcher may bypass Node's
-  graceful shutdown handlers; partial files remain on disk, but active
-  transfers may not be drained before process termination.
+  use HTTPS trusted by Android. Do not disable cleartext protection globally.
+- **Quality tiers are ignored.** BitChord sends `quality` on search and stream
+  requests, but P2PChord always returns FLAC regardless of a requested tier.
+- The default manifest ID `p2pchord-addon.${slug}` may collide between
+  independent installations; a distinct slug changes the ID, but there is no
+  generated per-install identity mechanism.
+- Searches are capped at 50 results. BitChord's protocol does not define a
+  result-count parameter.
+- Soulseek peers may queue, refuse, disconnect, or return mismatched data.
+  Torrent peers and trackers may be unavailable or slow. P2PChord does not
+  automatically switch sources mid-transfer; doing so could corrupt ranges or
+  resumed data if files differ.
+- Disabling NAT mappings and uploads does not hide the user's public IP from
+  BitTorrent trackers or connected peers, and a local peer listener may still
+  be opened. Users must import only torrents they are authorized to access.
+- The npm audit performed during this work reported four HIGH advisories
+  through `ip@2.0.1` (`GHSA-2p57-rm9w-gvfp`), with no patched version offered
+  by npm at that time. A forced WebTorrent downgrade was not applied; the
+  dependency tree should not be described as audit-clean.
+- `slsk-client` retains received chunks in memory and concatenates them at
+  transfer completion. The existing 128 MiB/two-transfer limits still permit
+  high memory use. Torrent storage is separate and disk-backed.
+- Synthetic server tests cover the manifest/stream/file handoff, but actual
+  playback, seeking, downloads, and compatibility across installed BitChord
+  releases require device and peer testing.
+- On Windows, launcher Stop may terminate the child without delivering a
+  graceful Node shutdown signal, so active transfers may not be drained.
 
 ### Future improvements (not implemented)
 
-- Honor or explicitly negotiate BitChord quality tiers, while accurately
-  describing the formats BitSeekWin can actually provide.
-- Provide a unique, stable manifest ID per configured installation, if the
-  product is intended to support multiple instances in one BitChord install.
-- Reduce or eliminate library-level in-memory buffering if the Soulseek
-  library or a future supported implementation permits safe disk streaming.
-- Test transfer resume, repeated ranges, and playback/disconnect behavior with
-  live Soulseek peers and BitChord devices.
+- Run live Soulseek and BitTorrent peer tests for first-byte latency, real
+  range seeking, peer timeouts, storage persistence, and transfer cancellation.
+- Test playback/download/range behavior on the BitChord versions users actually
+  have installed.
+- Honor or explicitly negotiate BitChord quality tiers and consider a unique
+  stable manifest ID per installation.
+- Reassess the flagged transitive dependency when a compatible patched release
+  becomes available; do not force a downgrade without compatibility testing.
+- Reduce library-level in-memory buffering if a safe supported approach exists.

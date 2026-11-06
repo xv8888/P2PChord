@@ -62,6 +62,7 @@ export class StreamCache {
     peerIdleTimeout,
     idleTransferTimeout,
     formatBytes,
+    transferBudget,
     validateFlac = true,
     writeBatchBytes = WRITE_BATCH_BYTES,
     writeBatchDelayMs = WRITE_BATCH_DELAY_MS,
@@ -78,6 +79,7 @@ export class StreamCache {
     this.peerIdleTimeout = peerIdleTimeout;
     this.idleTransferTimeout = idleTransferTimeout;
     this.formatBytes = formatBytes;
+    this.transferBudget = transferBudget;
     this.validateFlac = validateFlac;
     this.writeBatchBytes = writeBatchBytes;
     this.writeBatchDelayMs = writeBatchDelayMs;
@@ -357,12 +359,19 @@ export class StreamCache {
         );
         throw new Error("Too many active Soulseek streams");
       }
+      let releaseSlot;
+      try {
+        releaseSlot = this.transferBudget?.acquire();
+      } catch {
+        throw new Error("Too many active Soulseek streams", { cause: "transfer-limit" });
+      }
       this.log(
         "INFO",
         `File request ${context.requestId ?? "unknown"} has a transfer slot for result id=${track.id} ` +
           `(${this.activeStreams + 1}/${this.maxActiveStreams}; +${(performance.now() - (context.requestStartedAt ?? performance.now())).toFixed(1)}ms).`,
       );
       transfer = this.createTransfer(entry, track, peerFileKey, context);
+      transfer.releaseSlot = releaseSlot;
     }
     await transfer.ready;
   }
@@ -456,7 +465,7 @@ export class StreamCache {
         transfer.writePosition = 0;
         entry.receivedBytes = 0;
       }
-      const tempPath = join(tmpdir(), "BitSeekWin", `${randomUUID()}.flac`);
+      const tempPath = join(tmpdir(), "P2PChord", `${randomUUID()}.flac`);
       transfer.downloadStartedAt = performance.now();
       this.log(
         "STREAM",
@@ -722,6 +731,8 @@ export class StreamCache {
           this.activePeerFiles.delete(transfer.peerFileKey);
         }
         this.activeStreams--;
+        transfer.releaseSlot?.();
+        transfer.releaseSlot = null;
         this.notify(transfer.entry);
         transfer.resolveReleased();
         this.log("STREAM", `Stream slot released (${this.activeStreams} active).`);
@@ -736,7 +747,7 @@ export class StreamCache {
       .map((entry) => entry.activeTransfer)
       .filter(Boolean);
     for (const transfer of active) {
-      transfer.cancel("BitSeekWin is shutting down");
+      transfer.cancel("P2PChord is shutting down");
     }
     await Promise.all(active.map((transfer) => transfer.released));
     await this.sweepQueue;

@@ -3,6 +3,26 @@
 Notable changes are recorded here. Historical entries summarize changes
 available in the project history and prior session records.
 
+## alpha-0.1.0
+
+- Rebranded the user-facing launcher, manifest, and documentation as P2PChord
+  and renamed the add-on ID, `P2PCHORD_*` configuration, source URL slug, and
+  storage namespace. This is a breaking change; old settings and source URLs
+  are not migrated, and prior cache folders are left untouched.
+- Reset the current alpha version to `alpha-0.1.0` and replaced the prioritized
+  roadmap with the seven-stage Alpha plan.
+- Reworked the launcher into a horizontal-navigation music-app layout while
+  retaining its live activity, provider, connection, and configuration controls.
+- Added an opt-in experimental BitTorrent provider using WebTorrent 3.0.21.
+  Soulseek remains enabled by default; users can run Soulseek-only,
+  BitTorrent-only, or both with a shared transfer limit.
+- Added user-supplied magnet and local `.torrent` inputs, filename-based FLAC
+  search, separate piece storage, and provider-neutral HTTP range streaming.
+  UPnP/NAT-PMP mappings and uploads are disabled; the provider is not a public
+  torrent search engine.
+- Added launcher provider controls and documentation of unverified live peer
+  behavior. No live BitTorrent swarm or BitChord playback test is claimed.
+
 ## alpha-0.5.5
 
 - Added an explicit LAN source mode that detects a private IPv4 address, uses
@@ -46,16 +66,16 @@ available in the project history and prior session records.
   current launch only.
 - Preserved existing defaults and capped transfer concurrency at two. Fastest
   reported-speed selection remains optional and may choose a less relevant
-  result; the peer-reported speed is not measured by BitSeekWin.
+  result; the peer-reported speed is not measured by P2PChord.
 - Added Windows CI for the Node and launcher test suites. Tightened the
-  stop script to match exact BitSeekWin script arguments rather than arbitrary
+  stop script to match exact P2PChord script arguments rather than arbitrary
   command-line substrings.
 - Batched subsequent cache writes while flushing the first audio chunk
   immediately (128 KiB threshold, 1 ms maximum delay). Writes remain
   serialized, HTTP readers wait for persisted bytes, and the HTTP response
   retains independent backpressure. Added a repeatable synthetic HTTP/cache
   benchmark; it does not measure Soulseek or WAN throughput.
-- Clarified that BitChord excludes BitSeekWin from download-source selection
+- Clarified that BitChord excludes P2PChord from download-source selection
   while the manifest's `allowDownloads` flag is false (the intentional
   default), documented how to opt in, and tested the manifest-to-file URL
   handoff without claiming a live BitChord download test.
@@ -68,7 +88,7 @@ available in the project history and prior session records.
   tokens; no Apple font files are bundled.
 - Restyled the launcher’s source-phrase sliders with a thin rounded Apple Music
   style track, filled progress, and circular thumb for Chromium and Firefox.
-- Emphasized the BitSeek portion of the launcher wordmark with a slightly larger
+- Emphasized the P2P portion of the launcher wordmark with a slightly larger
   bold weight and reduced the superscript Win size.
 
 ## alpha-0.5.0

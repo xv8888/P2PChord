@@ -29,9 +29,9 @@ These are source/documentation findings, not a report of the version installed
 by any particular user. Installed versions and release behavior must be
 confirmed separately, and live add-on testing is still needed.
 
-### BitSeekWin today
+### P2PChord today
 
-BitSeekWin serves a JSON manifest with `resources: ["search", "stream"]` and
+P2PChord serves a JSON manifest with `resources: ["search", "stream"]` and
 the optional `allowDownloads` flag. Signed request authentication is now an
 explicit, default-off setting. When enabled, the manifest declares
 `bitchordAuth: true`; `/search` and `/stream` validate `X-BitChord-Token` and
@@ -50,7 +50,7 @@ server itself does not provide TLS.
 
 - **Inspected 1.9.0 source:** It did not implement the newer proof mechanism,
   so the newer proof requirement is not indicated by that source snapshot.
-  Whether a particular 1.9.0 build can reach a BitSeekWin URL still depends on
+  Whether a particular 1.9.0 build can reach a P2PChord URL still depends on
   network reachability, URL configuration, and Android cleartext policy.
 - **Inspected 1.9.1 behavior:** The legacy mode remains compatible with the
   documented behavior for non-opted-in add-ons, which work without proof
@@ -58,7 +58,7 @@ server itself does not provide TLS.
   1.9.1+ clients; older clients cannot provide the required proof.
 - **HTTPS:** When an add-on opts into proof authentication, BitChord sends
   proof headers only over HTTPS, except for loopback development addresses.
-  BitSeekWin's plain-HTTP LAN URL cannot use that opt-in mode. Independently,
+  P2PChord's plain-HTTP LAN URL cannot use that opt-in mode. Independently,
   the inspected Android release manifest sets
   `android:usesCleartextTraffic="false"`, so a plain-HTTP LAN URL may be blocked
   client-side even when the add-on stays in legacy mode. An HTTPS
@@ -75,17 +75,17 @@ of the new proof mechanism in 1.9.0, the optional-auth behavior and request
 challenge handling in the inspected 1.9.1 source, and the cited Android
 cleartext setting.
 
-**Verified by automated tests:** BitSeekWin's legacy and opt-in paths,
+**Verified by automated tests:** P2PChord's legacy and opt-in paths,
 generated-token/proof verification, signed media URL checks, and ranged
 `/file` delivery.
 
 **Requires release/device testing:** which protocol a user's installed
 BitChord build enforces; whether it can register, search, resolve, play,
-download, and seek against the current BitSeekWin deployment; and whether a
+download, and seek against the current P2PChord deployment; and whether a
 given HTTPS/LAN setup is reachable and trusted. Do not infer universal client
 compatibility from synthetic protocol tests or the inspected source version
 and published documentation alone. The official verifier artifact is not
-vendored; BitSeekWin implements its published protocol independently.
+vendored; P2PChord implements its published protocol independently.
 
 ## Known Limitations
 
@@ -105,20 +105,20 @@ vendored; BitSeekWin implements its published protocol independently.
 - Compatibility with installed BitChord versions, including actual playback,
   download, and range-seek behavior, has not been validated end to end across
   old and new clients.
-- Optional SMB export is only a proposal. BitSeekWin does not currently expose
+- Optional SMB export is only a proposal. P2PChord does not currently expose
   completed cache files through SMB.
 
 ## Compatibility and Migration Risks
 
-1. **Opt-in carefully.** BitSeekWin advertises `bitchordAuth: true` only when
+1. **Opt-in carefully.** P2PChord advertises `bitchordAuth: true` only when
    proof verification is enabled. This mode is a security choice; BitChord
    1.9.1 does not require every add-on to opt in.
 2. **Preserve the current path-secret mechanism during migration.** Removing
    it outright could break existing URLs, launcher workflows, and clients
-   using current behavior. Since the new feature is opt-in, BitSeekWin can
+   using current behavior. Since the new feature is opt-in, P2PChord can
    remain in legacy mode while its value and migration are evaluated.
 3. **Opt-in changes client compatibility.** BitChord 1.9.0 and older clients
-   do not implement this proof protocol. If BitSeekWin starts requiring proof
+   do not implement this proof protocol. If P2PChord starts requiring proof
    on its existing endpoint, those clients will not be able to use it. Do not
    assume a protected and legacy mode can safely share one endpoint until
    tested.
@@ -193,30 +193,32 @@ provide live Soulseek search, partial-download playback, or live streaming,
 and it would remain separate from the existing Soulseek add-on and streaming
 engine.
 
-## Prioritized roadmap
+## Alpha roadmap
 
-### Priority 1 — Compatibility
+### Immediate priority — BitChord 1.9.1 compatibility
 
-- Confirm the exact BitChord versions currently used by existing users.
-- Test BitSeekWin's current legacy mode with BitChord 1.9.0 and 1.9.1+.
-- Keep authentication opt-in and test both legacy mode and the protected mode
-  against the exact BitChord versions in use.
-- Preserve existing working clients and streaming behavior during migration.
+**Verified from the cited 1.9.1 documentation and client source:** signed
+add-on authentication is optional, not a requirement for every add-on.
+Opt-in add-ons declare `bitchordAuth: true` (or can be challenged by the
+server); proof requests use HTTPS except for loopback. The inspected 1.9.0
+source does not implement this proof protocol, and legacy add-ons may show an
+“Outdated addon” notice in 1.9.1.
 
-### Priority 2 — Reliability and performance
+**Not yet verified against live BitChord clients:** successful source
+registration, search, playback, downloads, and repeated/ranged seeking with
+P2PChord in both legacy and opt-in modes. Installed client versions and
+network/TLS behavior also need confirmation. Keep authentication opt-in and
+legacy behavior available until those release/device tests are complete; do
+not infer universal compatibility from source inspection or automated tests.
 
-- Continue investigating first-byte latency and peer transfer startup.
-- Test cache batching and transfer timeouts with real Soulseek peers.
-- Preserve byte-range integrity, cancellation isolation, and resumability.
-- Do not claim performance improvements based solely on synthetic benchmarks.
+| Stage | Focus |
+|---|---|
+| Alpha 1–2 | P2PChord rebrand, BitTorrent library integration, magnet and torrent imports |
+| Alpha 3–4 | FLAC identification, verified piece downloads, HTTP range streaming |
+| Alpha 5 | Persistent cache, seeking, resume, resource management |
+| Alpha 6 | Security hardening, real-world performance testing, Soulseek regression testing |
+| Alpha 7 | Evaluate additional providers such as eDonkey/Kad or Direct Connect |
 
-### Priority 3 — LAN usability
-
-- Improve LAN address discovery and source configuration.
-- Establish a secure, Android-compatible HTTPS approach.
-- Document any BitChord-side changes required for LAN access.
-
-### Priority 4 — Optional SMB export
-
-- Implement only if there is a clear use case.
-- Keep it separate from the existing Soulseek add-on and streaming engine.
+These stages describe the intended development sequence. Some Alpha 1–5
+foundations are already present, but live peer availability, playback
+compatibility, and real-world performance still require validation.

@@ -16,8 +16,10 @@ import { fileURLToPath } from "node:url";
 import { FileAttribute, SlskClient } from "slsk-client";
 import { createBitChordAuth } from "./bitchord_auth.mjs";
 import { StreamCache } from "./stream_cache.mjs";
+import { TorrentProvider } from "./torrent_provider.mjs";
+import { TransferBudget } from "./transfer_budget.mjs";
 
-const APP_NAME = "BitSeekWin - BitChord-Soulseek Integration";
+const APP_NAME = "P2PChord - Peer-powered music. One streaming bridge.";
 const VERSION = (await readFile(new URL("./version.txt", import.meta.url), "utf8"))
   .trim();
 const SOURCE_WORDS = JSON.parse(
@@ -26,28 +28,28 @@ const SOURCE_WORDS = JSON.parse(
 const DEFAULT_SECRET_WORD_COUNT = 3;
 const DEFAULT_SECRET_WORD_LENGTH = 6;
 const ALLOW_DOWNLOADS = readBooleanEnvironmentValue(
-  "BITSEEKWIN_ALLOW_DOWNLOADS",
+  "P2PCHORD_ALLOW_DOWNLOADS",
   false,
 );
-const BIND_ADDRESS = process.env.BITSEEKWIN_BIND_ADDRESS ?? "127.0.0.1";
+const BIND_ADDRESS = process.env.P2PCHORD_BIND_ADDRESS ?? "127.0.0.1";
 const BITCHORD_AUTH_ENABLED = readBooleanEnvironmentValue(
-  "BITSEEKWIN_BITCHORD_AUTH",
+  "P2PCHORD_BITCHORD_AUTH",
   false,
 );
 const SECRET_WORD_LENGTH_VARIANCE = 3;
 const SECRET_WORD_COUNT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_WORD_COUNT",
+  "P2PCHORD_WORD_COUNT",
   DEFAULT_SECRET_WORD_COUNT,
   2,
   8,
 );
 const SECRET_WORD_LENGTH = readIntegerEnvironmentValue(
-  "BITSEEKWIN_WORD_LENGTH",
+  "P2PCHORD_WORD_LENGTH",
   DEFAULT_SECRET_WORD_LENGTH,
   3,
   9,
 );
-const SLUG = process.env.BITSEEKWIN_SLUG ?? "bitseekwin";
+const SLUG = process.env.P2PCHORD_SLUG ?? "p2pchord";
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const SECRET =
   process.env.BITCHORD_SECRET ??
@@ -56,33 +58,33 @@ const PUBLIC_BASE_URL = (
   process.env.PUBLIC_BASE_URL ?? `http://127.0.0.1:${PORT}`
 ).replace(/\/+$/, "");
 const SEARCH_TIMEOUT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_SEARCH_TIMEOUT_MS",
+  "P2PCHORD_SEARCH_TIMEOUT_MS",
   2000,
   500,
   30000,
 );
 const LOGIN_TIMEOUT = 30000;
 const SEARCH_LIMIT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_SEARCH_LIMIT",
+  "P2PCHORD_SEARCH_LIMIT",
   50,
   1,
   50,
 );
 const SEARCH_RECOVERY = readBooleanEnvironmentValue(
-  "BITSEEKWIN_SEARCH_RECOVERY",
+  "P2PCHORD_SEARCH_RECOVERY",
   true,
 );
 const MAX_TRACKS = 1000;
 const TRACK_RETENTION_MS = 20 * 60 * 1000;
 const MAX_TRACK_SEARCH_REQUESTS = 8;
 const MAX_ACTIVE_STREAMS = readIntegerEnvironmentValue(
-  "BITSEEKWIN_MAX_ACTIVE_STREAMS",
+  "P2PCHORD_MAX_ACTIVE_STREAMS",
   2,
   1,
   2,
 );
 const MAX_STREAM_BYTES = readIntegerEnvironmentValue(
-  "BITSEEKWIN_MAX_STREAM_BYTES",
+  "P2PCHORD_MAX_STREAM_BYTES",
   128 * 1024 * 1024,
   1,
   128 * 1024 * 1024,
@@ -90,46 +92,68 @@ const MAX_STREAM_BYTES = readIntegerEnvironmentValue(
 const STREAM_TIMEOUT = 15 * 60 * 1000;
 const SIGNED_MEDIA_URL_TTL_SECONDS = 15 * 60;
 const FIRST_BYTE_TIMEOUT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_FIRST_BYTE_TIMEOUT_MS",
+  "P2PCHORD_FIRST_BYTE_TIMEOUT_MS",
   30 * 1000,
   1000,
   5 * 60 * 1000,
 );
 const PEER_IDLE_TIMEOUT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_PEER_IDLE_TIMEOUT_MS",
+  "P2PCHORD_PEER_IDLE_TIMEOUT_MS",
   30 * 1000,
   1000,
   5 * 60 * 1000,
 );
 const IDLE_TRANSFER_TIMEOUT = readIntegerEnvironmentValue(
-  "BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS",
+  "P2PCHORD_IDLE_TRANSFER_TIMEOUT_MS",
   30 * 1000,
   1,
   Number.MAX_SAFE_INTEGER,
 );
 const CACHE_TTL_MS = readIntegerEnvironmentValue(
-  "BITSEEKWIN_CACHE_TTL_MS",
+  "P2PCHORD_CACHE_TTL_MS",
   30 * 60 * 1000,
   1,
   Number.MAX_SAFE_INTEGER,
 );
 const MAX_CACHE_BYTES = readIntegerEnvironmentValue(
-  "BITSEEKWIN_CACHE_MAX_BYTES",
+  "P2PCHORD_CACHE_MAX_BYTES",
   2 * 1024 * 1024 * 1024,
   1,
   Number.MAX_SAFE_INTEGER,
 );
-const CACHE_DIRECTORY = resolve(
-  process.env.BITSEEKWIN_CACHE_DIRECTORY ??
-    join(process.env.LOCALAPPDATA ?? join(homedir(), ".cache"), "BitSeekWin", "cache"),
+const SOULSEEK_ENABLED = readBooleanEnvironmentValue(
+  "P2PCHORD_SOULSEEK_ENABLED",
+  true,
 );
-const SOURCE_SELECTION = process.env.BITSEEKWIN_SOURCE_SELECTION ?? "match";
+const TORRENT_ENABLED = readBooleanEnvironmentValue(
+  "P2PCHORD_TORRENT_ENABLED",
+  false,
+);
+const TORRENT_SOURCES = readStringArrayEnvironmentValue(
+  "P2PCHORD_TORRENT_SOURCES",
+  [],
+);
+const TORRENT_DIRECTORY = resolve(
+  process.env.P2PCHORD_TORRENT_DIRECTORY ??
+    join(process.env.LOCALAPPDATA ?? join(homedir(), ".cache"), "P2PChord", "torrents"),
+);
+const MAX_TORRENT_STORAGE_BYTES = readIntegerEnvironmentValue(
+  "P2PCHORD_TORRENT_STORAGE_MAX_BYTES",
+  4 * 1024 * 1024 * 1024,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const CACHE_DIRECTORY = resolve(
+  process.env.P2PCHORD_CACHE_DIRECTORY ??
+    join(process.env.LOCALAPPDATA ?? join(homedir(), ".cache"), "P2PChord", "cache"),
+);
+const SOURCE_SELECTION = process.env.P2PCHORD_SOURCE_SELECTION ?? "match";
 const SOURCE_SELECTION_MODES = new Set(["match", "speed"]);
 const SEARCH_LIMIT_MAX = 50;
 const SEARCH_RATE_LIMIT_BURST = 10;
 const SEARCH_RATE_LIMIT_REFILL_MS = 1000;
 if (!SOURCE_SELECTION_MODES.has(SOURCE_SELECTION)) {
-  throw new TypeError("BITSEEKWIN_SOURCE_SELECTION must be 'match' or 'speed'.");
+  throw new TypeError("P2PCHORD_SOURCE_SELECTION must be 'match' or 'speed'.");
 }
 
 function readIntegerEnvironmentValue(name, defaultValue, minimum, maximum) {
@@ -151,6 +175,25 @@ function readBooleanEnvironmentValue(name, defaultValue) {
   if (raw === "true") return true;
   if (raw === "false") return false;
   throw new TypeError(`${name} must be "true" or "false".`);
+}
+
+function readStringArrayEnvironmentValue(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new TypeError(`${name} must be a JSON string array.`);
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length > 8 ||
+    value.some((entry) => typeof entry !== "string" || entry.length > 4096)
+  ) {
+    throw new TypeError(`${name} must contain at most 8 strings of at most 4096 characters.`);
+  }
+  return value;
 }
 
 export function generateSourceSecret(
@@ -415,6 +458,8 @@ function sendError(response, status, message) {
 
 export function createAddonServer({
   client,
+  torrentProvider = null,
+  transferBudget,
   logger = defaultLogger,
   secret = SECRET,
   slug = SLUG,
@@ -443,6 +488,9 @@ export function createAddonServer({
 }) {
   if (typeof requireBitChordAuth !== "boolean") {
     throw new TypeError("requireBitChordAuth must be true or false.");
+  }
+  if (!client && !torrentProvider) {
+    throw new TypeError("At least one audio source provider must be enabled.");
   }
   if (typeof validateFlac !== "boolean") {
     throw new TypeError("validateFlac must be true or false.");
@@ -545,6 +593,7 @@ export function createAddonServer({
   const tracks = new Map();
   const trackState = new Map();
   const searchRateLimits = new Map();
+  const sharedTransferBudget = transferBudget ?? new TransferBudget(maxActiveStreams);
 
   function log(level, message) {
     logger(level, sanitizeLogMessage(message));
@@ -581,7 +630,7 @@ export function createAddonServer({
     for (const [id, state] of trackState) {
       if (now - state.lastUsedAt >= trackRetentionMs) {
         const track = tracks.get(id);
-        if (track && streamCache.hasActiveTrackUse(track)) {
+        if (track && isTrackActive(track)) {
           state.lastUsedAt = now;
           continue;
         }
@@ -611,7 +660,7 @@ export function createAddonServer({
     const state = trackState.get(id);
     const now = Date.now();
     const expired = state && now - state.lastUsedAt >= trackRetentionMs;
-    if (!track || !state || (expired && !streamCache.hasActiveTrackUse(track))) {
+    if (!track || !state || (expired && !isTrackActive(track))) {
       tracks.delete(id);
       trackState.delete(id);
       log(
@@ -628,6 +677,12 @@ export function createAddonServer({
         `file="${track.file}" peer=${track.user}.`,
     );
     return { track, searchRequestIds: [...state.searchRequestIds] };
+  }
+
+  function isTrackActive(track) {
+    return Boolean(
+      sourceProviders.get(track.provider)?.hasActiveTrackUse(track),
+    );
   }
 
   function signMediaUrl(trackId) {
@@ -664,6 +719,7 @@ export function createAddonServer({
     ttlMs: cacheTtlMs,
     maxBytes: maxCacheBytes,
     maxActiveStreams,
+    transferBudget: sharedTransferBudget,
     maxStreamBytes,
     validateFlac,
     streamTimeout: STREAM_TIMEOUT,
@@ -674,6 +730,10 @@ export function createAddonServer({
     ...(writeBatchBytes !== undefined ? { writeBatchBytes } : {}),
     ...(writeBatchDelayMs !== undefined ? { writeBatchDelayMs } : {}),
   });
+  const sourceProviders = new Map([
+    ["soulseek", streamCache],
+    ...(torrentProvider ? [["torrent", torrentProvider]] : []),
+  ]);
 
   async function handle(request, response) {
     const requestStartedAt = performance.now();
@@ -738,9 +798,16 @@ export function createAddonServer({
 
     if (route.length === 1 && route[0] === "monitoring" && request.method === "GET") {
       try {
+        const providerStatus = {};
+        if (client) {
+          Object.assign(providerStatus, await streamCache.getMonitoringSnapshot());
+        }
+        if (torrentProvider) {
+          providerStatus.torrent = torrentProvider.getMonitoringSnapshot();
+        }
         sendJson(response, 200, {
           connection: getConnectionStatus(),
-          ...(await streamCache.getMonitoringSnapshot()),
+          ...providerStatus,
         });
       } catch (error) {
         log("ERROR", `Could not read monitoring status: ${error.message}`);
@@ -754,11 +821,11 @@ export function createAddonServer({
         response,
         200,
         {
-          id: `bitseekwin-addon.${slug}`,
+          id: `p2pchord-addon.${slug}`,
           name: APP_NAME,
           version: VERSION,
           description:
-            "Search authorized FLAC files and stream them directly from Soulseek peers to BitChord.",
+            "Search and stream FLAC files directly from Soulseek peers and configured torrents to BitChord.",
           resources: ["search", "stream"],
           types: ["track"],
           contentType: "music",
@@ -792,56 +859,76 @@ export function createAddonServer({
         return;
       }
       try {
-        log("SEARCH", `Search request ${searchRequestId}: searching Soulseek for "${query}".`);
-        let results = await client.search({ req: query, timeout: searchTimeout });
-        if (searchRecovery && results.length === 0) {
-          const recoveryQuery = searchRecoveryQuery(query);
-          if (recoveryQuery) {
-            log(
-              "SEARCH",
-              `Search request ${searchRequestId}: no exact results; retrying with likely missing vowels as "${recoveryQuery}".`,
-            );
-            results = await client.search({
-              req: recoveryQuery,
-              timeout: searchTimeout,
+        const candidates = [];
+        if (client) {
+          log("SEARCH", `Search request ${searchRequestId}: searching Soulseek for "${query}".`);
+          let results = await client.search({ req: query, timeout: searchTimeout });
+          if (searchRecovery && results.length === 0) {
+            const recoveryQuery = searchRecoveryQuery(query);
+            if (recoveryQuery) {
+              log(
+                "SEARCH",
+                `Search request ${searchRequestId}: no exact results; retrying with likely missing vowels as "${recoveryQuery}".`,
+              );
+              results = await client.search({
+                req: recoveryQuery,
+                timeout: searchTimeout,
+              });
+            }
+          }
+          for (const result of results) {
+            if (
+              !result.user ||
+              !isSafeFlac(result.file) ||
+              !Number.isSafeInteger(result.size) ||
+              result.size <= 0
+            ) {
+              continue;
+            }
+            const id = trackId(result);
+            const { title, artist } = trackMetadata(query, result.file);
+            const track = {
+              id,
+              provider: "soulseek",
+              user: result.user,
+              file: result.file,
+              size: result.size,
+              title,
+              artist,
+              duration: validDuration(result.attribs?.[FileAttribute.Duration]),
+            };
+            candidates.push({
+              track,
+              score: matchScore(query, `${title} ${artist}`),
+              slots: result.slots === true,
+              speed: Number.isFinite(result.speed) ? result.speed : 0,
+              queueLength: Number.isFinite(result.queueLength)
+                ? result.queueLength
+                : Number.MAX_SAFE_INTEGER,
             });
           }
         }
-        const candidates = [];
-        const seen = new Set();
-        for (const result of results) {
-          if (
-            !result.user ||
-            !isSafeFlac(result.file) ||
-            !Number.isSafeInteger(result.size) ||
-            result.size <= 0
-          ) {
-            continue;
+        if (torrentProvider) {
+          for (const result of torrentProvider.search(query)) {
+            if (!isSafeFlac(result.file) || result.size > maxStreamBytes) continue;
+            const { title, artist } = trackMetadata(query, result.file);
+            const track = { ...result, title, artist };
+            candidates.push({
+              track,
+              score: matchScore(query, `${title} ${artist}`),
+              slots: result.slots,
+              speed: result.speed,
+              queueLength: result.queueLength,
+            });
           }
-          const id = trackId(result);
-          if (seen.has(id)) continue;
-          seen.add(id);
-          const { title, artist } = trackMetadata(query, result.file);
-          const track = {
-            id,
-            user: result.user,
-            file: result.file,
-            size: result.size,
-            title,
-            artist,
-            duration: validDuration(result.attribs?.[FileAttribute.Duration]),
-          };
-          candidates.push({
-            track,
-            score: matchScore(query, `${title} ${artist}`),
-            slots: result.slots === true,
-            speed: Number.isFinite(result.speed) ? result.speed : 0,
-            queueLength: Number.isFinite(result.queueLength)
-              ? result.queueLength
-              : Number.MAX_SAFE_INTEGER,
-          });
         }
-        candidates.sort((left, right) => {
+        const seen = new Set();
+        const uniqueCandidates = candidates.filter(({ track }) => {
+          if (seen.has(track.id)) return false;
+          seen.add(track.id);
+          return true;
+        });
+        uniqueCandidates.sort((left, right) => {
           const speedOrder = right.speed - left.speed;
           const matchOrder = right.score - left.score;
           const slotOrder = Number(right.slots) - Number(left.slots);
@@ -854,7 +941,7 @@ export function createAddonServer({
             left.track.id.localeCompare(right.track.id)
           );
         });
-        const selectedCandidates = candidates.slice(
+        const selectedCandidates = uniqueCandidates.slice(
           0,
           sourceSelection === "speed" ? 1 : searchLimit,
         );
@@ -872,23 +959,25 @@ export function createAddonServer({
         }
         if (found.length) {
           const bestDescription = sourceSelection === "speed"
-            ? `selected the fastest reported uploader "${found[0].user}" at reported speed ${candidates[0].speed}: `
+            ? found[0].provider === "soulseek"
+              ? `selected the fastest reported uploader "${found[0].user}" at reported speed ${uniqueCandidates[0].speed}: `
+              : `selected the fastest ${found[0].provider} source "${found[0].user}" at reported/observed speed ${uniqueCandidates[0].speed}: `
             : `best match: `;
           const resultLabel = found.length === 1 ? "candidate" : "candidates";
           log(
             "SEARCH",
-            `Search request ${searchRequestId}: found ${candidates.length} FLAC matches; returning ${found.length} ${
+            `Search request ${searchRequestId}: found ${uniqueCandidates.length} FLAC matches; returning ${found.length} ${
               sourceSelection === "speed" ? "fastest-speed" : "ranked"
             } ${resultLabel}. ${bestDescription}"${found[0].title}"${found[0].artist ? ` by ${found[0].artist}` : ""}${found[0].duration ? ` (${found[0].duration}s)` : ""}.`,
           );
           const selectedCandidateSet = new Set(selectedCandidates);
-          for (const candidate of candidates.slice(0, SEARCH_LIMIT_MAX)) {
+          for (const candidate of uniqueCandidates.slice(0, SEARCH_LIMIT_MAX)) {
             const { track } = candidate;
             const selected = selectedCandidateSet.has(candidate);
             if (selected) rememberTrack(track, searchRequestId);
             log(
               "SEARCH",
-              `Search request ${searchRequestId}: result id=${track.id} file="${track.file}" peer=${track.user}; ` +
+              `Search request ${searchRequestId}: provider=${track.provider} result id=${track.id} file="${track.file}" source=${track.user}; ` +
                 `selectedForBitChord=${selected} ` +
                 `slotsAvailable=${candidate.slots} reportedSpeed=${candidate.speed} ` +
                 `queueLength=${candidate.queueLength === Number.MAX_SAFE_INTEGER ? "unknown" : candidate.queueLength} ` +
@@ -918,8 +1007,8 @@ export function createAddonServer({
         });
       } catch (error) {
         log("ERROR", `Search request ${searchRequestId} failed for "${query}": ${error.message}; HTTP 502.`);
-        console.error("Soulseek search failed:", sanitizeLogMessage(error.message));
-        sendError(response, 502, "Soulseek search failed");
+        console.error("Source search failed:", sanitizeLogMessage(error.message));
+        sendError(response, 502, "Source search failed");
       }
       return;
     }
@@ -1038,31 +1127,40 @@ export function createAddonServer({
 
       log(
         "STREAM",
-        `BitChord requested "${track.title}" from ${track.user} (${track.size} bytes${request.headers.range ? `, ${request.headers.range}` : ""}).`,
+        `BitChord requested "${track.title}" from ${track.provider} source ${track.user} (${track.size} bytes${request.headers.range ? `, ${request.headers.range}` : ""}).`,
       );
+      const provider = sourceProviders.get(track.provider);
+      if (!provider) {
+        sendError(response, 502, "Audio source provider is unavailable");
+        return;
+      }
       let entry;
       try {
-        entry = await streamCache.getEntry(track);
-        await streamCache.touch(entry);
+        entry = await provider.getEntry(track);
+        await provider.touch(entry);
         log(
           "STREAM",
           `File request ${requestId} cache entry ready (+${(performance.now() - requestStartedAt).toFixed(1)}ms).`,
         );
       } catch (error) {
-        if (entry) streamCache.removeConsumer(entry);
+        if (entry) provider.removeConsumer(entry);
         log("ERROR", `File request ${requestId} could not open result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 500.`);
         sendError(response, 500, "Could not open stream cache");
         return;
       }
 
       try {
-        if (!entry.complete && entry.receivedBytes <= end) {
-          await streamCache.ensureTransfer(entry, track, {
+        const complete = entry.complete ?? entry.done ?? false;
+        const needsTransfer = track.provider === "torrent"
+          ? !complete
+          : !entry.complete && entry.receivedBytes <= end;
+        if (needsTransfer) {
+          await provider.ensureTransfer(entry, track, {
             requestId,
             searchRequestIds,
             requestStartedAt,
           });
-        } else if (entry.activeTransfer) {
+        } else if (entry.activeTransfer || entry.releaseSlot) {
           log(
             "STREAM",
             `File request ${requestId} reuses existing transfer for result id=${track.id}; ` +
@@ -1075,10 +1173,10 @@ export function createAddonServer({
               `for result id=${track.id}; file="${track.file}" peer=${track.user}.`,
           );
         }
-        await streamCache.sweep();
+        await provider.sweep();
       } catch (error) {
-        streamCache.removeConsumer(entry);
-        if (error.message === "Too many active Soulseek streams") {
+        provider.removeConsumer(entry);
+        if (error.statusCode === 503 || error.message === "Too many active Soulseek streams") {
           log(
             "WARN",
             `File request ${requestId} could not start result id=${track.id} file="${track.file}" peer=${track.user}; ` +
@@ -1090,19 +1188,19 @@ export function createAddonServer({
           sendError(response, 409, error.message);
         } else {
           log("ERROR", `File request ${requestId} could not start result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 502.`);
-          sendError(response, 502, "Could not start Soulseek stream");
+          sendError(response, 502, "Could not start source stream");
         }
         return;
       }
 
       if (partial) {
-        headers["Content-Range"] = entry.complete
+        headers["Content-Range"] = (entry.complete ?? entry.done)
           ? `bytes ${start}-${end}/${track.size}`
           : `bytes ${start}-${end}/*`;
       }
       const streamAbort = new AbortController();
       const range = Readable.from(
-        streamCache.readRange(
+        provider.readRange(
           entry,
           start,
           end,
@@ -1122,11 +1220,17 @@ export function createAddonServer({
             `peer=${track.user} failed${response.headersSent ? ` after HTTP ${response.statusCode} began` : " before audio started"}: ${error.message}` +
             `${response.headersSent ? "." : "; HTTP 502."}`,
         );
-        console.error("Soulseek stream failed:", sanitizeLogMessage(error.message));
+        console.error("Source stream failed:", sanitizeLogMessage(error.message));
         if (response.headersSent) {
           response.destroy(error);
         } else {
-          sendError(response, 502, "Soulseek peer transfer failed before audio started");
+          sendError(
+            response,
+            502,
+            track.provider === "soulseek"
+              ? "Soulseek peer transfer failed before audio started"
+              : "Torrent transfer failed before audio started",
+          );
         }
       });
       let firstReadableAt = null;
@@ -1167,7 +1271,7 @@ export function createAddonServer({
         }
         range.destroy();
         streamAbort.abort();
-        streamCache.removeConsumer(entry);
+        provider.removeConsumer(entry);
       });
       log(
         "STREAM",
@@ -1213,28 +1317,48 @@ function formatBytes(bytes) {
 async function main() {
   const username = process.env.SOULSEEK_USERNAME?.trim();
   const password = process.env.SOULSEEK_PASSWORD;
-  if (!username || !password) {
+  if (SOULSEEK_ENABLED && (!username || !password)) {
     throw new Error("Set SOULSEEK_USERNAME and SOULSEEK_PASSWORD.");
   }
+  if (!SOULSEEK_ENABLED && !TORRENT_ENABLED) {
+    throw new Error("Enable at least one source with P2PCHORD_SOULSEEK_ENABLED or P2PCHORD_TORRENT_ENABLED.");
+  }
+  if (TORRENT_ENABLED && TORRENT_SOURCES.length === 0) {
+    throw new Error("Set P2PCHORD_TORRENT_SOURCES when BitTorrent is enabled.");
+  }
   if (!/^[A-Za-z0-9_-]+$/.test(SLUG)) {
-    throw new Error("BITSEEKWIN_SLUG must contain only letters, digits, _ or -.");
+    throw new Error("P2PCHORD_SLUG must contain only letters, digits, _ or -.");
   }
   if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
     throw new Error("PORT must be a valid TCP port.");
   }
   if (!isIP(BIND_ADDRESS)) {
-    throw new Error("BITSEEKWIN_BIND_ADDRESS must be an IP address.");
+    throw new Error("P2PCHORD_BIND_ADDRESS must be an IP address.");
   }
 
-  const client = new SlskClient({
-    timeout: LOGIN_TIMEOUT,
-    transferTimeout: 30000,
-    downloadTimeout: STREAM_TIMEOUT,
-    uploads: false,
-  });
+  const transferBudget = new TransferBudget(MAX_ACTIVE_STREAMS);
+  const client = SOULSEEK_ENABLED
+    ? new SlskClient({
+      timeout: LOGIN_TIMEOUT,
+      transferTimeout: 30000,
+      downloadTimeout: STREAM_TIMEOUT,
+      uploads: false,
+    })
+    : null;
+  const torrentProvider = TORRENT_ENABLED
+    ? new TorrentProvider({
+      logger: defaultLogger,
+      directory: TORRENT_DIRECTORY,
+      sources: TORRENT_SOURCES,
+      maxFileBytes: MAX_STREAM_BYTES,
+      maxStorageBytes: MAX_TORRENT_STORAGE_BYTES,
+      idleTransferTimeout: IDLE_TRANSFER_TIMEOUT,
+      transferBudget,
+    })
+    : null;
   let server;
   let streamCache;
-  let connectionStatus = "connecting";
+  let connectionStatus = client ? "connecting" : "disabled";
   let stopping = false;
   const shutdown = (exitCode = 0) => {
     if (stopping) return;
@@ -1258,35 +1382,51 @@ async function main() {
         return error;
       },
     );
-    void Promise.all([serverClosed, cacheClosed]).then(([serverError, cacheError]) => {
-      client.destroy();
-      process.exit(serverError || cacheError ? 1 : exitCode);
-    });
+    const torrentClosed = (torrentProvider?.close() ?? Promise.resolve()).then(
+      () => null,
+      (error) => {
+        defaultLogger("ERROR", `Could not stop BitTorrent provider cleanly: ${error.message}`);
+        return error;
+      },
+    );
+    void Promise.all([serverClosed, cacheClosed, torrentClosed]).then(
+      ([serverError, cacheError, torrentError]) => {
+        client?.destroy();
+        process.exit(serverError || cacheError || torrentError ? 1 : exitCode);
+      },
+    );
   };
-  client.on("server-error", (error) => {
-    connectionStatus = "error";
-    defaultLogger("ERROR", `Soulseek server error: ${error.message}`);
-  });
-  client.on("server-disconnect", ({ reconnecting }) => {
-    connectionStatus = reconnecting ? "connecting" : "disconnected";
-    defaultLogger("WARN", `Soulseek disconnected; reconnecting=${reconnecting}.`);
-  });
-  client.on("server-reconnect", () => {
-    connectionStatus = "connected";
-    defaultLogger("INFO", "Soulseek reconnected.");
-  });
-  client.on("relogged", () => {
-    connectionStatus = "error";
-    defaultLogger("ERROR", "Soulseek session was replaced by another login.");
-    shutdown(1);
-  });
+  if (client) {
+    client.on("server-error", (error) => {
+      connectionStatus = "error";
+      defaultLogger("ERROR", `Soulseek server error: ${error.message}`);
+    });
+    client.on("server-disconnect", ({ reconnecting }) => {
+      connectionStatus = reconnecting ? "connecting" : "disconnected";
+      defaultLogger("WARN", `Soulseek disconnected; reconnecting=${reconnecting}.`);
+    });
+    client.on("server-reconnect", () => {
+      connectionStatus = "connected";
+      defaultLogger("INFO", "Soulseek reconnected.");
+    });
+    client.on("relogged", () => {
+      connectionStatus = "error";
+      defaultLogger("ERROR", "Soulseek session was replaced by another login.");
+      shutdown(1);
+    });
+  }
 
   try {
-    await client.login(username, password);
-    connectionStatus = "connected";
-    defaultLogger("INFO", "Connected to Soulseek.");
+    if (client) {
+      await client.login(username, password);
+      connectionStatus = "connected";
+      defaultLogger("INFO", "Connected to Soulseek.");
+    }
+    await torrentProvider?.initialize();
     ({ server, streamCache } = createAddonServer({
       client,
+      torrentProvider,
+      transferBudget,
       allowDownloads: ALLOW_DOWNLOADS,
       sourceSelection: SOURCE_SELECTION,
       searchLimit: SEARCH_LIMIT,
@@ -1309,7 +1449,8 @@ async function main() {
     defaultLogger("INFO", "BitChord source endpoint is ready.");
     defaultLogger("INFO", `Listening on port ${PORT}; direct streaming enabled.`);
   } catch (error) {
-    client.destroy();
+    client?.destroy();
+    await torrentProvider?.close();
     throw error;
   }
 
@@ -1322,7 +1463,7 @@ if (
   fileURLToPath(import.meta.url) === resolve(process.argv[1])
 ) {
   main().catch((error) => {
-    defaultLogger("ERROR", `BitSeekWin startup failed: ${error.message}`);
+    defaultLogger("ERROR", `P2PChord startup failed: ${error.message}`);
     process.exitCode = 1;
   });
 }

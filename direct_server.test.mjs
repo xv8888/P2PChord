@@ -251,7 +251,7 @@ async function startServer(options = {}) {
   ({ server, streamCache } = createAddonServer({
     client,
     secret: "test-secret",
-    slug: "bitseekwin",
+    slug: "p2pchord",
     publicBaseUrl: "https://music.example.test",
     getConnectionStatus: () => monitorConnectionStatus,
     logger: (level, message) => logEntries.push({ level, message }),
@@ -261,7 +261,7 @@ async function startServer(options = {}) {
     ...options,
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
+  base = `http://127.0.0.1:${server.address().port}/p2pchord/test-secret`;
 }
 
 async function stopServer() {
@@ -277,7 +277,7 @@ beforeEach(async () => {
   monitorConnectionStatus = "connected";
   trackADelay = 200;
   transferDelay = 80;
-  cacheDirectory = await mkdtemp(join(tmpdir(), "bitseekwin-test-cache-"));
+  cacheDirectory = await mkdtemp(join(tmpdir(), "p2pchord-test-cache-"));
   client = {
     async search(options) {
       this.lastSearch = options;
@@ -325,7 +325,7 @@ async function searchTracks(query = "kick") {
 
 test("manifest and search expose only safe FLAC results", async () => {
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "alpha-0.5.5");
+  assert.equal(manifest.version, "alpha-0.1.0");
   assert.match(manifest.description, /directly from Soulseek peers/);
   assert.equal(manifest.allowDownloads, false);
   assert.equal("bitchordAuth" in manifest, false);
@@ -846,7 +846,7 @@ test("stream descriptor points to the authenticated direct-stream endpoint", asy
   const descriptor = await response.json();
   assert.equal(
     descriptor.url,
-    `https://music.example.test/bitseekwin/test-secret/file/${id}`,
+    `https://music.example.test/p2pchord/test-secret/file/${id}`,
   );
   assert.equal(descriptor.format, "flac");
   assert.equal(descriptor.codec, "flac");
@@ -1685,12 +1685,12 @@ test("files above the configured in-memory limit are rejected", async () => {
   ({ server } = createAddonServer({
     client,
     secret: "test-secret",
-    slug: "bitseekwin",
+    slug: "p2pchord",
     publicBaseUrl: "https://music.example.test",
     maxStreamBytes: 5,
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}/bitseekwin/test-secret`;
+  base = `http://127.0.0.1:${server.address().port}/p2pchord/test-secret`;
   const search = await (await fetch(`${base}/search?q=kick`)).json();
   const id = search.tracks[0].id;
   const response = await fetch(`${base}/file/${id}`);

@@ -13,14 +13,14 @@ const MIB = 1024 * KIB;
 const CHUNK_SIZES = [64, 128, 256, 512].map((size) => size * KIB);
 const BATCH_SIZES = [64, 128, 256, 512].map((size) => size * KIB);
 const BATCH_DELAY_MS = 1;
-const DATA_BYTES = Number(process.env.BITSEEKWIN_BENCH_MIB ?? 4) * MIB;
-const REPEATS = Number(process.env.BITSEEKWIN_BENCH_REPEATS ?? 3);
-const TARGETED = process.env.BITSEEKWIN_BENCH_TARGETED === "true";
+const DATA_BYTES = Number(process.env.P2PCHORD_BENCH_MIB ?? 4) * MIB;
+const REPEATS = Number(process.env.P2PCHORD_BENCH_REPEATS ?? 3);
+const TARGETED = process.env.P2PCHORD_BENCH_TARGETED === "true";
 if (!Number.isSafeInteger(DATA_BYTES) || DATA_BYTES < MIB || DATA_BYTES > 128 * MIB) {
-  throw new RangeError("BITSEEKWIN_BENCH_MIB must be a whole number from 1 to 128.");
+  throw new RangeError("P2PCHORD_BENCH_MIB must be a whole number from 1 to 128.");
 }
 if (!Number.isSafeInteger(REPEATS) || REPEATS < 1 || REPEATS > 10) {
-  throw new RangeError("BITSEEKWIN_BENCH_REPEATS must be a whole number from 1 to 10.");
+  throw new RangeError("P2PCHORD_BENCH_REPEATS must be a whole number from 1 to 10.");
 }
 const DATA = Buffer.alloc(DATA_BYTES, 0x53);
 const DATA_HASH = createHash("sha256").update(DATA).digest("hex");
@@ -158,7 +158,7 @@ async function runCase({
   concurrency,
 }) {
   global.gc?.();
-  const cacheDirectory = await mkdtemp(join(tmpdir(), "bitseekwin-bench-"));
+  const cacheDirectory = await mkdtemp(join(tmpdir(), "p2pchord-bench-"));
   const client = {
     async search({ req }) {
       return [{
@@ -182,7 +182,7 @@ async function runCase({
   const { server, streamCache } = createAddonServer({
     client,
     secret: "benchmark-secret",
-    slug: "bitseekwin",
+    slug: "p2pchord",
     publicBaseUrl: "http://127.0.0.1",
     cacheDirectory,
     maxStreamBytes: DATA_BYTES,
@@ -198,7 +198,7 @@ async function runCase({
     const address = server.address();
     assert.ok(address && typeof address === "object" && address.port > 0);
     const base =
-      `http://127.0.0.1:${address.port}/bitseekwin/benchmark-secret`;
+      `http://127.0.0.1:${address.port}/p2pchord/benchmark-secret`;
     const ids = await Promise.all(
       Array.from({ length: concurrency }, (_, index) =>
         requestTrack(base, `track-${index}`),

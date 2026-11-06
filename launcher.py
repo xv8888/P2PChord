@@ -14,9 +14,9 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-APP_NAME = "BitSeekWin"
+APP_NAME = "P2PChord"
 PROJECT_DIR = Path(__file__).resolve().parent
 __version__ = (PROJECT_DIR / "version.txt").read_text(encoding="utf-8").strip()
 PORT = 8080
@@ -51,6 +51,7 @@ CACHE_TTL_BOUNDS = (1, 10080)
 CACHE_MAX_SIZE_BOUNDS = (16, 32768)
 ACTIVE_STREAMS_BOUNDS = (1, 2)
 MAX_STREAM_SIZE_BOUNDS = (1, 128)
+MAX_TORRENT_SOURCES = 8
 
 
 def _validate_integer_setting(value: object, name: str, bounds: tuple[int, int]) -> int:
@@ -62,6 +63,35 @@ def _validate_integer_setting(value: object, name: str, bounds: tuple[int, int])
     ):
         raise ValueError(f"{name} must be a whole number between {minimum} and {maximum}.")
     return value
+
+
+def _validate_torrent_sources(value: object) -> list[str]:
+    if not isinstance(value, list) or len(value) > MAX_TORRENT_SOURCES:
+        raise ValueError(f"Enter at most {MAX_TORRENT_SOURCES} torrent sources.")
+    sources = []
+    for raw_source in value:
+        if not isinstance(raw_source, str) or not raw_source.strip() or len(raw_source) > 4096:
+            raise ValueError("Torrent sources must be non-empty strings of at most 4096 characters.")
+        source = raw_source.strip()
+        if source.lower().startswith("magnet:"):
+            query = parse_qs(urlsplit(source).query)
+            if not any(
+                re.fullmatch(r"urn:btih:(?:[a-f0-9]{40}|[a-z2-7]{32})", info_hash, re.I)
+                for info_hash in query.get("xt", [])
+            ):
+                raise ValueError("Each magnet URI must contain a valid BitTorrent info hash.")
+        else:
+            path = Path(source)
+            if not path.is_absolute() or path.suffix.lower() != ".torrent":
+                raise ValueError("Torrent files must be absolute .torrent paths.")
+            try:
+                info = path.stat()
+            except OSError as exc:
+                raise ValueError(f"Could not read torrent metadata file: {path}") from exc
+            if not path.is_file() or not 1 <= info.st_size <= 2 * 1024 * 1024:
+                raise ValueError("Torrent metadata files must be between 1 byte and 2 MiB.")
+        sources.append(source)
+    return sources
 
 
 def generate_source_secret(
@@ -188,7 +218,7 @@ def normalize_public_url(value: str) -> str:
     return url
 
 
-def build_bitseekwin_environment(
+def build_p2pchord_environment(
     base: dict[str, str],
     username: str,
     password: str,
@@ -208,11 +238,27 @@ def build_bitseekwin_environment(
     max_stream_size_mb: int = DEFAULT_MAX_STREAM_SIZE_MB,
     bitchord_auth: bool = False,
     bind_address: str = "127.0.0.1",
+    soulseek_enabled: bool = True,
+    torrent_enabled: bool = False,
+    torrent_sources: list[str] | None = None,
+    torrent_storage_max_size_gb: int = 4,
 ) -> dict[str, str]:
     if not isinstance(allow_downloads, bool):
         raise ValueError("Allow downloads must be true or false.")
     if not isinstance(bitchord_auth, bool):
         raise ValueError("BitChord authentication must be true or false.")
+    if not isinstance(soulseek_enabled, bool) or not isinstance(torrent_enabled, bool):
+        raise ValueError("Source provider settings must be true or false.")
+    if not soulseek_enabled and not torrent_enabled:
+        raise ValueError("Enable Soulseek, BitTorrent, or both.")
+    if torrent_sources is None:
+        torrent_sources = []
+    torrent_sources = _validate_torrent_sources(torrent_sources)
+    if torrent_enabled and not torrent_sources:
+        raise ValueError("Add at least one magnet URI or .torrent file when BitTorrent is enabled.")
+    torrent_storage_max_size_gb = _validate_integer_setting(
+        torrent_storage_max_size_gb, "BitTorrent storage limit", (1, 1024)
+    )
     try:
         ipaddress.ip_address(bind_address)
     except ValueError as exc:
@@ -245,31 +291,39 @@ def build_bitseekwin_environment(
     env = base.copy()
     for key in ("SLSKD_API_KEY", "SLSKD_SLSK_USERNAME", "SLSKD_SLSK_PASSWORD"):
         env.pop(key, None)
+    if not soulseek_enabled:
+        env.pop("SOULSEEK_USERNAME", None)
+        env.pop("SOULSEEK_PASSWORD", None)
     env.update(
         {
-            "SOULSEEK_USERNAME": username,
-            "SOULSEEK_PASSWORD": password,
             "BITCHORD_SECRET": secret,
             "PUBLIC_BASE_URL": public_url,
             "PORT": str(PORT),
-            "BITSEEKWIN_WORD_COUNT": str(word_count),
-            "BITSEEKWIN_WORD_LENGTH": str(word_length),
-            "BITSEEKWIN_ALLOW_DOWNLOADS": str(allow_downloads).lower(),
-            "BITSEEKWIN_BITCHORD_AUTH": str(bitchord_auth).lower(),
-            "BITSEEKWIN_BIND_ADDRESS": bind_address,
-            "BITSEEKWIN_SOURCE_SELECTION": source_selection,
-            "BITSEEKWIN_SEARCH_LIMIT": str(search_limit),
-            "BITSEEKWIN_SEARCH_TIMEOUT_MS": str(search_timeout_ms),
-            "BITSEEKWIN_SEARCH_RECOVERY": str(search_recovery).lower(),
-            "BITSEEKWIN_IDLE_TRANSFER_TIMEOUT_MS": str(
+            "P2PCHORD_WORD_COUNT": str(word_count),
+            "P2PCHORD_WORD_LENGTH": str(word_length),
+            "P2PCHORD_ALLOW_DOWNLOADS": str(allow_downloads).lower(),
+            "P2PCHORD_BITCHORD_AUTH": str(bitchord_auth).lower(),
+            "P2PCHORD_BIND_ADDRESS": bind_address,
+            "P2PCHORD_SOURCE_SELECTION": source_selection,
+            "P2PCHORD_SEARCH_LIMIT": str(search_limit),
+            "P2PCHORD_SEARCH_TIMEOUT_MS": str(search_timeout_ms),
+            "P2PCHORD_SEARCH_RECOVERY": str(search_recovery).lower(),
+            "P2PCHORD_IDLE_TRANSFER_TIMEOUT_MS": str(
                 idle_transfer_timeout_seconds * 1000
             ),
-            "BITSEEKWIN_CACHE_TTL_MS": str(cache_ttl_minutes * 60 * 1000),
-            "BITSEEKWIN_CACHE_MAX_BYTES": str(cache_max_size_mb * 1024 * 1024),
-            "BITSEEKWIN_MAX_ACTIVE_STREAMS": str(max_active_streams),
-            "BITSEEKWIN_MAX_STREAM_BYTES": str(max_stream_size_mb * 1024 * 1024),
+            "P2PCHORD_CACHE_TTL_MS": str(cache_ttl_minutes * 60 * 1000),
+            "P2PCHORD_CACHE_MAX_BYTES": str(cache_max_size_mb * 1024 * 1024),
+            "P2PCHORD_MAX_ACTIVE_STREAMS": str(max_active_streams),
+            "P2PCHORD_MAX_STREAM_BYTES": str(max_stream_size_mb * 1024 * 1024),
+            "P2PCHORD_SOULSEEK_ENABLED": str(soulseek_enabled).lower(),
+            "P2PCHORD_TORRENT_ENABLED": str(torrent_enabled).lower(),
+            "P2PCHORD_TORRENT_SOURCES": json.dumps(torrent_sources),
+            "P2PCHORD_TORRENT_STORAGE_MAX_BYTES": str(torrent_storage_max_size_gb * 1024 * 1024 * 1024),
         }
     )
+    if soulseek_enabled:
+        env["SOULSEEK_USERNAME"] = username
+        env["SOULSEEK_PASSWORD"] = password
     return env
 
 
@@ -352,7 +406,7 @@ class LauncherController:
         self.server_process: subprocess.Popen | None = None
         self.starting = False
         self.status = "Ready"
-        self.detail = "Enter your Soulseek login to get started."
+        self.detail = "Choose one or both source providers to get started."
         self.source_url = ""
         self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.stop_requested = threading.Event()
@@ -437,11 +491,30 @@ class LauncherController:
             "Maximum track size",
             MAX_STREAM_SIZE_BOUNDS,
         )
+        soulseek_enabled = config.get("soulseek_enabled", True)
+        torrent_enabled = config.get("torrent_enabled", False)
+        torrent_sources = config.get("torrent_sources", "")
+        torrent_storage_max_size_gb = _validate_integer_setting(
+            config.get("torrent_storage_max_size_gb", 4),
+            "BitTorrent storage limit",
+            (1, 1024),
+        )
         word_count = config.get("word_count", DEFAULT_SECRET_WORD_COUNT)
         word_length = config.get("word_length", DEFAULT_SECRET_WORD_LENGTH)
 
-        if not username or not password:
+        if not isinstance(soulseek_enabled, bool) or not isinstance(torrent_enabled, bool):
+            raise ValueError("Source provider settings must be true or false.")
+        if not soulseek_enabled and not torrent_enabled:
+            raise ValueError("Enable Soulseek, BitTorrent, or both.")
+        if soulseek_enabled and (not username or not password):
             raise ValueError("Enter your Soulseek username and password.")
+        if not isinstance(torrent_sources, str):
+            raise ValueError("Torrent sources must be entered as one source per line.")
+        torrent_sources = _validate_torrent_sources(
+            [source.strip() for source in torrent_sources.splitlines() if source.strip()]
+        )
+        if torrent_enabled and not torrent_sources:
+            raise ValueError("Add at least one magnet URI or .torrent file when BitTorrent is enabled.")
         if not isinstance(lan_access, bool):
             raise ValueError("LAN access must be true or false.")
         if not isinstance(allow_downloads, bool):
@@ -507,7 +580,7 @@ class LauncherController:
                 )
             self.starting = True
             self.status = "Starting"
-            self.detail = "Connecting directly to Soulseek…"
+            self.detail = "Starting enabled P2P sources…"
             self.source_url = ""
             self.stop_requested.clear()
             self.logs.clear()
@@ -523,6 +596,10 @@ class LauncherController:
             "cache_max_size_mb": cache_max_size_mb,
             "max_active_streams": max_active_streams,
             "max_stream_size_mb": max_stream_size_mb,
+            "soulseek_enabled": soulseek_enabled,
+            "torrent_enabled": torrent_enabled,
+            "torrent_sources": torrent_sources,
+            "torrent_storage_max_size_gb": torrent_storage_max_size_gb,
         }
         threading.Thread(
             target=self._start_worker,
@@ -579,13 +656,16 @@ class LauncherController:
     ) -> None:
         server_process: subprocess.Popen | None = None
         try:
-            if not (PROJECT_DIR / "node_modules" / "slsk-client").is_dir():
+            if any(
+                not (PROJECT_DIR / "node_modules" / module).is_dir()
+                for module in ("slsk-client", "webtorrent")
+            ):
                 npm = shutil.which("npm.cmd") or shutil.which("npm")
                 if not npm:
                     raise RuntimeError(
                         "npm was not found. Install Node.js 22 or newer and restart."
                     )
-                self.log("Installing the direct Soulseek client dependency…")
+                self.log("Installing P2PChord runtime dependencies…")
                 install = subprocess.run(
                     [npm, "install", "--no-audit", "--no-fund"],
                     cwd=str(PROJECT_DIR),
@@ -601,7 +681,7 @@ class LauncherController:
                     )
             if self._port_in_use(PORT, bind_address):
                 raise RuntimeError(
-                    f"Port {PORT} is already in use; close the existing BitSeekWin first."
+                    f"Port {PORT} is already in use; close the existing P2PChord first."
                 )
             if self.stop_requested.is_set():
                 raise RuntimeError("Startup was cancelled.")
@@ -610,7 +690,7 @@ class LauncherController:
             source_secret = generate_source_secret(
                 word_count, word_length, include_token=not lan_access
             )
-            server_env = build_bitseekwin_environment(
+            server_env = build_p2pchord_environment(
                 base_env,
                 username,
                 password,
@@ -659,10 +739,15 @@ class LauncherController:
                 raise RuntimeError("Startup was cancelled.")
             threading.Thread(
                 target=self._read_output,
-                args=("BitSeekWin", server_process, (username, password)),
+                args=("P2PChord", server_process, (username, password)),
                 daemon=True,
             ).start()
-            self.log("Connecting directly to Soulseek…")
+            enabled_sources = []
+            if server_settings.get("soulseek_enabled", True):
+                enabled_sources.append("Soulseek")
+            if server_settings.get("torrent_enabled", False):
+                enabled_sources.append("BitTorrent")
+            self.log(f"Starting {' and '.join(enabled_sources)} source provider(s)…")
 
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
@@ -670,23 +755,23 @@ class LauncherController:
                     raise RuntimeError("Startup was cancelled.")
                 if server_process.poll() is not None:
                     raise RuntimeError(
-                        f"BitSeekWin exited with code {server_process.returncode}. Check the activity log."
+                        f"P2PChord exited with code {server_process.returncode}. Check the activity log."
                     )
                 if self._port_in_use(PORT, bind_address):
                     break
                 time.sleep(0.5)
             else:
                 raise RuntimeError(
-                    "BitSeekWin could not connect to Soulseek and open port 8080 within 90 seconds."
+                    "P2PChord could not open port 8080 within 90 seconds."
                 )
             with self.lock:
                 self.status = "Listening"
-                self.detail = "Connected to Soulseek; direct streaming is ready."
-                slug = server_env.get("BITSEEKWIN_SLUG", "bitseekwin")
+                self.detail = "Enabled source providers are ready for direct streaming."
+                slug = server_env.get("P2PCHORD_SLUG", "p2pchord")
                 self.source_url = (
                     f"{public_url.rstrip('/')}/{slug}/{source_secret}"
                 )
-            self.log("BitSeekWin started. Add the source URL below in BitChord.")
+            self.log("P2PChord started. Add the source URL below in BitChord.")
         except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             self.log(f"Startup failed: {exc}")
             self.stop_requested.set()
@@ -708,12 +793,12 @@ class LauncherController:
             server_process = self.server_process
             self.server_process = None
             self.status = "Stopped"
-            self.detail = "BitSeekWin has been stopped."
+            self.detail = "P2PChord has been stopped."
             self.source_url = ""
-        self.log("Stopping BitSeekWin and the Soulseek connection…")
+        self.log("Stopping P2PChord and enabled source providers…")
         _terminate_process(server_process)
         self._disable_funnel()
-        self.log("BitSeekWin stopped.")
+        self.log("P2PChord stopped.")
 
     def _disable_funnel(self) -> None:
         with self.lock:
@@ -765,7 +850,7 @@ _HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>BitSeekWin • Setup</title>
+<title>P2PChord • Setup</title>
 <style>
 @font-face{
   font-family:"Inter";
@@ -863,31 +948,26 @@ html{scroll-behavior:smooth;scroll-padding-top:20px}
 body{margin:0;min-width:320px;min-height:100vh;background:var(--surface)}
 button,input,select{font:inherit}
 button{cursor:pointer}
-.app{display:grid;grid-template-columns:224px minmax(0,1fr);height:100vh;min-height:540px;background:var(--surface)}
-.sidebar{display:flex;flex-direction:column;min-width:0;padding:24px 12px 14px;background:var(--sidebar);border-right:1px solid var(--line)}
-.brand{display:flex;align-items:baseline;padding:0 12px;font-size:var(--text-brand);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-brand);line-height:var(--leading-tight);white-space:nowrap}
+.app{min-height:100vh;background:var(--surface)}
+.titlebar{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:62px;padding:0 30px;background:var(--surface);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:baseline;gap:15px;font-size:var(--text-brand);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-brand);line-height:var(--leading-tight);white-space:nowrap}
 .brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}
-.brand-bit{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
-.brand-seek{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand-bit{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand-seek{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
 .brand-win{margin-left:1px;font-size:var(--text-brand-win);letter-spacing:var(--tracking-brand-win);vertical-align:super}
-.nav{flex:1;min-height:0;margin-top:30px;overflow-y:auto}
-.nav-group+.nav-group{margin-top:23px}
-.nav-label{margin:0 12px 8px;color:var(--subtle);font-size:var(--text-caption);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-label)}
-.nav-link{display:flex;align-items:center;gap:11px;min-height:36px;margin:2px 0;padding:0 11px;border-radius:7px;color:var(--text-secondary);text-decoration:none;font-size:var(--text-nav);font-weight:var(--weight-medium);transition:background .12s,color .12s}
-.nav-link svg{width:17px;height:17px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.brand-tagline{color:var(--muted);font-size:var(--text-label);font-weight:var(--weight-medium);letter-spacing:0}
+.nav{display:flex;align-items:center;gap:5px;min-height:52px;padding:0 30px;background:var(--surface);border-bottom:1px solid var(--line)}
+.nav-link{display:flex;align-items:center;min-height:34px;padding:0 13px;border-radius:7px;color:var(--text-secondary);text-decoration:none;font-size:var(--text-nav);font-weight:var(--weight-medium);white-space:nowrap;transition:background .12s,color .12s}
 .nav-link:hover{background:var(--hover-surface)}
 .nav-link.current{background:var(--selected-surface);color:var(--text);font-weight:var(--weight-semibold)}
-.sidebar-footer{padding:13px 12px 1px;border-top:1px solid var(--line);color:var(--muted);font-size:var(--text-caption);line-height:var(--leading-relaxed)}
-.workspace{display:grid;grid-template-rows:56px minmax(0,1fr);min-width:0;min-height:0}
-.toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 30px;background:var(--surface);border-bottom:1px solid var(--line)}
-.toolbar-title{color:var(--text);font-size:var(--text-nav);font-weight:var(--weight-semibold)}
+.toolbar-status{display:flex;align-items:center;gap:8px;margin-left:auto;color:var(--text-secondary);font-size:var(--text-label);white-space:nowrap}
 .toolbar-actions{display:flex;align-items:center;gap:16px}
-.toolbar-status{display:flex;align-items:center;gap:8px;color:var(--text-secondary);font-size:var(--text-label)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--subtle)}
 .dot.success{background:var(--success)}
 .dot.error{background:var(--error)}
-.content-scroll{min-height:0;overflow:auto;overscroll-behavior:contain}
-.page-content{width:min(1080px,100%);margin:0 auto;padding:34px 40px 48px}
+.workspace{min-width:0;min-height:0}
+.content-scroll{min-height:0}
+.page-content{width:min(1120px,100%);margin:0 auto;padding:34px 40px 24px}
 .page-heading{margin:0 0 7px;font-size:var(--text-display);font-weight:var(--weight-bold);letter-spacing:var(--tracking-display);line-height:var(--leading-tight)}
 .page-description{max-width:720px;margin:0;color:var(--muted);font-size:var(--text-body);line-height:var(--leading-relaxed)}
 .section-card{margin-top:22px;padding:22px 24px;background:var(--surface);border:1px solid var(--line);border-radius:10px;scroll-margin-top:18px}
@@ -897,10 +977,12 @@ button{cursor:pointer}
 .field{min-width:0}
 .field.full{grid-column:1/-1}
 .field label,.slider-label{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:7px;color:var(--text);font-size:var(--text-label);font-weight:var(--weight-semibold);line-height:var(--leading-label)}
-.field input:not([type=range]):not([type=checkbox]),.field select{width:100%;min-width:0;height:39px;padding:0 11px;border:1px solid var(--control-border);border-radius:7px;background:var(--control-surface);color:var(--text);outline:none;font-size:var(--text-nav)}
-.field input:focus,.field select:focus{border-color:var(--focus);box-shadow:0 0 0 3px #007aff26}
-.field input:focus-visible,.field select:focus-visible,button:focus-visible,.nav-link:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-.field input::placeholder{color:var(--placeholder)}
+.field input:not([type=range]):not([type=checkbox]),.field select,.field textarea{width:100%;min-width:0;padding:0 11px;border:1px solid var(--control-border);border-radius:7px;background:var(--control-surface);color:var(--text);outline:none;font-size:var(--text-nav)}
+.field input:not([type=range]):not([type=checkbox]),.field select{height:39px}
+.field textarea{min-height:96px;padding:10px 11px;resize:vertical;line-height:1.45}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--focus);box-shadow:0 0 0 3px #007aff26}
+.field input:focus-visible,.field select:focus-visible,.field textarea:focus-visible,button:focus-visible,.nav-link:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.field input::placeholder,.field textarea::placeholder{color:var(--placeholder)}
 .field select{color-scheme:inherit}
 .hint{margin:6px 0 0;color:var(--muted);font-size:var(--text-caption);line-height:var(--leading-relaxed)}
 .check{display:flex;align-items:flex-start;gap:9px;color:var(--text);font-size:var(--text-label);line-height:var(--leading-normal)}
@@ -942,22 +1024,17 @@ button{cursor:pointer}
 .log-line.warn .log-kind{color:var(--log-warning)}
 .log-line.error .log-kind,.error{color:var(--error)}
 .success{color:var(--success)}
+.app-footer{display:flex;justify-content:space-between;gap:16px;padding:18px 2px 8px;color:var(--muted);font-size:var(--text-caption)}
 .exit-screen{max-width:620px;margin:18vh auto;padding:32px;color:var(--text);font-size:var(--text-body)}
 .exit-screen h1{font-size:var(--text-mobile-display);font-weight:var(--weight-bold)}
-@media(max-width:980px){.app{grid-template-columns:196px minmax(0,1fr)}.toolbar{padding:0 24px}.page-content{padding:30px 28px 42px}}
+@media(max-width:980px){.titlebar,.nav{padding-right:24px;padding-left:24px}.page-content{padding:30px 28px 20px}}
 @media(max-width:720px){
-  .app{display:block;height:auto;min-height:100vh}
-  .sidebar{padding:13px 14px 8px;border-right:0;border-bottom:1px solid var(--line)}
-  .brand{padding:0 5px;font-size:var(--text-mobile-brand)}
-  .nav{display:flex;gap:7px;margin-top:12px;overflow-x:auto;overflow-y:hidden}
-  .nav-group{display:flex;flex:none;gap:4px}
-  .nav-group+.nav-group{margin-top:0}
-  .nav-label,.sidebar-footer{display:none}
-  .nav-link{min-height:34px;padding:0 10px;white-space:nowrap}
-  .workspace{display:block;min-height:calc(100vh - 106px)}
-  .toolbar{height:48px;padding:0 16px}
-  .toolbar-actions{gap:11px}
-  .content-scroll{overflow:visible}
+  .titlebar{min-height:56px;padding:0 16px}
+  .brand{gap:9px;font-size:var(--text-mobile-brand)}
+  .brand-tagline{display:none}
+  .nav{gap:3px;overflow-x:auto;overflow-y:hidden;padding:0 12px}
+  .nav-link{min-height:34px;padding:0 10px}
+  .toolbar-actions{gap:9px}
   .page-content{padding:24px 16px 36px}
   .page-heading{font-size:var(--text-mobile-display)}
   .section-card{margin-top:16px;padding:18px}
@@ -965,79 +1042,63 @@ button{cursor:pointer}
 @media(max-width:500px){
   .fields-grid{grid-template-columns:minmax(0,1fr);row-gap:13px}
   .field.full{grid-column:auto}
-  .toolbar{padding:0 12px}
-  .toolbar-actions{gap:8px}
+  .titlebar{padding:0 12px}
+  .toolbar-actions{gap:7px}
+  .toolbar-actions .button{padding:0 9px}
   .toolbar-status{font-size:var(--text-caption)}
   .page-content{padding-right:12px;padding-left:12px}
   .section-card{padding:16px}
   .address-row{align-items:stretch;flex-direction:column}
   .logs{height:200px}
   .log-line{grid-template-columns:48px 43px minmax(0,1fr);gap:5px}
+  .app-footer{flex-direction:column;gap:4px}
 }
 </style>
 </head>
 <body>
 <div class="app">
-<aside class="sidebar">
-  <div class="brand" aria-label="BitSeekWin"><span class="brand-bit">Bit</span><span class="brand-seek">Seek</span><span class="brand-win">Win</span></div>
-  <nav class="nav" aria-label="Launcher sections">
-    <div class="nav-group">
-      <p class="nav-label">SERVER</p>
-      <a class="nav-link current" href="#connection">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10h14M10 3v14"/><circle cx="10" cy="10" r="7"/></svg>
-        Connection
-      </a>
-      <a class="nav-link" href="#activity">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 4h14v12H3zM6 8h8M6 11h5"/></svg>
-        Activity
-      </a>
-    </div>
-    <div class="nav-group">
-      <p class="nav-label">SETTINGS</p>
-      <a class="nav-link" href="#source-settings">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/></svg>
-        Source
-      </a>
-      <a class="nav-link" href="#search-settings">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg>
-        Search
-      </a>
-      <a class="nav-link" href="#transfer-settings">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h14M3 10h14M3 14h14"/><circle cx="7" cy="6" r="1.5"/><circle cx="12" cy="10" r="1.5"/><circle cx="9" cy="14" r="1.5"/></svg>
-        Transfers
-      </a>
-      <a class="nav-link" href="#cache-settings">
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6c0-1.7 3.1-3 7-3s7 1.3 7 3-3.1 3-7 3-7-1.3-7-3Z"/><path d="M3 6v8c0 1.7 3.1 3 7 3s7-1.3 7-3V6M3 10c0 1.7 3.1 3 7 3s7-1.3 7-3"/></svg>
-        Cache
-      </a>
-    </div>
-  </nav>
-  <div class="sidebar-footer">BitSeekWin<br>Connect Soulseek to BitChord</div>
-</aside>
-<div class="workspace">
-  <header class="toolbar">
-    <span class="toolbar-title">Setup</span>
+  <header class="titlebar">
+    <div class="brand" aria-label="P2PChord"><span><span class="brand-bit">P2P</span><span class="brand-seek">Chord</span></span><span class="brand-tagline">Peer-powered music for BitChord</span></div>
     <div class="toolbar-actions">
-      <span class="toolbar-status"><span id="dot" class="dot"></span><span id="state">Ready</span></span>
       <button class="button" id="themeToggle" type="button" aria-label="Switch to light mode" aria-pressed="true">Light mode</button>
       <button class="button" id="exit" type="button">Exit</button>
     </div>
   </header>
+  <nav class="nav" aria-label="Launcher sections">
+    <a class="nav-link current" href="#activity">Activity</a>
+    <a class="nav-link" href="#providers">Providers</a>
+    <a class="nav-link" href="#transfer-settings">Transfers</a>
+    <a class="nav-link" href="#cache-settings">Cache</a>
+    <a class="nav-link" href="#source-settings">Settings</a>
+    <span class="toolbar-status"><span id="dot" class="dot"></span><span id="state">Ready</span></span>
+  </nav>
+<div class="workspace">
   <div class="content-scroll">
     <main class="page-content">
-      <h1 class="page-heading">Connect to Soulseek</h1>
-      <p class="page-description">Sign in to start the BitSeekWin server and make your BitChord source available.</p>
+      <h1 class="page-heading">P2PChord</h1>
+      <p class="page-description">Configure peer-to-peer sources and view the live activity behind your BitChord music source.</p>
 
       <section class="section-card" id="activity" aria-labelledby="activityTitle">
         <div class="activity-head"><div><h2 class="section-heading" id="activityTitle">Activity</h2><p class="section-description">Server events and the source URL for BitChord.</p></div><button class="button copy" id="copy" type="button" disabled>Copy source URL</button></div>
         <div id="url" class="url empty">Your BitChord source URL will appear here after startup.</div>
-        <div class="console-meta"><span>SOULSEEK / BITCHORD</span><span id="log-count">0 EVENTS</span></div>
+        <div class="console-meta"><span>P2PCHORD / BITCHORD</span><span id="log-count">0 EVENTS</span></div>
         <div id="logs" class="logs" role="log" aria-live="polite" aria-relevant="additions">Ready when you are.</div>
+      </section>
+
+      <section class="section-card" id="providers" aria-labelledby="providersTitle">
+        <h2 class="section-heading" id="providersTitle">Source providers</h2>
+        <p class="section-description">Soulseek is enabled by default. BitTorrent is opt-in and accepts only magnets or local .torrent files.</p>
+        <div class="fields-grid">
+          <div class="field"><label class="check"><input id="soulseekEnabled" type="checkbox" checked>Enable Soulseek</label></div>
+          <div class="field"><label class="check"><input id="torrentEnabled" type="checkbox">Enable BitTorrent (experimental)</label></div>
+          <div class="field full"><label for="torrentSources">Magnet URIs or absolute .torrent paths (one per line)</label><textarea id="torrentSources" rows="4" placeholder="magnet:?xt=urn:btih:...&#10;C:\Torrents\album.torrent"></textarea><p class="hint">No public torrent search is performed. Router port mapping and BitTorrent uploads are disabled; trackers and peers can still see your IP address.</p></div>
+          <div class="field"><label for="torrentStorage">Maximum BitTorrent storage (GiB)</label><input id="torrentStorage" type="number" min="1" max="1024" step="1" value="4" required><p class="hint">Separate storage used by WebTorrent; it does not change the existing Soulseek cache.</p></div>
+        </div>
       </section>
 
       <section class="section-card" id="connection" aria-labelledby="connectionTitle">
         <h2 class="section-heading" id="connectionTitle">Soulseek account</h2>
-        <p class="section-description">Your credentials are used for this launch only.</p>
+        <p class="section-description">Required only when Soulseek is enabled. Credentials are used for this launch only.</p>
         <div class="fields-grid">
           <div class="field"><label for="username">Username</label><input id="username" type="text" autocomplete="username" placeholder="Your Soulseek username"></div>
           <div class="field"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" placeholder="Only used for this session"></div>
@@ -1058,13 +1119,13 @@ button{cursor:pointer}
           <div class="field full"><p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. Non-LAN source URLs also include a separate random 128-bit bearer token.</p><p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p></div>
           <div class="field full"><label class="check"><input id="allowDownloads" type="checkbox">Allow downloads in BitChord</label><p class="hint">Off by default. When enabled, BitChord may offer downloads from this source.</p></div>
           <div class="field full"><label class="check"><input id="bitchordAuth" type="checkbox">Require BitChord 1.9.1 signed authentication</label><p class="hint">Optional and off by default. Requires HTTPS except on localhost; older BitChord clients cannot use this mode.</p></div>
-          <div class="field full"><label for="sourceSelection">Source selection</label><select id="sourceSelection"><option value="match">Best filename match (recommended)</option><option value="speed">Highest reported upload speed</option></select><p class="hint">Fastest-speed mode returns only the peer reporting the highest upload speed, even when another result may be a closer match. Peer speeds are self-reported.</p></div>
+          <div class="field full"><label for="sourceSelection">Source selection</label><select id="sourceSelection"><option value="match">Best filename match (recommended)</option><option value="speed">Highest reported/observed transfer speed</option></select><p class="hint">Fastest-speed mode returns one result using the provider's reported or observed transfer speed; the fastest result may be a less relevant match.</p></div>
         </div>
       </section>
 
       <section class="section-card" id="search-settings" aria-labelledby="searchTitle">
         <h2 class="section-heading" id="searchTitle">Search</h2>
-        <p class="section-description">Tune how Soulseek results are requested and ranked.</p>
+        <p class="section-description">Tune Soulseek results; torrent imports are matched locally by filename.</p>
         <div class="fields-grid">
           <div class="field"><label for="searchLimit">Maximum search results</label><input id="searchLimit" type="number" min="1" max="50" step="1" value="50" required><p class="hint">Applies to best-match mode. Fastest-speed mode always returns one result.</p></div>
           <div class="field"><label for="searchTimeout">Soulseek search timeout (seconds)</label><input id="searchTimeout" type="number" min="1" max="30" step="1" value="2" required></div>
@@ -1077,7 +1138,7 @@ button{cursor:pointer}
         <p class="section-description">Manage concurrent transfers, reconnect behavior, and file-size limits.</p>
         <div class="fields-grid">
           <div class="field"><label for="reconnectGrace">Reconnect grace period (seconds)</label><input id="reconnectGrace" type="number" min="1" max="600" step="1" value="30" required><p class="hint">How long an unfinished transfer stays open after all HTTP consumers disconnect.</p></div>
-          <div class="field"><label for="transferSlots">Concurrent Soulseek transfers</label><select id="transferSlots"><option value="1">1 transfer</option><option value="2" selected>2 transfers (maximum)</option></select></div>
+          <div class="field"><label for="transferSlots">Concurrent source transfers</label><select id="transferSlots"><option value="1">1 transfer</option><option value="2" selected>2 transfers (maximum)</option></select></div>
           <div class="field"><label for="maxTrackSize">Maximum size per track (MiB)</label><input id="maxTrackSize" type="number" min="1" max="128" step="1" value="128" required></div>
         </div>
       </section>
@@ -1091,6 +1152,7 @@ button{cursor:pointer}
         </div>
       </section>
 
+      <footer class="app-footer"><span>P2PChord | __VERSION__</span><span>Connect P2P sources to BitChord</span></footer>
     </main>
   </div>
 </div>
@@ -1098,12 +1160,14 @@ button{cursor:pointer}
 const token=__TOKEN_JSON__, api="/"+token+"/api/", lanIp=__LAN_IP_JSON__;
 const $=id=>document.getElementById(id);
 let sourceUrl="";
-function applyTheme(theme,persist=false){const dark=theme==="dark";document.documentElement.dataset.theme=dark?"dark":"light";$("themeToggle").textContent=dark?"Light mode":"Dark mode";$("themeToggle").setAttribute("aria-label",dark?"Switch to light mode":"Switch to dark mode");$("themeToggle").setAttribute("aria-pressed",String(dark));if(persist){try{localStorage.setItem("bitseekwin.theme",dark?"dark":"light");}catch(e){console.warn("Could not save the appearance preference.",e);}}}
-let savedTheme="dark";try{const storedTheme=localStorage.getItem("bitseekwin.theme");if(storedTheme==="dark"||storedTheme==="light")savedTheme=storedTheme;}catch(e){console.warn("Could not load the appearance preference.",e);}
+function updateProviderFields(){$("username").required=$("soulseekEnabled").checked;$("password").required=$("soulseekEnabled").checked;$("torrentSources").required=$("torrentEnabled").checked;}
+$("soulseekEnabled").addEventListener("change",updateProviderFields);$("torrentEnabled").addEventListener("change",updateProviderFields);updateProviderFields();
+function applyTheme(theme,persist=false){const dark=theme==="dark";document.documentElement.dataset.theme=dark?"dark":"light";$("themeToggle").textContent=dark?"Light mode":"Dark mode";$("themeToggle").setAttribute("aria-label",dark?"Switch to light mode":"Switch to dark mode");$("themeToggle").setAttribute("aria-pressed",String(dark));if(persist){try{localStorage.setItem("p2pchord.theme",dark?"dark":"light");}catch(e){console.warn("Could not save the appearance preference.",e);}}}
+let savedTheme="dark";try{const storedTheme=localStorage.getItem("p2pchord.theme");if(storedTheme==="dark"||storedTheme==="light")savedTheme=storedTheme;}catch(e){console.warn("Could not load the appearance preference.",e);}
 applyTheme(savedTheme);
 $("themeToggle").addEventListener("click",()=>applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark",true));
 $("publicUrl").value=__PUBLIC_URL_JSON__;
-try{const savedPublicUrl=localStorage.getItem("bitseekwin.publicBaseUrl");if(savedPublicUrl&&normalizePublicUrl(savedPublicUrl))$("publicUrl").value=savedPublicUrl;}catch(e){$("publicUrlState").textContent="Saved address could not be loaded from this browser.";}
+try{const savedPublicUrl=localStorage.getItem("p2pchord.publicBaseUrl");if(savedPublicUrl&&normalizePublicUrl(savedPublicUrl))$("publicUrl").value=savedPublicUrl;}catch(e){$("publicUrlState").textContent="Saved address could not be loaded from this browser.";}
 const lanBaseUrl=lanIp?"http://"+lanIp+":8080":"";
 $("lanAddressHint").textContent=lanIp?"Detected LAN address: "+lanBaseUrl+". Android BitChord does not currently allow this HTTP URL.":"No private LAN IPv4 address was detected.";
 $("useLan").disabled=!lanIp;
@@ -1121,18 +1185,22 @@ update();
 document.querySelectorAll(".nav-link").forEach(link=>link.addEventListener("click",()=>{document.querySelectorAll(".nav-link").forEach(item=>item.classList.remove("current"));link.classList.add("current");}));
 $("start").addEventListener("click",async()=>{
   const publicUrl=validatePublicUrl();if(!publicUrl){$("publicUrl").reportValidity();return;}
-  const numericSettings=["searchLimit","searchTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize"];
+  const numericSettings=["searchLimit","searchTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize","torrentStorage"];
   const invalidSetting=numericSettings.map(id=>$(id)).find(input=>!input.checkValidity());
   if(invalidSetting){invalidSetting.reportValidity();return;}
-  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,bitchord_auth:$("bitchordAuth").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value)};
+  const torrentSources=$("torrentSources").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+  if(!$("soulseekEnabled").checked&&!$("torrentEnabled").checked){alert("Enable at least one source provider.");return;}
+  if($("torrentEnabled").checked&&!torrentSources.length){$("torrentSources").setCustomValidity("Add at least one magnet URI or .torrent file.");$("torrentSources").reportValidity();return;}
+  $("torrentSources").setCustomValidity("");
+  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,bitchord_auth:$("bitchordAuth").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value),soulseek_enabled:$("soulseekEnabled").checked,torrent_enabled:$("torrentEnabled").checked,torrent_sources:torrentSources.join("\n"),torrent_storage_max_size_gb:Number($("torrentStorage").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
-  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("bitseekwin.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("logs").textContent="Connecting directly to Soulseek…";}
+  try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("p2pchord.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("logs").textContent="Starting enabled P2P sources…";}
   catch(e){$("start").disabled=false;alert(e.message);}
   await update();
 });
 $("stop").addEventListener("click",async()=>{try{await fetch(api+"stop",{method:"POST"});}catch(e){}await update();});
 $("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipboard.writeText(sourceUrl);$("state").textContent="URL copied";}});
-$("exit").addEventListener("click",async()=>{if(!confirm("Exit BitSeekWin and disconnect from Soulseek?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main class='exit-screen'><h1>BitSeekWin stopped.</h1><p>You can close this browser tab.</p></main>";});
+$("exit").addEventListener("click",async()=>{if(!confirm("Exit P2PChord and stop all enabled sources?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main class='exit-screen'><h1>P2PChord stopped.</h1><p>You can close this browser tab.</p></main>";});
 async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});renderStatus(await r.json());}catch(e){}}
 function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;renderLogs(s.logs||[],s.detail||"");$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
 function renderLogs(entries,fallback){const box=$("logs"),follow=box.scrollHeight-box.scrollTop-box.clientHeight<24,lines=entries.length?entries:[fallback||"Waiting for activity…"];box.replaceChildren();for(const line of lines){const row=document.createElement("div"),time=document.createElement("span"),kind=document.createElement("span"),message=document.createElement("span"),match=/^(?:\[[^\]]+\]\s*)?\[(\d{2}:\d{2}:\d{2})\]\s+\[(SEARCH|STREAM|WARN|ERROR|INFO)\]\s*(.*)$/i.exec(line);const level=match?match[2].toLowerCase():"info";row.className="log-line "+level;time.className="log-time";time.textContent=match?match[1]:"";kind.className="log-kind";kind.textContent=level.toUpperCase();message.className="log-message";message.textContent=match?match[3]:line;row.append(time,kind,message);box.append(row);}$("log-count").textContent=entries.length+" EVENT"+(entries.length===1?"":"S");if(follow)box.scrollTop=box.scrollHeight;}
