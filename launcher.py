@@ -959,8 +959,7 @@ button{cursor:pointer}
 .brand{display:flex;align-items:center;gap:12px;font-size:var(--text-brand);font-weight:var(--weight-semibold);letter-spacing:var(--tracking-brand);line-height:var(--leading-tight);white-space:nowrap}
 .brand-icon{width:36px;height:36px;flex:none;border-radius:9px}
 .brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}
-.brand-bit{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7);-webkit-background-clip:text;background-clip:text;color:transparent}
-.brand-seek{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand-bit,.brand-seek{color:var(--text)}
 .brand-win{margin-left:1px;font-size:var(--text-brand-win);letter-spacing:var(--tracking-brand-win);vertical-align:super}
 .brand-tagline{color:var(--muted);font-size:var(--text-label);font-weight:var(--weight-medium);letter-spacing:0}
 .nav{display:flex;align-items:center;gap:5px;min-height:52px;padding:0 30px;background:var(--surface);border-bottom:1px solid var(--line)}
@@ -1269,7 +1268,7 @@ def make_handler(controller: LauncherController, token: str):
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                "font-src 'self'; "
+                "font-src 'self'; img-src 'self'; "
                 "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             )
 

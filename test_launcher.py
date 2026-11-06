@@ -610,8 +610,7 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertNotIn('id="allowDownloads" type="checkbox" checked', page)
         self.assertIn('<span class="brand-bit">P2P</span>', page)
         self.assertIn('<span class="brand-seek">Chord</span>', page)
-        self.assertIn(".brand-bit{background:linear-gradient(110deg,#49d5e8,#2996d6 56%,#254eb7)", page)
-        self.assertIn(".brand-seek{background:linear-gradient(115deg,#fa233b 8%,#fb5c74 48%,#fb8c55 100%)", page)
+        self.assertIn(".brand-bit,.brand-seek{color:var(--text)}", page)
         self.assertIn("--text-brand-primary:1.08em", page)
         self.assertIn("--text-brand-win:.48em", page)
         self.assertIn(".brand-bit,.brand-seek{font-size:var(--text-brand-primary);font-weight:var(--weight-bold)}", page)
@@ -687,6 +686,9 @@ class LauncherConfigurationTests(unittest.TestCase):
                     self.assertIn(
                         "font-src 'self'", response.headers["Content-Security-Policy"]
                     )
+                    self.assertIn(
+                        "img-src 'self'", response.headers["Content-Security-Policy"]
+                    )
             with urlopen(
                 f"{base}/{token}/assets/inter-variable.woff2", timeout=3
             ) as response:
@@ -698,6 +700,7 @@ class LauncherConfigurationTests(unittest.TestCase):
             ) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["Content-Type"], "image/png")
+                self.assertIn("img-src 'self'", response.headers["Content-Security-Policy"])
                 self.assertEqual(response.read(8), b"\x89PNG\r\n\x1a\n")
             with self.assertRaises(HTTPError) as error:
                 urlopen(f"{base}/wrong-token", timeout=3)
