@@ -1,0 +1,25 @@
+{
+  "metadata": {
+    "identifier": "music-example",
+    "mediatype": "audio",
+    "creator": "Example Artist",
+    "title": "Example Album"
+  },
+  "files": [
+    {
+      "name": "Example Album - 01.flac",
+      "format": "Flac",
+      "size": "1200"
+    },
+    {
+      "name": "Example Album - 02.flac",
+      "format": "Flac",
+      "size": "2300"
+    },
+    {
+      "name": "music-example_archive.torrent",
+      "format": "Archive BitTorrent",
+      "btih": "0123456789012345678901234567890123456789"
+    }
+  ]
+}

@@ -19,14 +19,14 @@ import { StreamCache } from "./stream_cache.mjs";
 import { TorrentProvider } from "./torrent_provider.mjs";
 import { TransferBudget } from "./transfer_budget.mjs";
 
-const APP_NAME = "P2PChord - Peer-powered music. One streaming bridge.";
+const APP_NAME = "P2PChord";
 const VERSION = (await readFile(new URL("./version.txt", import.meta.url), "utf8"))
   .trim();
 const SOURCE_WORDS = JSON.parse(
   await readFile(new URL("./source_words.json", import.meta.url), "utf8"),
 );
-const DEFAULT_SECRET_WORD_COUNT = 3;
-const DEFAULT_SECRET_WORD_LENGTH = 6;
+const DEFAULT_SECRET_WORD_COUNT = 2;
+const DEFAULT_SECRET_WORD_LENGTH = 9;
 const ALLOW_DOWNLOADS = readBooleanEnvironmentValue(
   "P2PCHORD_ALLOW_DOWNLOADS",
   false,
@@ -129,6 +129,11 @@ const TORRENT_ENABLED = readBooleanEnvironmentValue(
   "P2PCHORD_TORRENT_ENABLED",
   false,
 );
+const TORRENT_DISCOVERY_ENABLED = readBooleanEnvironmentValue(
+  "P2PCHORD_TORRENT_DISCOVERY_ENABLED",
+  false,
+);
+const ADMIN_TOKEN = process.env.P2PCHORD_ADMIN_TOKEN ?? "";
 const TORRENT_SOURCES = readStringArrayEnvironmentValue(
   "P2PCHORD_TORRENT_SOURCES",
   [],
@@ -233,6 +238,12 @@ export function generateSourceSecret(
   });
   const token = bytes.toString("base64url").replaceAll("-", "~");
   return `${words.join("-")}-${token}`;
+}
+
+function sourcePhrase(secret) {
+  const words = secret.split("-");
+  if (/^[A-Za-z0-9_~]{22}$/.test(words.at(-1) ?? "")) words.pop();
+  return words.join("-");
 }
 
 function trackId(result) {
@@ -466,6 +477,8 @@ export function createAddonServer({
   publicBaseUrl = PUBLIC_BASE_URL,
   requireBitChordAuth = BITCHORD_AUTH_ENABLED,
   bitChordAuthOptions,
+  adminToken = ADMIN_TOKEN,
+  torrentDiscoveryEnabled = TORRENT_DISCOVERY_ENABLED,
   allowDownloads = ALLOW_DOWNLOADS,
   sourceSelection = SOURCE_SELECTION,
   searchLimit = SEARCH_LIMIT,
@@ -747,15 +760,19 @@ export function createAddonServer({
     );
     if (request.method === "OPTIONS") {
       response.writeHead(204, {
-        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
         "Access-Control-Allow-Headers":
-          "Range, If-Range, Content-Type, X-BitChord-Token, X-BitChord-Proof",
+          "Range, If-Range, Content-Type, X-BitChord-Token, X-BitChord-Proof, X-P2PChord-Admin-Token",
         "Access-Control-Max-Age": "86400",
       });
       response.end();
       return;
     }
-    if (request.method !== "GET" && request.method !== "HEAD") {
+    if (
+      request.method !== "GET" &&
+      request.method !== "HEAD" &&
+      request.method !== "POST"
+    ) {
       sendError(response, 405, "Method not allowed");
       return;
     }
@@ -781,6 +798,75 @@ export function createAddonServer({
       return;
     }
     const route = segments.slice(2);
+
+    if (
+      request.method === "POST" &&
+      !(
+        route.length === 3 &&
+        route[0] === "admin" &&
+        route[1] === "torrents" &&
+        route[2] === "import"
+      )
+    ) {
+      sendError(response, 405, "Method not allowed");
+      return;
+    }
+
+    if (
+      route.length === 3 &&
+      route[0] === "admin" &&
+      route[1] === "torrents" &&
+      route[2] === "import" &&
+      request.method === "POST"
+    ) {
+      if (
+        !torrentDiscoveryEnabled ||
+        !adminToken ||
+        !safeEqual(request.headers["x-p2pchord-admin-token"] ?? "", adminToken)
+      ) {
+        sendError(response, 403, "Not authorized");
+        return;
+      }
+      if (!torrentProvider) {
+        sendError(response, 503, "BitTorrent provider is disabled");
+        return;
+      }
+      if (request.headers["content-type"]?.split(";")[0] !== "application/json") {
+        sendError(response, 415, "Expected a JSON request");
+        return;
+      }
+      try {
+        const chunks = [];
+        let length = 0;
+        for await (const chunk of request) {
+          length += chunk.length;
+          if (length > 3 * 1024 * 1024) {
+            throw new RangeError("Torrent import request exceeds the size limit.");
+          }
+          chunks.push(chunk);
+        }
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        let source;
+        if (typeof payload.magnet === "string" && payload.magnet.length <= 4096) {
+          source = payload.magnet;
+        } else if (
+          typeof payload.torrentBase64 === "string" &&
+          payload.torrentBase64.length <= 2 * 1024 * 1024 * 4 / 3 + 4
+        ) {
+          source = Buffer.from(payload.torrentBase64, "base64");
+          if (source.toString("base64") !== payload.torrentBase64) {
+            throw new TypeError("Invalid torrent metadata encoding.");
+          }
+        } else {
+          throw new TypeError("Import requires a magnet URI or torrent metadata.");
+        }
+        await torrentProvider.addSource(source);
+        sendJson(response, 202, { status: "Import started" });
+      } catch (error) {
+        sendError(response, 400, error.message);
+      }
+      return;
+    }
 
     if (
       bitChordAuth &&
@@ -822,7 +908,7 @@ export function createAddonServer({
         200,
         {
           id: `p2pchord-addon.${slug}`,
-          name: APP_NAME,
+          name: `${APP_NAME} [${sourcePhrase(secret)}]`,
           version: VERSION,
           description:
             "Search and stream FLAC files directly from Soulseek peers and configured torrents to BitChord.",
@@ -1323,7 +1409,11 @@ async function main() {
   if (!SOULSEEK_ENABLED && !TORRENT_ENABLED) {
     throw new Error("Enable at least one source with P2PCHORD_SOULSEEK_ENABLED or P2PCHORD_TORRENT_ENABLED.");
   }
-  if (TORRENT_ENABLED && TORRENT_SOURCES.length === 0) {
+  if (
+    TORRENT_ENABLED &&
+    TORRENT_SOURCES.length === 0 &&
+    !TORRENT_DISCOVERY_ENABLED
+  ) {
     throw new Error("Set P2PCHORD_TORRENT_SOURCES when BitTorrent is enabled.");
   }
   if (!/^[A-Za-z0-9_-]+$/.test(SLUG)) {
@@ -1426,6 +1516,7 @@ async function main() {
     ({ server, streamCache } = createAddonServer({
       client,
       torrentProvider,
+      adminToken: ADMIN_TOKEN,
       transferBudget,
       allowDownloads: ALLOW_DOWNLOADS,
       sourceSelection: SOURCE_SELECTION,

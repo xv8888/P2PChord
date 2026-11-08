@@ -3,6 +3,16 @@
 Notable changes are recorded here. Historical entries summarize changes
 available in the project history and prior session records.
 
+## alpha-0.1.2
+
+- Added opt-in experimental torrent discovery through the Internet Archive
+  public API and user-configured Torznab endpoints. Results are not added to
+  WebTorrent until the user explicitly imports a selection in the launcher.
+- Added selected-torrent import through the existing WebTorrent provider and
+  documented experimental behavior and unverified live playback.
+- Set source URL defaults to two readable words with a nine-letter target.
+  BitChord's add-on name now includes the source URL phrase, without its token.
+
 ## alpha-0.1.0
 
 - Rebranded the user-facing launcher, manifest, and documentation as P2PChord

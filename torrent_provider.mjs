@@ -53,6 +53,7 @@ export class TorrentProvider {
     });
     this.torrents = new Map();
     this.filesById = new Map();
+    this.sourceCount = 0;
     this.totalDeclaredBytes = 0;
     this.initialized = false;
     this.closed = false;
@@ -77,31 +78,53 @@ export class TorrentProvider {
   }
 
   async addSource(source) {
-    if (typeof source !== "string" || !source.trim()) {
-      throw new TypeError("Torrent source must be a non-empty magnet URI or .torrent path.");
+    if (
+      !Buffer.isBuffer(source) &&
+      (typeof source !== "string" || !source.trim())
+    ) {
+      throw new TypeError(
+        "Torrent source must be a non-empty magnet URI, .torrent path, or metadata buffer.",
+      );
     }
-    const input = await this.readSource(source.trim());
-    const options = {
-      path: this.directory,
-      addUID: true,
-      deselect: true,
-      skipVerify: false,
-      destroyStoreOnDestroy: false,
-      storeCacheSlots: 8,
-      uploads: 0,
-    };
-    const torrent = this.client.add(input, options);
-    torrent.once("ready", () => this.registerTorrent(torrent));
-    torrent.on("error", (error) => {
-      this.log("WARN", `Torrent ${torrent.infoHash || "metadata"} failed: ${error.message}`);
-    });
-    torrent.on("warning", (error) => {
-      this.log("WARN", `Torrent ${torrent.infoHash || "metadata"}: ${error.message}`);
-    });
-    this.log("INFO", "Added a configured BitTorrent source; waiting for metadata.");
+    if (this.sourceCount >= MAX_SOURCE_COUNT) {
+      throw new RangeError(`At most ${MAX_SOURCE_COUNT} torrent sources are allowed.`);
+    }
+    this.sourceCount++;
+    try {
+      const input = await this.readSource(
+        typeof source === "string" ? source.trim() : source,
+      );
+      const options = {
+        path: this.directory,
+        addUID: true,
+        deselect: true,
+        skipVerify: false,
+        destroyStoreOnDestroy: false,
+        storeCacheSlots: 8,
+        uploads: 0,
+      };
+      const torrent = this.client.add(input, options);
+      torrent.once("ready", () => this.registerTorrent(torrent));
+      torrent.on("error", (error) => {
+        this.log("WARN", `Torrent ${torrent.infoHash || "metadata"} failed: ${error.message}`);
+      });
+      torrent.on("warning", (error) => {
+        this.log("WARN", `Torrent ${torrent.infoHash || "metadata"}: ${error.message}`);
+      });
+      this.log("INFO", "Added BitTorrent source; waiting for metadata.");
+    } catch (error) {
+      this.sourceCount--;
+      throw error;
+    }
   }
 
   async readSource(source) {
+    if (Buffer.isBuffer(source)) {
+      if (source.length < 1 || source.length > MAX_TORRENT_FILE_BYTES) {
+        throw new RangeError("Torrent metadata must be a file between 1 byte and 2 MiB.");
+      }
+      return source;
+    }
     if (source.toLowerCase().startsWith("magnet:")) {
       let magnet;
       try {

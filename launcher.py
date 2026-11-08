@@ -10,11 +10,14 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from torrent_discovery import DiscoveryError, TorrentDiscovery, fetch_torrent
 
 APP_NAME = "P2PChord"
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -22,8 +25,8 @@ __version__ = (PROJECT_DIR / "version.txt").read_text(encoding="utf-8").strip()
 PORT = 8080
 MAX_REQUEST_SIZE = 64 * 1024
 MAX_LOG_LINES = 250
-DEFAULT_SECRET_WORD_COUNT = 3
-DEFAULT_SECRET_WORD_LENGTH = 6
+DEFAULT_SECRET_WORD_COUNT = 2
+DEFAULT_SECRET_WORD_LENGTH = 9
 DEFAULT_SOURCE_SELECTION = "match"
 SOURCE_SELECTION_MODES = ("match", "speed")
 DEFAULT_SEARCH_LIMIT = 50
@@ -53,6 +56,9 @@ CACHE_MAX_SIZE_BOUNDS = (16, 32768)
 ACTIVE_STREAMS_BOUNDS = (1, 2)
 MAX_STREAM_SIZE_BOUNDS = (1, 128)
 MAX_TORRENT_SOURCES = 8
+TORRENT_DISCOVERY_INDEXERS = ("archive", "torznab")
+TORRENT_DISCOVERY_LIMIT_BOUNDS = (1, 50)
+TORRENT_DISCOVERY_TIMEOUT_BOUNDS = (1, 30)
 
 
 def _validate_integer_setting(value: object, name: str, bounds: tuple[int, int]) -> int:
@@ -241,6 +247,8 @@ def build_p2pchord_environment(
     bind_address: str = "127.0.0.1",
     soulseek_enabled: bool = True,
     torrent_enabled: bool = False,
+    torrent_discovery_enabled: bool = False,
+    admin_token: str = "",
     torrent_sources: list[str] | None = None,
     torrent_storage_max_size_gb: int = 4,
 ) -> dict[str, str]:
@@ -250,12 +258,18 @@ def build_p2pchord_environment(
         raise ValueError("BitChord authentication must be true or false.")
     if not isinstance(soulseek_enabled, bool) or not isinstance(torrent_enabled, bool):
         raise ValueError("Source provider settings must be true or false.")
+    if not isinstance(torrent_discovery_enabled, bool):
+        raise ValueError("Torrent discovery must be true or false.")
+    if torrent_discovery_enabled:
+        torrent_enabled = True
+        if not isinstance(admin_token, str) or len(admin_token) < 32:
+            raise ValueError("Torrent discovery requires an internal admin token.")
     if not soulseek_enabled and not torrent_enabled:
         raise ValueError("Enable Soulseek, BitTorrent, or both.")
     if torrent_sources is None:
         torrent_sources = []
     torrent_sources = _validate_torrent_sources(torrent_sources)
-    if torrent_enabled and not torrent_sources:
+    if torrent_enabled and not torrent_sources and not torrent_discovery_enabled:
         raise ValueError("Add at least one magnet URI or .torrent file when BitTorrent is enabled.")
     torrent_storage_max_size_gb = _validate_integer_setting(
         torrent_storage_max_size_gb, "BitTorrent storage limit", (1, 1024)
@@ -318,8 +332,10 @@ def build_p2pchord_environment(
             "P2PCHORD_MAX_STREAM_BYTES": str(max_stream_size_mb * 1024 * 1024),
             "P2PCHORD_SOULSEEK_ENABLED": str(soulseek_enabled).lower(),
             "P2PCHORD_TORRENT_ENABLED": str(torrent_enabled).lower(),
+            "P2PCHORD_TORRENT_DISCOVERY_ENABLED": str(torrent_discovery_enabled).lower(),
             "P2PCHORD_TORRENT_SOURCES": json.dumps(torrent_sources),
             "P2PCHORD_TORRENT_STORAGE_MAX_BYTES": str(torrent_storage_max_size_gb * 1024 * 1024 * 1024),
+            "P2PCHORD_ADMIN_TOKEN": admin_token,
         }
     )
     if soulseek_enabled:
@@ -413,6 +429,17 @@ class LauncherController:
         self.stop_requested = threading.Event()
         self.tailscale = find_tailscale()
         self.funnel_configured = False
+        self.torrent_discovery = TorrentDiscovery()
+        self.discovery_enabled = False
+        self.discovery_indexers = []
+        self.discovery_timeout = 10
+        self.discovery_limit = 20
+        self.torznab_url = ""
+        self.torznab_api_key = ""
+        self.discovery_results = {}
+        self.discovery_cancel_event = None
+        self.admin_token = ""
+        self.admin_import_url = ""
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -435,6 +462,7 @@ class LauncherController:
                 "running": running,
                 "active": running,
                 "source_url": self.source_url,
+                "discovery_enabled": self.discovery_enabled,
                 "logs": list(self.logs),
             }
 
@@ -494,6 +522,20 @@ class LauncherController:
         )
         soulseek_enabled = config.get("soulseek_enabled", True)
         torrent_enabled = config.get("torrent_enabled", False)
+        torrent_discovery_enabled = config.get("torrent_discovery_enabled", False)
+        discovery_indexers = config.get("torrent_discovery_indexers", ["archive"])
+        torznab_url = config.get("torznab_url", "")
+        torznab_api_key = config.get("torznab_api_key", "")
+        discovery_timeout = _validate_integer_setting(
+            config.get("torrent_discovery_timeout", 10),
+            "Torrent search timeout",
+            TORRENT_DISCOVERY_TIMEOUT_BOUNDS,
+        )
+        discovery_limit = _validate_integer_setting(
+            config.get("torrent_discovery_limit", 20),
+            "Torrent search result limit",
+            TORRENT_DISCOVERY_LIMIT_BOUNDS,
+        )
         torrent_sources = config.get("torrent_sources", "")
         torrent_storage_max_size_gb = _validate_integer_setting(
             config.get("torrent_storage_max_size_gb", 4),
@@ -503,10 +545,43 @@ class LauncherController:
         word_count = config.get("word_count", DEFAULT_SECRET_WORD_COUNT)
         word_length = config.get("word_length", DEFAULT_SECRET_WORD_LENGTH)
 
-        if not isinstance(soulseek_enabled, bool) or not isinstance(torrent_enabled, bool):
+        if (
+            not isinstance(soulseek_enabled, bool)
+            or not isinstance(torrent_enabled, bool)
+            or not isinstance(torrent_discovery_enabled, bool)
+        ):
             raise ValueError("Source provider settings must be true or false.")
-        if not soulseek_enabled and not torrent_enabled:
+        if not soulseek_enabled and not torrent_enabled and not torrent_discovery_enabled:
             raise ValueError("Enable Soulseek, BitTorrent, or both.")
+        if torrent_discovery_enabled:
+            torrent_enabled = True
+            if (
+                not isinstance(discovery_indexers, list)
+                or not discovery_indexers
+                or any(item not in TORRENT_DISCOVERY_INDEXERS for item in discovery_indexers)
+                or len(set(discovery_indexers)) != len(discovery_indexers)
+            ):
+                raise ValueError("Select at least one supported torrent indexer.")
+            if not isinstance(torznab_url, str) or not isinstance(torznab_api_key, str):
+                raise ValueError("Torznab URL and API key must be text.")
+            if (
+                len(torznab_url) > 2048
+                or len(torznab_api_key) > 256
+                or any(ord(char) < 33 for char in torznab_api_key)
+            ):
+                raise ValueError("Torznab URL or API key exceeds the length limit.")
+            if "torznab" in discovery_indexers:
+                parts = urlsplit(torznab_url)
+                if (
+                    parts.scheme != "https"
+                    or not parts.hostname
+                    or parts.username
+                    or parts.password
+                    or parts.fragment
+                ):
+                    raise ValueError("Torznab endpoints must use HTTPS without embedded credentials or fragments.")
+        elif not isinstance(discovery_indexers, list):
+            raise ValueError("Torrent indexers must be a list.")
         if soulseek_enabled and (not username or not password):
             raise ValueError("Enter your Soulseek username and password.")
         if not isinstance(torrent_sources, str):
@@ -514,7 +589,7 @@ class LauncherController:
         torrent_sources = _validate_torrent_sources(
             [source.strip() for source in torrent_sources.splitlines() if source.strip()]
         )
-        if torrent_enabled and not torrent_sources:
+        if torrent_enabled and not torrent_sources and not torrent_discovery_enabled:
             raise ValueError("Add at least one magnet URI or .torrent file when BitTorrent is enabled.")
         if not isinstance(lan_access, bool):
             raise ValueError("LAN access must be true or false.")
@@ -583,6 +658,14 @@ class LauncherController:
             self.status = "Starting"
             self.detail = "Starting enabled P2P sources…"
             self.source_url = ""
+            self.discovery_enabled = torrent_discovery_enabled
+            self.discovery_indexers = list(discovery_indexers)
+            self.discovery_timeout = discovery_timeout
+            self.discovery_limit = discovery_limit
+            self.torznab_url = torznab_url
+            self.torznab_api_key = torznab_api_key
+            self.discovery_results.clear()
+            self.discovery_cancel_event = None
             self.stop_requested.clear()
             self.logs.clear()
         server_settings = {
@@ -599,6 +682,7 @@ class LauncherController:
             "max_stream_size_mb": max_stream_size_mb,
             "soulseek_enabled": soulseek_enabled,
             "torrent_enabled": torrent_enabled,
+            "torrent_discovery_enabled": torrent_discovery_enabled,
             "torrent_sources": torrent_sources,
             "torrent_storage_max_size_gb": torrent_storage_max_size_gb,
         }
@@ -691,6 +775,11 @@ class LauncherController:
             source_secret = generate_source_secret(
                 word_count, word_length, include_token=not lan_access
             )
+            admin_token = (
+                secrets.token_urlsafe(32)
+                if server_settings["torrent_discovery_enabled"]
+                else ""
+            )
             server_env = build_p2pchord_environment(
                 base_env,
                 username,
@@ -699,9 +788,17 @@ class LauncherController:
                 public_url,
                 word_count,
                 word_length,
+                admin_token=admin_token,
                 **server_settings,
                 bind_address=bind_address,
             )
+            slug = server_env.get("P2PCHORD_SLUG", "p2pchord")
+            with self.lock:
+                self.admin_token = admin_token
+                self.admin_import_url = (
+                    f"http://{bind_address}:{PORT}/{slug}/{source_secret}"
+                    "/admin/torrents/import"
+                )
 
             if use_funnel:
                 result = subprocess.run(
@@ -784,6 +881,8 @@ class LauncherController:
                 if self.status != "Stopped":
                     self.status = "Startup failed"
                     self.detail = str(exc)
+                self.admin_token = ""
+                self.admin_import_url = ""
         finally:
             with self.lock:
                 self.starting = False
@@ -796,10 +895,117 @@ class LauncherController:
             self.status = "Stopped"
             self.detail = "P2PChord has been stopped."
             self.source_url = ""
+            self.admin_token = ""
+            self.admin_import_url = ""
+            if self.discovery_cancel_event:
+                self.discovery_cancel_event.set()
+            self.discovery_cancel_event = None
         self.log("Stopping P2PChord and enabled source providers…")
         _terminate_process(server_process)
         self._disable_funnel()
         self.log("P2PChord stopped.")
+
+    def search_torrents(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid torrent search request.")
+        query = payload.get("query")
+        with self.lock:
+            if not self.discovery_enabled or not self._any_process_running():
+                raise ValueError("Start P2PChord with torrent discovery enabled first.")
+            if self.discovery_cancel_event and not self.discovery_cancel_event.is_set():
+                raise ValueError("A torrent search is already running.")
+            cancel_event = threading.Event()
+            self.discovery_cancel_event = cancel_event
+            settings = (
+                list(self.discovery_indexers),
+                self.torznab_url,
+                self.torznab_api_key,
+                self.discovery_timeout,
+                self.discovery_limit,
+            )
+        try:
+            results, errors = self.torrent_discovery.search(
+                query,
+                settings[0],
+                torznab_url=settings[1],
+                torznab_api_key=settings[2],
+                timeout=settings[3],
+                limit=settings[4],
+                cancel_event=cancel_event,
+            )
+            if cancel_event.is_set():
+                raise InterruptedError("Torrent search was cancelled.")
+            now = time.monotonic()
+            with self.lock:
+                self.discovery_results = {
+                    result["info_hash"]: (result, now + 600)
+                    for result in results
+                }
+            self.log(f"Torrent discovery found {len(results)} results for {query!r}.")
+            return {
+                "results": [
+                    {key: value for key, value in result.items() if key != "import_source"}
+                    | {"id": result["info_hash"]}
+                    for result in results
+                ],
+                "errors": errors,
+            }
+        finally:
+            with self.lock:
+                if self.discovery_cancel_event is cancel_event:
+                    self.discovery_cancel_event = None
+
+    def cancel_torrent_search(self) -> None:
+        with self.lock:
+            if self.discovery_cancel_event:
+                self.discovery_cancel_event.set()
+
+    def import_torrent_result(self, result_id: str) -> dict:
+        if not isinstance(result_id, str) or not re.fullmatch(r"[a-f0-9]{40}", result_id):
+            raise ValueError("Invalid torrent result.")
+        with self.lock:
+            if not self.discovery_enabled or not self._any_process_running():
+                raise ValueError("Start P2PChord with torrent discovery enabled first.")
+            result_record = self.discovery_results.get(result_id)
+            admin_token = self.admin_token
+            import_url = self.admin_import_url
+            timeout = self.discovery_timeout
+        if not result_record or result_record[1] < time.monotonic():
+            raise ValueError("Torrent result expired; search again.")
+        result = result_record[0]
+        source = result["import_source"]
+        if source.lower().startswith("magnet:"):
+            payload = {"magnet": source}
+        else:
+            torrent = fetch_torrent(source, timeout)
+            if not isinstance(torrent, bytes):
+                raise ValueError("Selected torrent metadata could not be downloaded.")
+            payload = {"torrentBase64": base64.b64encode(torrent).decode("ascii")}
+        request = urllib.request.Request(
+            import_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-P2PChord-Admin-Token": admin_token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = response.read(64 * 1024)
+        except urllib.error.HTTPError as exc:
+            raise ValueError(f"Torrent import failed with HTTP {exc.code}.") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError("Could not reach the P2PChord torrent provider.") from exc
+        try:
+            result_body = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Torrent provider returned an invalid response.") from exc
+        self.log(
+            f"Selected torrent import started: {result['title']} "
+            f"({result['info_hash'][:12]}).",
+        )
+        return result_body
 
     def _disable_funnel(self) -> None:
         with self.lock:
@@ -1073,6 +1279,7 @@ button{cursor:pointer}
   <nav class="nav" aria-label="Launcher sections">
     <a class="nav-link current" href="#activity">Activity</a>
     <a class="nav-link" href="#providers">Providers</a>
+    <a class="nav-link" href="#torrent-discovery">Torrent discovery</a>
     <a class="nav-link" href="#transfer-settings">Transfers</a>
     <a class="nav-link" href="#cache-settings">Cache</a>
     <a class="nav-link" href="#source-settings">Settings</a>
@@ -1093,12 +1300,26 @@ button{cursor:pointer}
 
       <section class="section-card" id="providers" aria-labelledby="providersTitle">
         <h2 class="section-heading" id="providersTitle">Source providers</h2>
-        <p class="section-description">Soulseek is enabled by default. BitTorrent is opt-in and accepts only magnets or local .torrent files.</p>
+        <p class="section-description">Soulseek is enabled by default. BitTorrent and torrent discovery are opt-in.</p>
         <div class="fields-grid">
           <div class="field"><label class="check"><input id="soulseekEnabled" type="checkbox" checked>Enable Soulseek</label></div>
           <div class="field"><label class="check"><input id="torrentEnabled" type="checkbox">Enable BitTorrent (experimental)</label></div>
-          <div class="field full"><label for="torrentSources">Magnet URIs or absolute .torrent paths (one per line)</label><textarea id="torrentSources" rows="4" placeholder="magnet:?xt=urn:btih:...&#10;C:\Torrents\album.torrent"></textarea><p class="hint">No public torrent search is performed. Router port mapping and BitTorrent uploads are disabled; trackers and peers can still see your IP address.</p></div>
+          <div class="field full"><label for="torrentSources">Magnet URIs or absolute .torrent paths (one per line)</label><textarea id="torrentSources" rows="4" placeholder="magnet:?xt=urn:btih:...&#10;C:\Torrents\album.torrent"></textarea><p class="hint">Optional when discovery is enabled. Router port mapping and BitTorrent uploads are disabled; trackers and peers can still see your IP address.</p></div>
+          <div class="field full"><label class="check"><input id="torrentDiscoveryEnabled" type="checkbox">Enable experimental torrent discovery</label><p class="hint">Search public metadata using the Internet Archive API and/or a Torznab endpoint. Results are not imported until you select Import; only imported torrents appear in BitChord search.</p></div>
+          <div class="field"><label class="check"><input id="archiveIndexer" type="checkbox" checked>Search Internet Archive</label></div>
+          <div class="field"><label class="check"><input id="torznabIndexer" type="checkbox">Search a Torznab indexer</label></div>
+          <div class="field full"><label for="torznabUrl">Torznab HTTPS endpoint</label><input id="torznabUrl" type="url" autocomplete="url" placeholder="https://indexer.example/api"><p class="hint">Use an endpoint you are permitted to query. Private-network endpoints and cross-host redirects are rejected.</p></div>
+          <div class="field full"><label for="torznabApiKey">Torznab API key (optional)</label><input id="torznabApiKey" type="password" autocomplete="off" placeholder="Provided by the indexer"><p class="hint">Used only for the selected Torznab endpoint and this launcher session.</p></div>
           <div class="field"><label for="torrentStorage">Maximum BitTorrent storage (GiB)</label><input id="torrentStorage" type="number" min="1" max="1024" step="1" value="4" required><p class="hint">Separate storage used by WebTorrent; it does not change the existing Soulseek cache.</p></div>
+        </div>
+      </section>
+
+      <section class="section-card" id="torrent-discovery" aria-labelledby="torrentDiscoveryTitle">
+        <h2 class="section-heading" id="torrentDiscoveryTitle">Torrent discovery</h2>
+        <p class="section-description">Search indexers for publicly accessible release metadata. Select and import a result before the torrent joins BitChord search.</p>
+        <div class="fields-grid">
+          <div class="field full"><label for="torrentDiscoveryQuery">Artist, album, or release</label><input id="torrentDiscoveryQuery" type="search" maxlength="200" placeholder="Search torrent metadata"><div class="actions"><button class="button primary" id="torrentDiscoverySearch" type="button" disabled>Search indexers</button><button class="button" id="torrentDiscoveryCancel" type="button" disabled>Cancel search</button></div><p class="hint" id="torrentDiscoveryStatus" aria-live="polite">Start P2PChord with discovery enabled to search.</p></div>
+          <div class="field full"><div id="torrentDiscoveryResults" aria-live="polite"></div></div>
         </div>
       </section>
 
@@ -1120,8 +1341,8 @@ button{cursor:pointer}
           <div class="field full"><label for="publicUrl">Base address</label><div class="address-row"><input id="publicUrl" type="url" autocomplete="url" aria-describedby="publicUrlHint lanAddressHint publicUrlState" placeholder="https://device.tailnet.ts.net"><button class="button" id="useLan" type="button">Use LAN address</button></div><p class="hint" id="publicUrlHint">Enter the base address only. A valid address is saved on this device when startup is accepted.</p><p class="hint" id="lanAddressHint"></p><p class="hint" id="publicUrlState" aria-live="polite"></p></div>
           <div class="field full"><label class="check"><input id="lanAccess" type="checkbox">Connect from another device on this LAN</label><p class="hint">Uses the detected private IP and a word-only adjective/noun access phrase. Keep the full source URL private. Android BitChord currently blocks plain HTTP; see the LAN setup note.</p></div>
           <div class="field full"><label class="check"><input id="funnel" type="checkbox">Start Tailscale Funnel on port 8080</label><p class="hint">Use Funnel only when you want to share over a public HTTPS .ts.net address.</p></div>
-          <div class="field"><label class="slider-label" for="wordCount">Words in source URL <output id="wordCountValue" class="slider-value">3</output></label><input class="slider" id="wordCount" type="range" min="2" max="8" value="3"></div>
-          <div class="field"><label class="slider-label" for="wordLength">Target letters per word <output id="wordLengthValue" class="slider-value">6</output></label><input class="slider" id="wordLength" type="range" min="3" max="9" value="6"></div>
+          <div class="field"><label class="slider-label" for="wordCount">Words in source URL <output id="wordCountValue" class="slider-value">2</output></label><input class="slider" id="wordCount" type="range" min="2" max="8" value="2"></div>
+          <div class="field"><label class="slider-label" for="wordLength">Target letters per word <output id="wordLengthValue" class="slider-value">9</output></label><input class="slider" id="wordLength" type="range" min="3" max="9" value="9"></div>
           <div class="field full"><p class="hint">Each word varies by up to 3 letters from the target (within 3–9). Adjectives come first, then one noun. Non-LAN source URLs also include a separate random 128-bit bearer token.</p><p class="hint phrase-preview" id="phrasePreview" aria-live="polite"></p></div>
           <div class="field full"><label class="check"><input id="allowDownloads" type="checkbox">Allow downloads in BitChord</label><p class="hint">Off by default. When enabled, BitChord may offer downloads from this source.</p></div>
           <div class="field full"><label class="check"><input id="bitchordAuth" type="checkbox">Require BitChord 1.9.1 signed authentication</label><p class="hint">Optional and off by default. Requires HTTPS except on localhost; older BitChord clients cannot use this mode.</p></div>
@@ -1131,10 +1352,12 @@ button{cursor:pointer}
 
       <section class="section-card" id="search-settings" aria-labelledby="searchTitle">
         <h2 class="section-heading" id="searchTitle">Search</h2>
-        <p class="section-description">Tune Soulseek results; torrent imports are matched locally by filename.</p>
+        <p class="section-description">Tune Soulseek and torrent discovery results.</p>
         <div class="fields-grid">
           <div class="field"><label for="searchLimit">Maximum search results</label><input id="searchLimit" type="number" min="1" max="50" step="1" value="50" required><p class="hint">Applies to best-match mode. Fastest-speed mode always returns one result.</p></div>
           <div class="field"><label for="searchTimeout">Soulseek search timeout (seconds)</label><input id="searchTimeout" type="number" min="1" max="30" step="1" value="2" required></div>
+          <div class="field"><label for="torrentDiscoveryLimit">Torrent discovery result limit</label><input id="torrentDiscoveryLimit" type="number" min="1" max="50" step="1" value="20" required></div>
+          <div class="field"><label for="torrentDiscoveryTimeout">Torrent discovery timeout (seconds)</label><input id="torrentDiscoveryTimeout" type="number" min="1" max="30" step="1" value="10" required></div>
           <div class="field full"><label class="check"><input id="searchRecovery" type="checkbox" checked>Retry likely missing vowels when no results are found</label></div>
         </div>
       </section>
@@ -1165,9 +1388,9 @@ button{cursor:pointer}
 <script>
 const token=__TOKEN_JSON__, api="/"+token+"/api/", lanIp=__LAN_IP_JSON__;
 const $=id=>document.getElementById(id);
-let sourceUrl="";
-function updateProviderFields(){$("username").required=$("soulseekEnabled").checked;$("password").required=$("soulseekEnabled").checked;$("torrentSources").required=$("torrentEnabled").checked;}
-$("soulseekEnabled").addEventListener("change",updateProviderFields);$("torrentEnabled").addEventListener("change",updateProviderFields);updateProviderFields();
+let sourceUrl="",discoveryEnabled=false,discoveryRequest=0;
+function updateProviderFields(){$("username").required=$("soulseekEnabled").checked;$("password").required=$("soulseekEnabled").checked;$("torrentSources").required=$("torrentEnabled").checked&&!$("torrentDiscoveryEnabled").checked;}
+$("soulseekEnabled").addEventListener("change",updateProviderFields);$("torrentEnabled").addEventListener("change",updateProviderFields);$("torrentDiscoveryEnabled").addEventListener("change",updateProviderFields);updateProviderFields();
 function applyTheme(theme,persist=false){const dark=theme==="dark";document.documentElement.dataset.theme=dark?"dark":"light";$("themeToggle").textContent=dark?"Light mode":"Dark mode";$("themeToggle").setAttribute("aria-label",dark?"Switch to light mode":"Switch to dark mode");$("themeToggle").setAttribute("aria-pressed",String(dark));if(persist){try{localStorage.setItem("p2pchord.theme",dark?"dark":"light");}catch(e){console.warn("Could not save the appearance preference.",e);}}}
 let savedTheme="dark";try{const storedTheme=localStorage.getItem("p2pchord.theme");if(storedTheme==="dark"||storedTheme==="light")savedTheme=storedTheme;}catch(e){console.warn("Could not load the appearance preference.",e);}
 applyTheme(savedTheme);
@@ -1191,24 +1414,35 @@ update();
 document.querySelectorAll(".nav-link").forEach(link=>link.addEventListener("click",()=>{document.querySelectorAll(".nav-link").forEach(item=>item.classList.remove("current"));link.classList.add("current");}));
 $("start").addEventListener("click",async()=>{
   const publicUrl=validatePublicUrl();if(!publicUrl){$("publicUrl").reportValidity();return;}
-  const numericSettings=["searchLimit","searchTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize","torrentStorage"];
+  const numericSettings=["searchLimit","searchTimeout","torrentDiscoveryLimit","torrentDiscoveryTimeout","reconnectGrace","cacheTtl","cacheMaxSize","maxTrackSize","torrentStorage"];
   const invalidSetting=numericSettings.map(id=>$(id)).find(input=>!input.checkValidity());
   if(invalidSetting){invalidSetting.reportValidity();return;}
   const torrentSources=$("torrentSources").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
-  if(!$("soulseekEnabled").checked&&!$("torrentEnabled").checked){alert("Enable at least one source provider.");return;}
-  if($("torrentEnabled").checked&&!torrentSources.length){$("torrentSources").setCustomValidity("Add at least one magnet URI or .torrent file.");$("torrentSources").reportValidity();return;}
+  const discovery=$("torrentDiscoveryEnabled").checked,indexers=[];
+  if($("archiveIndexer").checked)indexers.push("archive");if($("torznabIndexer").checked)indexers.push("torznab");
+  if(!$("soulseekEnabled").checked&&!$("torrentEnabled").checked&&!discovery){alert("Enable at least one source provider.");return;}
+  if(($("torrentEnabled").checked||discovery)&&!torrentSources.length&&!discovery){$("torrentSources").setCustomValidity("Add a magnet URI or .torrent file, or enable discovery.");$("torrentSources").reportValidity();return;}
   $("torrentSources").setCustomValidity("");
-  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,bitchord_auth:$("bitchordAuth").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value),soulseek_enabled:$("soulseekEnabled").checked,torrent_enabled:$("torrentEnabled").checked,torrent_sources:torrentSources.join("\n"),torrent_storage_max_size_gb:Number($("torrentStorage").value)};
+  if(discovery&&!indexers.length){alert("Select at least one torrent indexer.");return;}
+  $("torznabUrl").setCustomValidity(discovery&&$("torznabIndexer").checked&&!$("torznabUrl").value.trim()?"Enter the Torznab HTTPS endpoint.":"");
+  if(!$("torznabUrl").reportValidity())return;
+  const config={username:$("username").value,password:$("password").value,public_url:publicUrl,lan_access:$("lanAccess").checked,start_funnel:$("funnel").checked,allow_downloads:$("allowDownloads").checked,bitchord_auth:$("bitchordAuth").checked,source_selection:$("sourceSelection").value,search_limit:Number($("searchLimit").value),search_timeout_ms:Number($("searchTimeout").value)*1000,search_recovery:$("searchRecovery").checked,idle_transfer_timeout_seconds:Number($("reconnectGrace").value),cache_ttl_minutes:Number($("cacheTtl").value),cache_max_size_mb:Number($("cacheMaxSize").value),max_active_streams:Number($("transferSlots").value),max_stream_size_mb:Number($("maxTrackSize").value),word_count:Number($("wordCount").value),word_length:Number($("wordLength").value),soulseek_enabled:$("soulseekEnabled").checked,torrent_enabled:$("torrentEnabled").checked,torrent_sources:torrentSources.join("\n"),torrent_storage_max_size_gb:Number($("torrentStorage").value),torrent_discovery_enabled:discovery,torrent_discovery_indexers:indexers,torznab_url:$("torznabUrl").value.trim(),torznab_api_key:$("torznabApiKey").value,torrent_discovery_timeout:Number($("torrentDiscoveryTimeout").value),torrent_discovery_limit:Number($("torrentDiscoveryLimit").value)};
   $("start").disabled=true;$("state").textContent="Starting";$("dot").className="dot";
   try{const r=await fetch(api+"start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not start.");try{localStorage.setItem("p2pchord.publicBaseUrl",publicUrl);$("publicUrlState").textContent="Address saved on this device.";}catch(e){$("publicUrlState").textContent="Startup accepted, but this browser could not save the address.";}$("password").value="";$("logs").textContent="Starting enabled P2P sources…";}
   catch(e){$("start").disabled=false;alert(e.message);}
   await update();
 });
 $("stop").addEventListener("click",async()=>{try{await fetch(api+"stop",{method:"POST"});}catch(e){}await update();});
+$("torrentDiscoverySearch").addEventListener("click",searchTorrents);
+$("torrentDiscoveryQuery").addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();searchTorrents();}});
+$("torrentDiscoveryCancel").addEventListener("click",async()=>{try{await fetch(api+"discovery/cancel",{method:"POST"});$("torrentDiscoveryStatus").textContent="Cancellation requested; the active indexer request may take up to its timeout to stop.";}catch(e){$("torrentDiscoveryStatus").textContent="Could not cancel the search: "+e.message;}});
+async function searchTorrents(){const query=$("torrentDiscoveryQuery").value.trim();if(!query){$("torrentDiscoveryQuery").focus();$("torrentDiscoveryStatus").textContent="Enter an artist, album, or release.";return;}const requestId=++discoveryRequest;$("torrentDiscoverySearch").disabled=true;$("torrentDiscoveryCancel").disabled=false;$("torrentDiscoveryStatus").textContent="Searching selected indexers…";$("torrentDiscoveryResults").replaceChildren();try{const r=await fetch(api+"discovery/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query})});const d=await r.json();if(!r.ok)throw Error(d.error||"Torrent search failed.");if(requestId!==discoveryRequest)return;renderTorrentResults(d.results||[]);$("torrentDiscoveryStatus").textContent=(d.results||[]).length+" results"+((d.errors||[]).length?"; "+d.errors.join(" "):"");}catch(e){if(requestId===discoveryRequest)$("torrentDiscoveryStatus").textContent=e.message;}finally{if(requestId===discoveryRequest){$("torrentDiscoverySearch").disabled=!discoveryEnabled;$("torrentDiscoveryCancel").disabled=true;}}}
+function renderTorrentResults(results){const box=$("torrentDiscoveryResults");box.replaceChildren();for(const result of results){const row=document.createElement("article"),title=document.createElement("strong"),meta=document.createElement("p"),link=document.createElement("a"),button=document.createElement("button");row.className="section-card";title.textContent=result.title;meta.textContent=[result.artist,result.album,result.format,result.size?Math.round(result.size/1048576)+" MiB":"size unknown",result.seeders===null?"seeders unknown":result.seeders+" seeders",result.leechers===null?"leechers unknown":result.leechers+" leechers",result.source].filter(Boolean).join(" · ");link.href=result.source_url||result.download_url||result.magnet_url||"#";link.textContent="Source";link.target="_blank";link.rel="noopener noreferrer";button.className="button primary";button.type="button";button.textContent="Import selected torrent";button.addEventListener("click",()=>importTorrent(result.id,button));row.append(title,meta,link,document.createTextNode(" "),button);box.append(row);}}
+async function importTorrent(id,button){button.disabled=true;button.textContent="Importing…";try{const r=await fetch(api+"discovery/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});const d=await r.json();if(!r.ok)throw Error(d.error||"Could not import torrent.");button.textContent="Import started";$("torrentDiscoveryStatus").textContent="Selected torrent is being added. Once metadata is ready, matching FLAC files will appear in BitChord search alongside Soulseek.";}catch(e){button.disabled=false;button.textContent="Import selected torrent";$("torrentDiscoveryStatus").textContent=e.message;}}
 $("copy").addEventListener("click",async()=>{if(sourceUrl){await navigator.clipboard.writeText(sourceUrl);$("state").textContent="URL copied";}});
 $("exit").addEventListener("click",async()=>{if(!confirm("Exit P2PChord and stop all enabled sources?"))return;try{await fetch(api+"exit",{method:"POST"});}catch(e){}document.body.innerHTML="<main class='exit-screen'><h1>P2PChord stopped.</h1><p>You can close this browser tab.</p></main>";});
 async function update(){try{const r=await fetch(api+"status",{cache:"no-store"});if(!r.ok)throw Error("HTTP "+r.status);renderStatus(await r.json());}catch(e){$("state").textContent="Connection error";$("dot").className="dot error";$("logs").textContent="Launcher status unavailable: "+e.message;}}
-function renderStatus(s){sourceUrl=s.source_url||"";$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;renderLogs(s.logs||[],s.detail||"");$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
+function renderStatus(s){sourceUrl=s.source_url||"";discoveryEnabled=!!s.discovery_enabled&&!!s.running;$("torrentDiscoverySearch").disabled=!discoveryEnabled;$("url").textContent=sourceUrl||"Your BitChord source URL will appear here after startup.";$("url").classList.toggle("empty",!sourceUrl);$("copy").disabled=!sourceUrl;renderLogs(s.logs||[],s.detail||"");$("state").textContent=s.status||"Ready";$("dot").className="dot"+(s.running?" success":s.status==="Startup failed"?" error":"");$("start").disabled=!!s.starting||!!s.active;$("stop").disabled=!s.starting&&!s.active;}
 function renderLogs(entries,fallback){const box=$("logs"),follow=box.scrollHeight-box.scrollTop-box.clientHeight<24,lines=entries.length?entries:[fallback||"Waiting for activity…"];box.replaceChildren();for(const line of lines){const row=document.createElement("div"),time=document.createElement("span"),kind=document.createElement("span"),message=document.createElement("span"),match=/^(?:\[[^\]]+\]\s*)?\[(\d{2}:\d{2}:\d{2})\]\s+\[(SEARCH|STREAM|WARN|ERROR|INFO)\]\s*(.*)$/i.exec(line);const level=match?match[2].toLowerCase():"info";row.className="log-line "+level;time.className="log-time";time.textContent=match?match[1]:"";kind.className="log-kind";kind.textContent=level.toUpperCase();message.className="log-message";message.textContent=match?match[3]:line;row.append(time,kind,message);box.append(row);}$("log-count").textContent=entries.length+" EVENT"+(entries.length===1?"":"S");if(follow)box.scrollTop=box.scrollHeight;}
 setInterval(update,1000);
 </script>
@@ -1332,6 +1566,35 @@ def make_handler(controller: LauncherController, token: str):
                     self._send_json({"error": str(exc)}, 400)
                     return
                 self._send_json(controller.snapshot(), 202)
+            elif path == f"/{token}/api/discovery/search":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if self.headers.get_content_type() != "application/json" or not 1 <= length <= MAX_REQUEST_SIZE:
+                        raise ValueError("Expected a bounded JSON search request.")
+                    payload = json.loads(self.rfile.read(length))
+                    self._send_json(controller.search_torrents(payload))
+                except InterruptedError as exc:
+                    self._send_json({"error": str(exc)}, 409)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except RuntimeError as exc:
+                    self._send_json({"error": str(exc)}, 502)
+            elif path == f"/{token}/api/discovery/cancel":
+                controller.cancel_torrent_search()
+                self._send_json({"status": "Cancellation requested"})
+            elif path == f"/{token}/api/discovery/import":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if self.headers.get_content_type() != "application/json" or not 1 <= length <= MAX_REQUEST_SIZE:
+                        raise ValueError("Expected a bounded JSON import request.")
+                    payload = json.loads(self.rfile.read(length))
+                    if not isinstance(payload, dict):
+                        raise ValueError("Invalid torrent result.")
+                    self._send_json(controller.import_torrent_result(payload.get("id")), 202)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                except RuntimeError as exc:
+                    self._send_json({"error": str(exc)}, 502)
             elif path == f"/{token}/api/stop":
                 threading.Thread(target=controller.stop, daemon=True).start()
                 self._send_json({"status": "Stopping"})

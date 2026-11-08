@@ -59,7 +59,27 @@ test("configured torrent sources validate magnet hashes and bounded local metada
   await writeFile(metadataPath, Buffer.from("fixture metadata"));
   assert.deepEqual(await provider.readSource(metadataPath), Buffer.from("fixture metadata"));
   await provider.close();
+
+  const importedDirectory = await mkdtemp(join(tmpdir(), "p2pchord-torrent-import-test-"));
+  const metadata = Buffer.from("selected torrent metadata");
+  let added;
+  const importedProvider = await createProvider(importedDirectory, {
+    client: {
+      add(input, options) {
+        added = { input, options };
+        return new EventEmitter();
+      },
+      destroy(callback) {
+        callback();
+      },
+    },
+  });
+  await importedProvider.addSource(metadata);
+  assert.deepEqual(added.input, metadata);
+  assert.equal(added.options.skipVerify, false);
+  await importedProvider.close();
   await rm(directory, { recursive: true, force: true });
+  await rm(importedDirectory, { recursive: true, force: true });
 });
 
 test("torrent search filters unsafe/non-FLAC paths and serves synthetic byte ranges", async () => {
@@ -138,6 +158,7 @@ test("HTTP search, stream resolution, and ranges dispatch to a torrent provider"
     numPeers: 1,
     downloaded: 0,
   });
+
   const { server, streamCache } = createAddonServer({
     client: null,
     torrentProvider: provider,
@@ -172,6 +193,107 @@ test("HTTP search, stream resolution, and ranges dispatch to a torrent provider"
     await new Promise((resolve) => server.close(resolve));
     await streamCache.close();
     await provider.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("launcher-only import endpoint requires its admin token and forwards selected metadata", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "p2pchord-torrent-test-"));
+  const imported = [];
+  const provider = {
+    addSource: async (source) => imported.push(source),
+    search: () => [],
+  };
+  const adminToken = "private-launcher-admin-token-for-tests";
+  const { server, streamCache } = createAddonServer({
+    client: null,
+    torrentProvider: provider,
+    adminToken,
+    torrentDiscoveryEnabled: true,
+    secret: "test-secret",
+    slug: "p2pchord",
+    publicBaseUrl: "http://127.0.0.1",
+    transferBudget: new TransferBudget(2),
+    cacheDirectory: join(directory, "soulseek-cache"),
+  });
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${server.address().port}/p2pchord/test-secret/admin/torrents/import`;
+    const denied = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789" }),
+    });
+    assert.equal(denied.status, 403);
+    const magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+    const accepted = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-P2PChord-Admin-Token": adminToken,
+      },
+      body: JSON.stringify({ magnet }),
+    });
+    assert.equal(accepted.status, 202);
+    const torrentBytes = Buffer.from("torrent metadata fixture");
+    const fileAccepted = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-P2PChord-Admin-Token": adminToken,
+      },
+      body: JSON.stringify({ torrentBase64: torrentBytes.toString("base64") }),
+    });
+    assert.equal(fileAccepted.status, 202);
+    assert.equal(imported[0], magnet);
+    assert.deepEqual(imported[1], torrentBytes);
+    const malformed = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-P2PChord-Admin-Token": adminToken,
+      },
+      body: JSON.stringify({ torrentBase64: "invalid!" }),
+    });
+    assert.equal(malformed.status, 400);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await streamCache.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("launcher-only import endpoint stays disabled when discovery is off", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "p2pchord-torrent-test-"));
+  const { server, streamCache } = createAddonServer({
+    client: null,
+    torrentProvider: { addSource: async () => {} },
+    adminToken: "private-launcher-admin-token-for-tests",
+    secret: "test-secret",
+    slug: "p2pchord",
+    publicBaseUrl: "http://127.0.0.1",
+    transferBudget: new TransferBudget(2),
+    cacheDirectory: join(directory, "soulseek-cache"),
+  });
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${server.address().port}/p2pchord/test-secret/admin/torrents/import`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-P2PChord-Admin-Token": "private-launcher-admin-token-for-tests",
+      },
+      body: JSON.stringify({
+        magnet: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+      }),
+    });
+    assert.equal(response.status, 403);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await streamCache.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

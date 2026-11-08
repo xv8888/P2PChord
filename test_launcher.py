@@ -1,12 +1,16 @@
+import base64
+import json
 import unittest
 from io import StringIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import threading
+import time
 from unittest.mock import patch
 from pathlib import Path
 
 from launcher import (
+    DEFAULT_SECRET_WORD_COUNT,
     LauncherController,
     SOURCE_WORDS,
     _page,
@@ -21,6 +25,89 @@ from http.server import ThreadingHTTPServer
 
 
 class LauncherConfigurationTests(unittest.TestCase):
+    def test_torrent_discovery_search_returns_selectable_results_without_importing(self):
+        class RunningProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        result = {
+            "title": "Artist - Album [FLAC]",
+            "artist": "Artist",
+            "album": "Album",
+            "format": "FLAC",
+            "size": 1234,
+            "seeders": 5,
+            "leechers": 1,
+            "source": "fixture",
+            "info_hash": "1" * 40,
+            "magnet_url": "magnet:?xt=urn:btih:" + "1" * 40,
+            "download_url": None,
+            "source_url": "https://indexer.example/release",
+            "import_source": "magnet:?xt=urn:btih:" + "1" * 40,
+        }
+        controller = LauncherController()
+        controller.server_process = RunningProcess()
+        controller.discovery_enabled = True
+        controller.discovery_indexers = ["torznab"]
+        with patch.object(
+            controller.torrent_discovery, "search", return_value=([result], [])
+        ):
+            response = controller.search_torrents({"query": "Artist Album"})
+        self.assertEqual(len(response["results"]), 1)
+        self.assertEqual(response["results"][0]["id"], "1" * 40)
+        self.assertNotIn("import_source", response["results"][0])
+        self.assertIn("1" * 40, controller.discovery_results)
+
+    def test_selected_torrent_import_forwards_only_cached_user_selection(self):
+        class RunningProcess:
+            @staticmethod
+            def poll():
+                return None
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            @staticmethod
+            def read(_limit):
+                return b'{"status":"Import started"}'
+
+        controller = LauncherController()
+        controller.server_process = RunningProcess()
+        controller.discovery_enabled = True
+        controller.admin_token = "a" * 40
+        controller.admin_import_url = "http://127.0.0.1:8080/p2pchord/test/admin/torrents/import"
+        result_id = "2" * 40
+        controller.discovery_results[result_id] = (
+            {
+                "title": "Artist - Album",
+                "info_hash": result_id,
+                "import_source": "https://indexer.example/album.torrent",
+            },
+            time.monotonic() + 60,
+        )
+        torrent_bytes = b"selected torrent metadata"
+        with (
+            patch("launcher.fetch_torrent", return_value=torrent_bytes),
+            patch("launcher.urllib.request.urlopen", return_value=Response()) as urlopen,
+        ):
+            response = controller.import_torrent_result(result_id)
+        self.assertEqual(response["status"], "Import started")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            json.loads(request.data),
+            {"torrentBase64": base64.b64encode(torrent_bytes).decode("ascii")},
+        )
+        self.assertEqual(
+            request.get_header("X-p2pchord-admin-token"), controller.admin_token
+        )
+        with self.assertRaisesRegex(ValueError, "expired"):
+            controller.import_torrent_result("3" * 40)
+
     def test_detect_lan_ip_prefers_private_route_address(self):
         route = type(
             "Route",
@@ -98,8 +185,8 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertEqual(env["BITCHORD_SECRET"], "generated-source-secret")
         self.assertEqual(env["PUBLIC_BASE_URL"], "https://device.example.ts.net")
         self.assertEqual(env["PORT"], "8080")
-        self.assertEqual(env["P2PCHORD_WORD_COUNT"], "3")
-        self.assertEqual(env["P2PCHORD_WORD_LENGTH"], "6")
+        self.assertEqual(env["P2PCHORD_WORD_COUNT"], "2")
+        self.assertEqual(env["P2PCHORD_WORD_LENGTH"], "9")
         self.assertEqual(env["P2PCHORD_ALLOW_DOWNLOADS"], "false")
         self.assertEqual(env["P2PCHORD_BITCHORD_AUTH"], "false")
         self.assertEqual(env["P2PCHORD_BIND_ADDRESS"], "127.0.0.1")
@@ -152,6 +239,23 @@ class LauncherConfigurationTests(unittest.TestCase):
                 torrent_enabled=True,
                 torrent_sources=["magnet:?xt=urn:btih:invalid"],
             )
+
+    def test_discovery_environment_enables_empty_torrent_provider_with_admin_token(self):
+        admin_token = "internal-admin-token-for-launcher-discovery"
+        env = build_p2pchord_environment(
+            {},
+            "",
+            "",
+            "secret",
+            "https://device.example.test",
+            soulseek_enabled=False,
+            torrent_discovery_enabled=True,
+            admin_token=admin_token,
+        )
+        self.assertEqual(env["P2PCHORD_TORRENT_ENABLED"], "true")
+        self.assertEqual(env["P2PCHORD_TORRENT_DISCOVERY_ENABLED"], "true")
+        self.assertEqual(env["P2PCHORD_TORRENT_SOURCES"], "[]")
+        self.assertEqual(env["P2PCHORD_ADMIN_TOKEN"], admin_token)
 
     def test_p2pchord_download_permission_is_opt_in(self):
         env = build_p2pchord_environment(
@@ -349,6 +453,7 @@ class LauncherConfigurationTests(unittest.TestCase):
             | {
                 "soulseek_enabled": True,
                 "torrent_enabled": False,
+                "torrent_discovery_enabled": False,
                 "torrent_sources": [],
                 "torrent_storage_max_size_gb": 4,
             },
@@ -529,8 +634,12 @@ class LauncherConfigurationTests(unittest.TestCase):
     def test_dashboard_preserves_controls_in_responsive_music_app_layout(self):
         page = _page("test-token", "https://device.example.ts.net").decode("utf-8")
         self.assertIn('type="password"', page)
-        self.assertIn('id="wordCount" type="range" min="2" max="8" value="3"', page)
-        self.assertIn('id="wordLength" type="range" min="3" max="9" value="6"', page)
+        self.assertEqual(DEFAULT_SECRET_WORD_COUNT, 2)
+        self.assertEqual(len(generate_source_secret().split("-")), 3)
+        self.assertIn('id="wordCount" type="range" min="2" max="8" value="2"', page)
+        self.assertIn('id="wordCountValue" class="slider-value">2</output>', page)
+        self.assertIn('id="wordLength" type="range" min="3" max="9" value="9"', page)
+        self.assertIn('id="wordLengthValue" class="slider-value">9</output>', page)
         self.assertIn("Adjectives come first, then one noun", page)
         self.assertIn("random 128-bit bearer token", page)
         self.assertIn("another device on this LAN", page)
@@ -554,12 +663,13 @@ class LauncherConfigurationTests(unittest.TestCase):
             "cache-settings",
             "activity",
             "providers",
+            "torrent-discovery",
         ):
             self.assertIn(f'id="{section}"', page)
-        for target in ("activity", "providers", "transfer-settings", "cache-settings", "source-settings"):
+        for target in ("activity", "providers", "torrent-discovery", "transfer-settings", "cache-settings", "source-settings"):
             self.assertIn(f'href="#{target}"', page)
         self.assertIn('class="titlebar"', page)
-        self.assertIn('class="app-footer"><span>P2PChord | alpha-0.1.0</span>', page)
+        self.assertIn('class="app-footer"><span>P2PChord | alpha-0.1.2</span>', page)
         self.assertNotIn('class="sidebar"', page)
         self.assertNotIn('class="player"', page)
         self.assertLess(page.index('id="activity"'), page.index('id="connection"'))
@@ -574,6 +684,17 @@ class LauncherConfigurationTests(unittest.TestCase):
             "sourceSelection",
             "searchLimit",
             "searchTimeout",
+            "torrentDiscoveryEnabled",
+            "archiveIndexer",
+            "torznabIndexer",
+            "torznabUrl",
+            "torznabApiKey",
+            "torrentDiscoveryLimit",
+            "torrentDiscoveryTimeout",
+            "torrentDiscoverySearch",
+            "torrentDiscoveryCancel",
+            "torrentDiscoveryQuery",
+            "torrentDiscoveryResults",
             "searchRecovery",
             "reconnectGrace",
             "transferSlots",
@@ -605,6 +726,12 @@ class LauncherConfigurationTests(unittest.TestCase):
         self.assertIn('<option value="2" selected>2 transfers (maximum)</option>', page)
         self.assertIn('id="maxTrackSize" type="number" min="1" max="128"', page)
         self.assertIn('search_timeout_ms:Number($("searchTimeout").value)*1000', page)
+        self.assertIn('torrent_discovery_enabled:discovery', page)
+        self.assertIn('torrent_discovery_indexers:indexers', page)
+        self.assertIn('fetch(api+"discovery/search"', page)
+        self.assertIn('fetch(api+"discovery/import"', page)
+        self.assertIn('fetch(api+"discovery/cancel"', page)
+        self.assertIn("Import selected torrent", page)
         self.assertIn('max_active_streams:Number($("transferSlots").value)', page)
         self.assertIn("if(invalidSetting){invalidSetting.reportValidity();return;}", page)
         self.assertNotIn('id="allowDownloads" type="checkbox" checked', page)

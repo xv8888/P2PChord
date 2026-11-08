@@ -28,6 +28,8 @@ flowchart LR
     PEERS -->|FLAC chunks| SC
     WT <-->|metadata and verified pieces| BTPEERS[Configured torrent peers]
     PY[Python launcher] -->|starts Node process; passes environment| HTTP
+    PY -->|public metadata search| INDEXERS[Internet Archive API / Torznab endpoint]
+    PY -->|explicit selection only; admin-token import| HTTP
     PY -->|stop / exit| LIFE
 ```
 
@@ -77,10 +79,10 @@ The official protocol uses three JSON-over-HTTP GET endpoints:
    - P2PChord returns the standard `tracks`, `albums`, `artists`, and
      `playlists` arrays. It filters safe `.flac` results from enabled providers
      and, by default, ranks candidates by filename match and returns at most 50
-     tracks. BitTorrent searches only configured torrent filenames; it does
-     not query a public index. Fastest-speed mode returns one result using the
-     source's reported or observed transfer speed. Empty queries and searches
-     without a usable match return empty arrays.
+     tracks. BitTorrent searches only torrents already imported by the user.
+     Fastest-speed mode returns one result using the source's reported or
+     observed transfer speed. Empty queries and searches without a usable
+     match return empty arrays.
 
 3. **Stream — `GET /stream/{id}`**
    - Return JSON with an absolute, directly playable media or manifest `url`.
@@ -96,6 +98,13 @@ a fourth add-on resource. It returns FLAC bytes and supports byte ranges for
 playback, seeking, and follow-up requests. P2PChord also accepts `HEAD` and
 `OPTIONS` on the HTTP server; these do not replace the three GET protocol
 routes.
+
+The inspected BitChord add-on API has no independent torrent selection or
+import action. P2PChord therefore keeps discovery in its launcher dashboard:
+results are displayed there, and an explicit **Import selected torrent** action
+hands that single magnet or bounded `.torrent` metadata to the existing
+provider. Only after that succeeds can the imported torrent's FLAC files appear
+beside Soulseek results in BitChord's normal search response.
 
 ## Search and track identity
 
@@ -137,6 +146,47 @@ cache readability, and the first body write queued to Node's HTTP response.
 That final milestone is not a measurement of delivery over the network to
 BitChord. Stream requests refer back to the most recent search-request IDs
 associated with that result.
+
+## Torrent discovery and explicit import
+
+Discovery is disabled by default and implemented in `torrent_discovery.py`
+using Python's standard-library HTTP and XML/JSON parsers. The built-in
+Internet Archive path queries its public advanced-search and metadata APIs.
+General-purpose indexers use the Torznab RSS API format; the user supplies an
+HTTPS endpoint and optional API key. P2PChord does not scrape HTML, install
+Prowlarr/Jackett, or bypass authentication and anti-bot controls.
+
+The parsers normalize title, artist, album, format, size, seeders, leechers,
+source, info hash, and available magnet/download/source URLs. Results without
+a valid info hash or an importable magnet/`.torrent` link are discarded.
+Duplicates collapse by normalized info hash. Ranking prioritizes FLAC, then
+query-term overlap, then reported seeders. Archive metadata exposes no live
+seeder counts; those values remain unknown.
+
+Requests have a configurable 1–30 second per-request timeout, a 2 MiB response
+limit, at most two concurrent HTTP requests, a one-request-per-second
+per-host rate limit, and a 60-second result cache. Torznab endpoints must use
+HTTPS, resolve only to public IP addresses, and may redirect only to the same
+host. Internet Archive requests and selected torrent downloads may redirect
+within `archive.org`; other download URLs reject cross-host redirects. Torrent
+metadata is downloaded only after the user selects Import and is capped at
+2 MiB. Search can be cancelled from the launcher; an in-flight standard-library
+HTTP request can take up to its configured timeout to return.
+
+The launcher holds result IDs and the short-lived admin credential in memory.
+The Node server's import route requires both the normal source path credential
+and that separate random token. It only forwards a user-selected result to
+`TorrentProvider.addSource`; that provider retains its source-count, metadata
+size, aggregate storage, file-count, path, and FLAC checks. WebTorrent's
+existing deselected startup and piece verification remain unchanged. The
+selected torrent is active for this server session; discovery selections are
+not persisted as launcher settings and must be imported again after restart.
+
+The Internet Archive API and a sample item's metadata/torrent URL were
+reachable during implementation. Torznab parsing and failure cases are tested
+with fixtures; no live Torznab endpoint was used. Search results and the
+launcher-to-provider handoff are not proof of live peer availability or
+successful BitChord playback.
 
 ## Soulseek client and transfer lifecycle
 
@@ -290,11 +340,12 @@ range-capable `/file/{id}` route dispatch to the provider that created the
 track. A shared `TransferBudget` limits active transfers across both providers.
 
 The torrent provider accepts user-configured magnet URIs with a `btih` info
-hash or absolute local `.torrent` paths (metadata files are capped at 2 MiB).
-It adds at most eight configured sources, rejects torrents with over 10,000
+hash, absolute local `.torrent` paths, or metadata buffers submitted by the
+launcher after explicit result selection (all metadata is capped at 2 MiB).
+It adds at most eight sources, rejects torrents with over 10,000
 files and unsafe file paths, and
 returns only size-limited `.flac` files whose filenames contain every query
-term. It does not search a public index. WebTorrent 3.0.21 provides the
+term. WebTorrent 3.0.21 provides the
 magnet/metadata client and range-readable file streams. WebTorrent verifies
 piece hashes before exposing those pieces to readers. Torrent files use a
 separate persistent piece store and do not enter the Soulseek cache.
@@ -327,6 +378,8 @@ its Windows networking or large-swarm behavior has been validated here.
   byte-range service, offset resume, FLAC signature validation, and size checks.
 - User-configured magnet and local `.torrent` inputs, filename matching, and
   WebTorrent piece-aware range reads.
+- Experimental Internet Archive and Torznab metadata discovery in the
+  launcher, with explicit result selection before import into TorrentProvider.
 - Per-client search rate limiting, signed media URLs when BitChord proof auth
   is enabled, and source URL path authentication.
 
@@ -336,6 +389,10 @@ its Windows networking or large-swarm behavior has been validated here.
   Current automated tests use local/synthetic data; availability, first-byte
   latency, repeated range behavior, and cancellation against real swarms remain
   unverified.
+- **Live Torznab compatibility is unverified.** RSS parsing and failure handling
+  use fixtures. A configured endpoint must permit automated HTTPS requests;
+  results may omit seed/leech counts, usable magnets, FLAC metadata, or live
+  peers. Discovery metadata does not establish a user's rights to a release.
 - **Android cleartext policy blocks the plain-HTTP LAN URL.** The inspected
   BitChord Android manifest sets `android:usesCleartextTraffic="false"`.
   P2PChord cannot override that client-side policy. BitChord would need a

@@ -21,6 +21,7 @@ const sourceWords = JSON.parse(
   readFileSync(new URL("./source_words.json", import.meta.url), "utf8"),
 );
 const serverSource = readFileSync(new URL("./direct_server.mjs", import.meta.url), "utf8");
+const testSecret = "exquisite-uncle-AAECAwQFBgcICQoLDA0ODw";
 const textEncoder = new TextEncoder();
 
 function base64Url(value) {
@@ -170,7 +171,7 @@ test("source URLs use adjective words followed by a noun and a 128-bit token", (
   assert.ok(sourceWords.adjectives["6"].includes(parts[1]));
   assert.ok(sourceWords.nouns["9"].includes(parts[2]));
   assert.equal(parts.at(-1), "AAECAwQFBgcICQoLDA0ODw");
-  assert.equal(generateSourceSecret().split("-").length, 4);
+  assert.equal(generateSourceSecret().split("-").length, 3);
 });
 
 test("each word varies by up to three letters from the target", () => {
@@ -248,9 +249,10 @@ let transferDelay;
 let monitorConnectionStatus;
 
 async function startServer(options = {}) {
+  const secret = options.secret ?? "test-secret";
   ({ server, streamCache } = createAddonServer({
     client,
-    secret: "test-secret",
+    secret,
     slug: "p2pchord",
     publicBaseUrl: "https://music.example.test",
     getConnectionStatus: () => monitorConnectionStatus,
@@ -261,7 +263,7 @@ async function startServer(options = {}) {
     ...options,
   }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  base = `http://127.0.0.1:${server.address().port}/p2pchord/test-secret`;
+  base = `http://127.0.0.1:${server.address().port}/p2pchord/${secret}`;
 }
 
 async function stopServer() {
@@ -324,8 +326,11 @@ async function searchTracks(query = "kick") {
 }
 
 test("manifest and search expose only safe FLAC results", async () => {
+  await stopServer();
+  await startServer({ secret: testSecret });
   const manifest = await (await fetch(`${base}/manifest.json`)).json();
-  assert.equal(manifest.version, "alpha-0.1.0");
+  assert.equal(manifest.version, "alpha-0.1.2");
+  assert.equal(manifest.name, "P2PChord [exquisite-uncle]");
   assert.match(manifest.description, /directly from Soulseek peers/);
   assert.equal(manifest.allowDownloads, false);
   assert.equal("bitchordAuth" in manifest, false);
