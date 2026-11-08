@@ -345,6 +345,53 @@ test("manifest and search expose only safe FLAC results", async () => {
   assert.equal(client.lastSearch.timeout, 2000);
 });
 
+test("manifest name does not expose a custom source secret", async () => {
+  await stopServer();
+  await startServer({ secret: "custom-source-secret" });
+  const manifest = await (await fetch(`${base}/manifest.json`)).json();
+  assert.equal(manifest.name, "P2PChord");
+  assert.equal(manifest.name.includes("custom-source-secret"), false);
+});
+
+test("disconnecting while opening a cache entry releases its consumer", async () => {
+  const id = await searchTrack();
+  const originalGetEntry = streamCache.getEntry.bind(streamCache);
+  let unblockGetEntry;
+  const getEntryBlocked = new Promise((resolve) => {
+    unblockGetEntry = resolve;
+  });
+  let notifyGetEntry;
+  const getEntryCalled = new Promise((resolve) => {
+    notifyGetEntry = resolve;
+  });
+  let notifyGetEntryFinished;
+  const getEntryFinished = new Promise((resolve) => {
+    notifyGetEntryFinished = resolve;
+  });
+  let entry;
+  streamCache.getEntry = async (...args) => {
+    notifyGetEntry();
+    await getEntryBlocked;
+    entry = await originalGetEntry(...args);
+    notifyGetEntryFinished();
+    return entry;
+  };
+
+  const controller = new AbortController();
+  const request = fetch(`${base}/file/${id}`, { signal: controller.signal });
+  try {
+    await getEntryCalled;
+    controller.abort();
+    await assert.rejects(request, { name: "AbortError" });
+    unblockGetEntry();
+    await getEntryFinished;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(entry.consumers, 0);
+  } finally {
+    unblockGetEntry();
+  }
+});
+
 test("opt-in BitChord auth protects add-on APIs and signs range-capable media URLs", async () => {
   await stopServer();
   const credentials = await createBitChordCredentials("music.example.test");

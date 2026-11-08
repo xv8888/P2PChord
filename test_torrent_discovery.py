@@ -1,7 +1,7 @@
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torrent_discovery as discovery
 
@@ -157,6 +157,45 @@ class TorrentDiscoveryTests(unittest.TestCase):
             handler.redirect_request(
                 None, response, 302, "Found", {}, "https://other.example/redirect"
             )
+
+    def test_https_connection_uses_a_validated_ip_and_hostname_for_tls(self):
+        address = (2, 1, 6, "", ("8.8.8.8", 443))
+        sock = object()
+        tls_sock = object()
+        context = Mock()
+        context.wrap_socket.return_value = tls_sock
+        with (
+            patch.object(discovery.socket, "getaddrinfo", return_value=[address]),
+            patch.object(discovery.socket, "create_connection", return_value=sock) as connect,
+        ):
+            connection = discovery._PinnedHTTPSConnection(
+                "indexer.example", timeout=5, context=context
+            )
+            connection.connect()
+
+        connect.assert_called_once_with(("8.8.8.8", 443), 5, None)
+        context.wrap_socket.assert_called_once_with(
+            sock, server_hostname="indexer.example"
+        )
+        self.assertIs(connection.sock, tls_sock)
+
+    def test_https_connection_rejects_dns_rebinding_to_a_private_address(self):
+        public = (2, 1, 6, "", ("8.8.8.8", 443))
+        private = (2, 1, 6, "", ("10.0.0.2", 443))
+        with (
+            patch.object(
+                discovery.socket, "getaddrinfo", side_effect=[[public], [private]]
+            ),
+            patch.object(discovery.socket, "create_connection") as connect,
+        ):
+            discovery._validate_https_url("https://indexer.example/api")
+            connection = discovery._PinnedHTTPSConnection(
+                "indexer.example", timeout=5, context=Mock()
+            )
+            with self.assertRaisesRegex(discovery.DiscoveryError, "public IP"):
+                connection.connect()
+
+        connect.assert_not_called()
 
     def test_selected_torrent_fetch_accepts_magnet_and_bounds_download(self):
         magnet = "magnet:?xt=urn:btih:" + "a" * 40

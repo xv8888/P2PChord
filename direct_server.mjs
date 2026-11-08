@@ -242,7 +242,10 @@ export function generateSourceSecret(
 
 function sourcePhrase(secret) {
   const words = secret.split("-");
-  if (/^[A-Za-z0-9_~]{22}$/.test(words.at(-1) ?? "")) words.pop();
+  if (!/^[A-Za-z0-9_~]{22}$/.test(words.pop() ?? "")) return "";
+  if (words.length < 2 || words.length > 8 || words.some((word) => !/^[a-z]+$/i.test(word))) {
+    return "";
+  }
   return words.join("-");
 }
 
@@ -903,12 +906,13 @@ export function createAddonServer({
     }
 
     if (route.length === 1 && route[0] === "manifest.json") {
+      const phrase = sourcePhrase(secret);
       sendJson(
         response,
         200,
         {
           id: `p2pchord-addon.${slug}`,
-          name: `${APP_NAME} [${sourcePhrase(secret)}]`,
+          name: phrase ? `${APP_NAME} [${phrase}]` : APP_NAME,
           version: VERSION,
           description:
             "Search and stream FLAC files directly from Soulseek peers and configured torrents to BitChord.",
@@ -1221,15 +1225,42 @@ export function createAddonServer({
         return;
       }
       let entry;
+      let consumerReleased = false;
+      let disconnected = response.destroyed;
+      let streamAbort;
+      let range;
+      const releaseConsumer = () => {
+        if (entry && !consumerReleased) {
+          consumerReleased = true;
+          provider.removeConsumer(entry);
+        }
+      };
+      response.once("close", () => {
+        disconnected = true;
+        if (!response.writableEnded) {
+          log("WARN", `BitChord disconnected while streaming "${track.title}".`);
+        }
+        range?.destroy();
+        streamAbort?.abort();
+        releaseConsumer();
+      });
       try {
         entry = await provider.getEntry(track);
+        if (disconnected || response.destroyed) {
+          releaseConsumer();
+          return;
+        }
         await provider.touch(entry);
+        if (disconnected || response.destroyed) {
+          releaseConsumer();
+          return;
+        }
         log(
           "STREAM",
           `File request ${requestId} cache entry ready (+${(performance.now() - requestStartedAt).toFixed(1)}ms).`,
         );
       } catch (error) {
-        if (entry) provider.removeConsumer(entry);
+        releaseConsumer();
         log("ERROR", `File request ${requestId} could not open result id=${track.id} file="${track.file}" peer=${track.user}: ${error.message}; HTTP 500.`);
         sendError(response, 500, "Could not open stream cache");
         return;
@@ -1246,6 +1277,10 @@ export function createAddonServer({
             searchRequestIds,
             requestStartedAt,
           });
+          if (disconnected || response.destroyed) {
+            releaseConsumer();
+            return;
+          }
         } else if (entry.activeTransfer || entry.releaseSlot) {
           log(
             "STREAM",
@@ -1260,8 +1295,12 @@ export function createAddonServer({
           );
         }
         await provider.sweep();
+        if (disconnected || response.destroyed) {
+          releaseConsumer();
+          return;
+        }
       } catch (error) {
-        provider.removeConsumer(entry);
+        releaseConsumer();
         if (error.statusCode === 503 || error.message === "Too many active Soulseek streams") {
           log(
             "WARN",
@@ -1284,8 +1323,8 @@ export function createAddonServer({
           ? `bytes ${start}-${end}/${track.size}`
           : `bytes ${start}-${end}/*`;
       }
-      const streamAbort = new AbortController();
-      const range = Readable.from(
+      streamAbort = new AbortController();
+      range = Readable.from(
         provider.readRange(
           entry,
           start,
@@ -1351,14 +1390,6 @@ export function createAddonServer({
         }
         return result;
       };
-      response.on("close", () => {
-        if (!response.writableEnded) {
-          log("WARN", `BitChord disconnected while streaming "${track.title}".`);
-        }
-        range.destroy();
-        streamAbort.abort();
-        provider.removeConsumer(entry);
-      });
       log(
         "STREAM",
         `File request ${requestId} waiting for audio to start result id=${track.id}; ` +

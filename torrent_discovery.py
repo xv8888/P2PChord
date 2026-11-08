@@ -1,8 +1,10 @@
 import base64
+import http.client
 import ipaddress
 import json
 import re
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -27,6 +29,47 @@ class DiscoveryError(ValueError):
     pass
 
 
+def _public_addresses(host, port):
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise DiscoveryError("Indexer host could not be resolved.") from exc
+    if not addresses:
+        raise DiscoveryError("Indexer host could not be resolved.")
+    ips = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise DiscoveryError("Indexer host must resolve only to public IP addresses.")
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        address = _public_addresses(self.host, self.port)[0]
+        self.sock = socket.create_connection(
+            (str(address), self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+        try:
+            self.sock = self._context.wrap_socket(
+                self.sock, server_hostname=self._tunnel_host or self.host
+            )
+        except Exception:
+            self.sock.close()
+            raise
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(
+            _PinnedHTTPSConnection, request, context=self._context
+        )
+
+
 def _validate_https_url(value, *, archive_only=False):
     if not isinstance(value, str) or len(value) > MAX_INDEXER_URL_LENGTH:
         raise DiscoveryError("Indexer URL is invalid.")
@@ -47,14 +90,7 @@ def _validate_https_url(value, *, archive_only=False):
         raise DiscoveryError("Indexer port is invalid.") from exc
     if archive_only and host != "archive.org" and not host.endswith(".archive.org"):
         raise DiscoveryError("Internet Archive links must stay on archive.org.")
-    try:
-        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise DiscoveryError("Indexer host could not be resolved.") from exc
-    if not addresses or any(
-        not ipaddress.ip_address(address[4][0]).is_global for address in addresses
-    ):
-        raise DiscoveryError("Indexer host must resolve only to public IP addresses.")
+    _public_addresses(host, port)
     return parts
 
 
@@ -97,10 +133,12 @@ def _fetch(
         raise DiscoveryError("Torrent indexer concurrency limit reached.")
     try:
         opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             _SafeRedirectHandler(
                 archive_only=archive_only,
                 original_host=host,
-            )
+            ),
+            _PinnedHTTPSHandler(context=ssl.create_default_context()),
         )
         request = urllib.request.Request(
             url,
